@@ -69,12 +69,8 @@ def main() -> None:
 
     config = streaming_client.subscription_config
     config.subscriber_data_type = (
-        aria.StreamingDataType.Rgb
-        | aria.StreamingDataType.Slam
-        | aria.StreamingDataType.EyeTrack
+        aria.StreamingDataType.EyeTrack
     )
-    config.message_queue_size[aria.StreamingDataType.Rgb] = 1
-    config.message_queue_size[aria.StreamingDataType.Slam] = 1
     config.message_queue_size[aria.StreamingDataType.EyeTrack] = 1
 
     options = aria.StreamingSecurityOptions()
@@ -95,19 +91,7 @@ def main() -> None:
     print("Start listening to image data")
     streaming_client.subscribe()
 
-    rgb_window = "Aria RGB"
-    slam_window = "Aria SLAM"
     eyetrack_window = "Aria EyeTrack"
-
-    cv2.namedWindow(rgb_window, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(rgb_window, 1024, 1024)
-    cv2.setWindowProperty(rgb_window, cv2.WND_PROP_TOPMOST, 1)
-    cv2.moveWindow(rgb_window, 50, 50)
-
-    cv2.namedWindow(slam_window, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(slam_window, 480 * 2, 640)
-    cv2.setWindowProperty(slam_window, cv2.WND_PROP_TOPMOST, 1)
-    cv2.moveWindow(slam_window, 1100, 50)
 
     cv2.namedWindow(eyetrack_window, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(eyetrack_window, 640, 240)
@@ -116,22 +100,6 @@ def main() -> None:
 
     try:
         while not quit_keypress():
-            if aria.CameraId.Rgb in observer.images:
-                rgb_image = np.rot90(observer.images[aria.CameraId.Rgb], -1)
-                rgb_image = cv2.cvtColor(rgb_image, cv2.COLOR_BGR2RGB)
-                cv2.imshow(rgb_window, rgb_image)
-                del observer.images[aria.CameraId.Rgb]
-
-            if (
-                aria.CameraId.Slam1 in observer.images
-                and aria.CameraId.Slam2 in observer.images
-            ):
-                slam1_image = np.rot90(observer.images[aria.CameraId.Slam1], -1)
-                slam2_image = np.rot90(observer.images[aria.CameraId.Slam2], -1)
-                cv2.imshow(slam_window, np.hstack((slam1_image, slam2_image)))
-                del observer.images[aria.CameraId.Slam1]
-                del observer.images[aria.CameraId.Slam2]
-
             if aria.CameraId.EyeTrack in observer.images:
                 eyetrack_image = observer.images[aria.CameraId.EyeTrack]
                 del observer.images[aria.CameraId.EyeTrack]

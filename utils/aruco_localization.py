@@ -6,6 +6,7 @@ from typing import Callable, Optional
 import aria.sdk as aria
 import cv2
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 from common import quit_keypress, update_iptables
 from projectaria_tools.core.calibration import (
@@ -14,6 +15,7 @@ from projectaria_tools.core.calibration import (
     get_linear_camera_calibration,
 )
 from projectaria_tools.core.sensor_data import ImageDataRecord
+
 
 
 def _get_focal_lengths(calib) -> tuple[float, float]:
@@ -29,7 +31,6 @@ def _get_focal_lengths(calib) -> tuple[float, float]:
             return float(intr[0]), float(intr[1])
     raise ValueError("Unable to get focal lengths from calibration")
 
-
 def _get_principal_point(calib) -> tuple[float, float]:
     if hasattr(calib, "get_principal_point"):
         cx, cy = calib.get_principal_point()
@@ -40,25 +41,10 @@ def _get_principal_point(calib) -> tuple[float, float]:
             return float(intr[2]), float(intr[3])
     raise ValueError("Unable to get principal point from calibration")
 
-
-def _get_image_size(calib) -> tuple[int, int]:
-    if hasattr(calib, "get_image_size"):
-        width, height = calib.get_image_size()
-        return int(width), int(height)
-    if hasattr(calib, "get_image_resolution"):
-        width, height = calib.get_image_resolution()
-        return int(width), int(height)
-    if hasattr(calib, "get_image_dimensions"):
-        width, height = calib.get_image_dimensions()
-        return int(width), int(height)
-    raise ValueError("Unable to get image size from calibration")
-
-
 def _camera_matrix_from_calib(calib) -> np.ndarray:
     fx, fy = _get_focal_lengths(calib)
     cx, cy = _get_principal_point(calib)
     return np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
-
 
 def _get_aruco_dictionary(name: str) -> cv2.aruco_Dictionary:
     if not hasattr(cv2, "aruco"):
@@ -69,6 +55,12 @@ def _get_aruco_dictionary(name: str) -> cv2.aruco_Dictionary:
         raise ValueError(f"Unknown ArUco dictionary: {name}")
     return aruco.getPredefinedDictionary(dict_id)
 
+def _invert_pose(rvec: np.ndarray, tvec: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    rotation_matrix, _ = cv2.Rodrigues(rvec)
+    rotation_inv = rotation_matrix.T
+    tvec_inv = -rotation_inv @ tvec.reshape(3, 1)
+    rvec_inv, _ = cv2.Rodrigues(rotation_inv)
+    return rvec_inv.reshape(3, 1), tvec_inv.reshape(3, 1)
 
 def run_rgb_aruco_localization(
     device_ip: Optional[str] = None,
@@ -79,6 +71,8 @@ def run_rgb_aruco_localization(
     undistort_width: int = 1408,
     undistort_height: int = 1408,
     undistort_focal_length: float = 450.0,
+    ros2_publish: bool = False,
+    ros2_topic: str = "/aruco/camera_pose",
     on_pose: Optional[Callable[[int, np.ndarray, np.ndarray], None]] = None,
 ) -> None:
     if update_iptables_rules and sys.platform.startswith("linux"):
@@ -128,6 +122,25 @@ def run_rgb_aruco_localization(
         aruco_detector = None
 
     aria.set_log_level(aria.Level.Info)
+
+    ros_node = None
+    ros_publisher = None
+    ros_clock = None
+    if ros2_publish:
+        try:
+            import rclpy
+            from geometry_msgs.msg import PoseStamped
+
+            rclpy.init(args=None)
+            ros_node = rclpy.create_node("aruco_camera_pose_publisher")
+            ros_publisher = ros_node.create_publisher(PoseStamped, ros2_topic, 10)
+            ros_clock = ros_node.get_clock()
+            print(f"ROS2 publishing enabled: {ros2_topic}")
+        except Exception as exc:
+            print(f"ROS2 publisher unavailable: {exc}")
+            ros_node = None
+            ros_publisher = None
+            ros_clock = None
 
     streaming_client = aria.StreamingClient()
     config = streaming_client.subscription_config
@@ -202,6 +215,51 @@ def run_rgb_aruco_localization(
             for marker_id, corner_set, rvec, tvec in zip(
                 ids.flatten(), corners, rvecs, tvecs
             ):
+                rvec_cam_in_marker, tvec_cam_in_marker = _invert_pose(rvec, tvec)
+                rotation_cam_in_marker, _ = cv2.Rodrigues(rvec_cam_in_marker)
+                quat_xyzw = Rotation.from_matrix(rotation_cam_in_marker).as_quat()
+                quat_cam_in_marker = np.array(
+                    [
+                        float(quat_xyzw[3]),
+                        float(quat_xyzw[0]),
+                        float(quat_xyzw[1]),
+                        float(quat_xyzw[2]),
+                    ],
+                    dtype=np.float64,
+                )
+
+                print(
+                    "Cam->Marker id=%d quat[w,x,y,z]=[%.6f, %.6f, %.6f, %.6f]"
+                    % (
+                        int(marker_id),
+                        float(quat_cam_in_marker[0]),
+                        float(quat_cam_in_marker[1]),
+                        float(quat_cam_in_marker[2]),
+                        float(quat_cam_in_marker[3]),
+                    )
+                )
+                print(
+                    "Cam->Marker id=%d tvec=[%.6f, %.6f, %.6f]"
+                    % (
+                        int(marker_id),
+                        float(tvec_cam_in_marker[0][0]),
+                        float(tvec_cam_in_marker[1][0]),
+                        float(tvec_cam_in_marker[2][0]),
+                    )
+                )
+                if ros_publisher is not None and ros_node is not None:
+                    pose_msg = PoseStamped()
+                    if ros_clock is not None:
+                        pose_msg.header.stamp = ros_clock.now().to_msg()
+                    pose_msg.header.frame_id = f"aruco_marker_{int(marker_id)}"
+                    pose_msg.pose.position.x = float(tvec_cam_in_marker[0][0])
+                    pose_msg.pose.position.y = float(tvec_cam_in_marker[1][0])
+                    pose_msg.pose.position.z = float(tvec_cam_in_marker[2][0])
+                    pose_msg.pose.orientation.w = float(quat_cam_in_marker[0])
+                    pose_msg.pose.orientation.x = float(quat_cam_in_marker[1])
+                    pose_msg.pose.orientation.y = float(quat_cam_in_marker[2])
+                    pose_msg.pose.orientation.z = float(quat_cam_in_marker[3])
+                    ros_publisher.publish(pose_msg)
                 pts = corner_set.reshape(-1, 2).astype(np.int32)
                 cv2.polylines(rgb_image, [pts], True, (0, 255, 0), 2)
                 text_pos = (int(pts[0][0]), int(pts[0][1]) - 6)
@@ -231,6 +289,14 @@ def run_rgb_aruco_localization(
 
     print("Stop listening to RGB data")
     streaming_client.unsubscribe()
+    if ros_node is not None:
+        try:
+            ros_node.destroy_node()
+            import rclpy
+
+            rclpy.shutdown()
+        except Exception:
+            pass
 
 
 def parse_args() -> argparse.Namespace:
@@ -239,7 +305,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--marker-length-m",
         type=float,
-        default=0.04,
+        default=0.053,
         help="Marker side length in meters.",
     )
     parser.add_argument(
@@ -277,6 +343,17 @@ def parse_args() -> argparse.Namespace:
         default=450.0,
         help="Focal length for the undistorted RGB output calibration.",
     )
+    parser.add_argument(
+        "--ros2-publish",
+        action="store_true",
+        help="Publish camera pose as ROS2 PoseStamped.",
+    )
+    parser.add_argument(
+        "--ros2-topic",
+        type=str,
+        default="/aruco/camera_pose",
+        help="ROS2 topic for PoseStamped.",
+    )
     return parser.parse_args()
 
 
@@ -291,6 +368,8 @@ def main() -> None:
         undistort_width=args.undistort_width,
         undistort_height=args.undistort_height,
         undistort_focal_length=args.undistort_focal_length,
+        ros2_publish=args.ros2_publish,
+        ros2_topic=args.ros2_topic,
     )
 
 
