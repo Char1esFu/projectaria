@@ -18,17 +18,23 @@ aria streaming install-certs
 
 ## Usage
 ```bash
-# streaming demo with glfw window
+# streaming demo with glfw window(run this first to give sudo access, otherwise streaming will fail later)
 python3 utils/device_stream.py --interface usb --update_iptables
 
-# streaming demo with individual message
+# estimate pose with IMU data and Madgwick filter as failsafe
+python3 -m src.imu_pose --imu-index 1 # or 0
+
+# subscribe first(needed in all scenarios)
 aria streaming start --interface usb # optional: --use-ephemeral-certs
+
+# streaming demo with individual message
 python3 utils/streaming_subscribe.py
 aria streaming stop
 
 # streaming with eye tracking inference
-python -m projectaria_eyetracking.streaming_eye_inference_demo
+python3 -m projectaria_eyetracking.streaming_eye_tracking
 
-# glass localization
-python3 utils/aruco_localization.py --ros2-publish
+# glass localization, specify arbitrary aruco marker id(s) in the setup
+source /opt/ros/humble/setup.bash
+python3 -m src.aruco_localization --marker-ids 5
 ```

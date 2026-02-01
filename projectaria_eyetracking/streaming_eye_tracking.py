@@ -61,6 +61,16 @@ def main() -> None:
 
     aria.set_log_level(aria.Level.Info)
 
+    try:
+        import rclpy
+        from geometry_msgs.msg import Vector3
+
+        rclpy.init(args=None)
+        ros_node = rclpy.create_node("eye_gaze_publisher")
+        gaze_publisher = ros_node.create_publisher(Vector3, "/aria/gaze", 10)
+    except Exception as exc:
+        raise RuntimeError(f"ROS2 publisher unavailable: {exc}") from exc
+
     inference_model = EyeGazeInference(
         args.model_checkpoint_path, args.model_config_path, args.device
     )
@@ -126,10 +136,21 @@ def main() -> None:
                     f"(low={yaw_l:.4f},{pitch_l:.4f} high={yaw_u:.4f},{pitch_u:.4f})"
                 )
 
+                gaze_msg = Vector3()
+                gaze_msg.x = yaw
+                gaze_msg.y = pitch
+                gaze_msg.z = 0.0
+                gaze_publisher.publish(gaze_msg)
+
             time.sleep(0.001)
     finally:
         print("Stop listening to image data")
         streaming_client.unsubscribe()
+        try:
+            ros_node.destroy_node()
+            rclpy.shutdown()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

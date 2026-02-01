@@ -5,7 +5,7 @@ import time
 
 import aria.sdk as aria
 import numpy as np
-from common import quit_keypress, update_iptables
+from utils.common import quit_keypress, update_iptables
 
 from projectaria_tools.core.sensor_data import MotionData
 

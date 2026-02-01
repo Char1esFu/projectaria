@@ -10,6 +10,5 @@ torchvision
 projectaria-tools[all]
 projectaria-mps
 scipy
-open3d
 
 projectaria_client_sdk
