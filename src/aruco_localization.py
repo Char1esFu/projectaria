@@ -24,37 +24,12 @@ from projectaria_tools.core.sensor_data import ImageDataRecord
 
 
 
-def _get_focal_lengths(calib) -> tuple[float, float]:
-    if hasattr(calib, "get_focal_lengths"):
-        fx, fy = calib.get_focal_lengths()
-        return float(fx), float(fy)
-    if hasattr(calib, "get_focal_length"):
-        f = float(calib.get_focal_length())
-        return f, f
-    if hasattr(calib, "get_intrinsics"):
-        intr = calib.get_intrinsics()
-        if len(intr) >= 2:
-            return float(intr[0]), float(intr[1])
-    raise ValueError("Unable to get focal lengths from calibration")
-
-def _get_principal_point(calib) -> tuple[float, float]:
-    if hasattr(calib, "get_principal_point"):
-        cx, cy = calib.get_principal_point()
-        return float(cx), float(cy)
-    if hasattr(calib, "get_intrinsics"):
-        intr = calib.get_intrinsics()
-        if len(intr) >= 4:
-            return float(intr[2]), float(intr[3])
-    raise ValueError("Unable to get principal point from calibration")
-
 def _camera_matrix_from_calib(calib) -> np.ndarray:
-    fx, fy = _get_focal_lengths(calib)
-    cx, cy = _get_principal_point(calib)
+    fx, fy = calib.get_focal_lengths()
+    cx, cy = calib.get_principal_point()
     return np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
 
 def _get_aruco_dictionary(name: str) -> cv2.aruco_Dictionary:
-    if not hasattr(cv2, "aruco"):
-        raise RuntimeError("OpenCV ArUco module not available. Install opencv-contrib-python.")
     aruco = cv2.aruco
     dict_id = getattr(aruco, name, None)
     if dict_id is None:
@@ -227,6 +202,7 @@ class ArucoLocalizer:
                     )
                     world_t, world_q_xyzw = _compose_pose(marker_t, marker_q, cam_t, cam_q)
 
+                    marker_frame = f"{self.ros2_marker_frame_prefix}{int(marker_id)}"
                     pose_msg.header.frame_id = parent_frame
                     pose_msg.pose.position.x = float(world_t[0])
                     pose_msg.pose.position.y = float(world_t[1])
@@ -238,15 +214,16 @@ class ArucoLocalizer:
                     self.ros_publisher.publish(pose_msg)
 
                     tf_msg = self.TransformStamped()
-                    tf_msg.header = pose_msg.header
+                    tf_msg.header.stamp = pose_msg.header.stamp
+                    tf_msg.header.frame_id = marker_frame
                     tf_msg.child_frame_id = self.ros2_camera_frame
-                    tf_msg.transform.translation.x = pose_msg.pose.position.x
-                    tf_msg.transform.translation.y = pose_msg.pose.position.y
-                    tf_msg.transform.translation.z = pose_msg.pose.position.z
-                    tf_msg.transform.rotation.w = pose_msg.pose.orientation.w
-                    tf_msg.transform.rotation.x = pose_msg.pose.orientation.x
-                    tf_msg.transform.rotation.y = pose_msg.pose.orientation.y
-                    tf_msg.transform.rotation.z = pose_msg.pose.orientation.z
+                    tf_msg.transform.translation.x = float(cam_t[0])
+                    tf_msg.transform.translation.y = float(cam_t[1])
+                    tf_msg.transform.translation.z = float(cam_t[2])
+                    tf_msg.transform.rotation.w = float(cam_q[3])
+                    tf_msg.transform.rotation.x = float(cam_q[0])
+                    tf_msg.transform.rotation.y = float(cam_q[1])
+                    tf_msg.transform.rotation.z = float(cam_q[2])
                     self.tf_broadcaster.sendTransform(tf_msg)
 
                     pts = corner_set.reshape(-1, 2).astype(np.int32)
@@ -466,7 +443,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--marker-length-m",
         type=float,
-        default=0.053,
+        default=0.047,
         help="Marker side length in meters.",
     )
     parser.add_argument(
