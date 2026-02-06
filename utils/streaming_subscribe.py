@@ -20,7 +20,7 @@ import aria.sdk as aria
 
 import cv2
 import numpy as np
-from common import quit_keypress, update_iptables
+from utils.common import quit_keypress, update_iptables
 
 from projectaria_tools.core.calibration import (
     device_calibration_from_json_string,

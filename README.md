@@ -28,13 +28,17 @@ python3 -m src.imu_pose --imu-index 1 # or 0
 aria streaming start --interface usb # optional: --use-ephemeral-certs
 
 # streaming demo with individual message
-python3 utils/streaming_subscribe.py
+python3 -m utils.streaming_subscribe
 aria streaming stop
-
-# streaming with eye tracking inference
-python3 -m projectaria_eyetracking.streaming_eye_tracking
 
 # glass localization, specify arbitrary aruco marker id(s) in the setup
 source /opt/ros/humble/setup.bash
-python3 -m src.aruco_localization --marker-ids 5
+python3 -m src.aruco_localization --marker-ids 1 2
+
+# gaze detection
+python3 -m projectaria_eyetracking.gaze_detect
+
+# publish gaze table intersection
+python3 src/gaze_intersection_node.py --visualize
+
 ```
