@@ -9,8 +9,8 @@
 		{
 			"marker_id": 2,
 			"parent_frame": "base_link",
-			"translation": [0.5, 0.3, 0.0],
-			"rotation_xyzw": [0.0, 0.0, 1.0, 0.0]
+			"translation": [0.5, 0.2, 0.0],
+			"rotation_xyzw": [0.0, 0.0, 0.0, 1.0]
 		}
 	]
 }

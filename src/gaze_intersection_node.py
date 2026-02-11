@@ -176,7 +176,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gaze-y-offset",
         type=float,
-        default=-0.5,
+        default=-0.05,
         help="Y offset from aria_camera_rgb to aria_gaze (meters).",
     )
     parser.add_argument(

@@ -8,7 +8,7 @@ from typing import Optional
 import aria.sdk as aria
 import cv2
 import numpy as np
-from scipy.spatial.transform import Rotation
+from scipy.spatial.transform import Rotation, Slerp
 
 from utils.common import quit_keypress, update_iptables
 from projectaria_tools.core.calibration import (
@@ -51,6 +51,27 @@ def _compose_pose(
     composed_t = parent_t + parent_rot.apply(child_t)
     return composed_t, composed_rot.as_quat()
 
+def _invert_transform(t: np.ndarray, q_xyzw: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    rot = Rotation.from_quat(q_xyzw)
+    rot_inv = rot.inv()
+    t_inv = -rot_inv.apply(t)
+    return t_inv, rot_inv.as_quat()
+
+def _average_quaternions(quats_xyzw: list[np.ndarray]) -> np.ndarray:
+    if not quats_xyzw:
+        raise ValueError("Cannot average zero quaternions")
+    ref = quats_xyzw[0]
+    accum = np.zeros(4, dtype=np.float64)
+    for quat in quats_xyzw:
+        if np.dot(ref, quat) < 0.0:
+            accum -= quat
+        else:
+            accum += quat
+    norm = np.linalg.norm(accum)
+    if norm < 1e-12:
+        return ref
+    return accum / norm
+
 class ArucoLocalizer:
     def __init__(
         self,
@@ -62,6 +83,7 @@ class ArucoLocalizer:
         undistort_height: int,
         undistort_focal_length: float,
         allowed_marker_ids: Optional[list[int]],
+        ema_alpha: float,
     ) -> None:
         self.device_ip = device_ip
         self.marker_length_m = marker_length_m
@@ -71,6 +93,7 @@ class ArucoLocalizer:
         self.undistort_height = undistort_height
         self.undistort_focal_length = undistort_focal_length
         self.allowed_marker_ids = allowed_marker_ids
+        self.ema_alpha = float(ema_alpha)
 
         self.ros2_topic = "/aria/cam_pose"
         self.ros2_marker_frame_prefix = "aruco_marker_"
@@ -93,6 +116,8 @@ class ArucoLocalizer:
 
         self.streaming_client = None
         self.observer = None
+
+        self._ema_state = {}
 
     def run(self) -> None:
         if self.update_iptables_rules and sys.platform.startswith("linux"):
@@ -151,13 +176,54 @@ class ArucoLocalizer:
             corners, self.marker_length_m, self.camera_matrix, self.dist_coeffs
         )
 
+        pose_entries = []
         for marker_id, corner_set, rvec, tvec in zip(ids.flatten(), corners, rvecs, tvecs):
             if allowed_id_set is not None and int(marker_id) not in allowed_id_set:
                 continue
-            self._publish_marker_pose(int(marker_id), rvec, tvec)
+            entry = self._compute_world_pose(int(marker_id), rvec, tvec)
+            if entry is not None:
+                pose_entries.append(entry)
             self._draw_marker(rgb_image, int(marker_id), corner_set, rvec, tvec)
 
-    def _publish_marker_pose(self, marker_id: int, rvec: np.ndarray, tvec: np.ndarray) -> None:
+        if not pose_entries:
+            return
+
+        if len(pose_entries) == 1:
+            parent_frame, marker_t, marker_q, world_t, world_q_xyzw, marker_id = pose_entries[0]
+            world_t, world_q_xyzw = self._apply_ema(parent_frame, world_t, world_q_xyzw)
+            marker_frame = f"{self.ros2_marker_frame_prefix}{marker_id}"
+            stamp = self.ros.publish_world_pose(parent_frame, world_t, world_q_xyzw)
+            inv_marker_t, inv_marker_q = _invert_transform(marker_t, marker_q)
+            cam_t, cam_q = _compose_pose(inv_marker_t, inv_marker_q, world_t, world_q_xyzw)
+            self.ros.publish_camera_tf(marker_frame, cam_t, cam_q, stamp)
+            return
+
+        parent_frame = pose_entries[0][0]
+        filtered_entries = [entry for entry in pose_entries if entry[0] == parent_frame]
+        if len(filtered_entries) != len(pose_entries):
+            print("Mixed parent frames detected; averaging only matching parent frame poses.")
+
+        if len(filtered_entries) == 1:
+            parent_frame, marker_t, marker_q, world_t, world_q_xyzw, marker_id = filtered_entries[0]
+            world_t, world_q_xyzw = self._apply_ema(parent_frame, world_t, world_q_xyzw)
+            marker_frame = f"{self.ros2_marker_frame_prefix}{marker_id}"
+            stamp = self.ros.publish_world_pose(parent_frame, world_t, world_q_xyzw)
+            inv_marker_t, inv_marker_q = _invert_transform(marker_t, marker_q)
+            cam_t, cam_q = _compose_pose(inv_marker_t, inv_marker_q, world_t, world_q_xyzw)
+            self.ros.publish_camera_tf(marker_frame, cam_t, cam_q, stamp)
+            return
+
+        world_ts = [entry[3] for entry in filtered_entries]
+        world_quats = [entry[4] for entry in filtered_entries]
+        avg_t = np.mean(np.stack(world_ts, axis=0), axis=0)
+        avg_q = _average_quaternions(world_quats)
+        avg_t, avg_q = self._apply_ema(parent_frame, avg_t, avg_q)
+        stamp = self.ros.publish_world_pose(parent_frame, avg_t, avg_q)
+        self.ros.publish_world_camera_tf(parent_frame, avg_t, avg_q, stamp)
+
+    def _compute_world_pose(
+        self, marker_id: int, rvec: np.ndarray, tvec: np.ndarray
+    ) -> Optional[tuple[str, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]]:
         rvec_cam_in_marker, tvec_cam_in_marker = _invert_pose(rvec, tvec)
         rotation_cam_in_marker, _ = cv2.Rodrigues(rvec_cam_in_marker)
         quat_xyzw = Rotation.from_matrix(rotation_cam_in_marker).as_quat()
@@ -173,7 +239,7 @@ class ArucoLocalizer:
 
         static_entry = self.ros.get_static_entry(marker_id)
         if static_entry is None:
-            return
+            return None
 
         parent_frame, marker_t, marker_q = static_entry
         cam_t = np.array(
@@ -194,9 +260,23 @@ class ArucoLocalizer:
             dtype=np.float64,
         )
         world_t, world_q_xyzw = _compose_pose(marker_t, marker_q, cam_t, cam_q)
-        marker_frame = f"{self.ros2_marker_frame_prefix}{marker_id}"
-        stamp = self.ros.publish_world_pose(parent_frame, world_t, world_q_xyzw)
-        self.ros.publish_camera_tf(marker_frame, cam_t, cam_q, stamp)
+        return parent_frame, marker_t, marker_q, world_t, world_q_xyzw, marker_id
+
+    def _apply_ema(self, parent_frame: str, t: np.ndarray, q_xyzw: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        if self.ema_alpha <= 0.0:
+            return t, q_xyzw
+        prev = self._ema_state.get(parent_frame)
+        if prev is None:
+            self._ema_state[parent_frame] = (t, q_xyzw)
+            return t, q_xyzw
+        prev_t, prev_q = prev
+        alpha = self.ema_alpha
+        new_t = (1.0 - alpha) * prev_t + alpha * t
+        rotations = Rotation.from_quat([prev_q, q_xyzw])
+        slerp = Slerp([0.0, 1.0], rotations)
+        new_q = slerp(alpha).as_quat()
+        self._ema_state[parent_frame] = (new_t, new_q)
+        return new_t, new_q
 
     def _draw_marker(
         self,
@@ -446,6 +526,20 @@ class RosPosePublisher:
         tf_msg.transform.rotation.z = float(cam_q[2])
         self.tf_broadcaster.sendTransform(tf_msg)
 
+    def publish_world_camera_tf(self, parent_frame: str, world_t: np.ndarray, world_q: np.ndarray, stamp):
+        tf_msg = self.TransformStamped()
+        tf_msg.header.stamp = stamp
+        tf_msg.header.frame_id = parent_frame
+        tf_msg.child_frame_id = self.camera_frame
+        tf_msg.transform.translation.x = float(world_t[0])
+        tf_msg.transform.translation.y = float(world_t[1])
+        tf_msg.transform.translation.z = float(world_t[2])
+        tf_msg.transform.rotation.x = float(world_q[0])
+        tf_msg.transform.rotation.y = float(world_q[1])
+        tf_msg.transform.rotation.z = float(world_q[2])
+        tf_msg.transform.rotation.w = float(world_q[3])
+        self.tf_broadcaster.sendTransform(tf_msg)
+
     def shutdown(self) -> None:
         if self.ros_node is None:
             return
@@ -465,6 +559,7 @@ def run_rgb_aruco_localization(
     undistort_height: int = 1408,
     undistort_focal_length: float = 450.0,
     allowed_marker_ids: Optional[list[int]] = None,
+    ema_alpha: float = 0.9,
 ) -> None:
     localizer = ArucoLocalizer(
         device_ip=device_ip,
@@ -475,6 +570,7 @@ def run_rgb_aruco_localization(
         undistort_height=undistort_height,
         undistort_focal_length=undistort_focal_length,
         allowed_marker_ids=allowed_marker_ids,
+        ema_alpha=ema_alpha,
     )
     localizer.run()
 
@@ -525,6 +621,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Only detect/publish these marker IDs (space-separated).",
     )
+    parser.add_argument(
+        "--ema-alpha",
+        type=float,
+        default=0.2,
+        help="EMA smoothing factor for pose (0 disables).",
+    )
     return parser.parse_args()
 
 
@@ -539,6 +641,7 @@ def main() -> None:
         undistort_height=args.undistort_height,
         undistort_focal_length=args.undistort_focal_length,
         allowed_marker_ids=args.marker_ids,
+        ema_alpha=args.ema_alpha,
     )
 
 
