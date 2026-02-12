@@ -45,15 +45,6 @@ def parse_args() -> argparse.Namespace:
     )
     return parser.parse_args()
 
-
-def to_grayscale(image: np.ndarray) -> np.ndarray:
-    if image.ndim == 2:
-        return image
-    if image.ndim == 3 and image.shape[2] in (3, 4):
-        return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    raise ValueError(f"Unexpected eye image shape: {image.shape}")
-
-
 def main() -> None:
     args = parse_args()
     if args.update_iptables and sys.platform.startswith("linux"):
@@ -117,11 +108,10 @@ def main() -> None:
                 # If your eye image orientation is rotated, uncomment the following line:
                 # eyetrack_image = np.rot90(eyetrack_image, -1)
 
-                eyetrack_gray = to_grayscale(eyetrack_image)
-                cv2.imshow(eyetrack_window, eyetrack_gray)
+                cv2.imshow(eyetrack_window, eyetrack_image)
 
                 # The model expects a single grayscale image containing [left | right] eyes.
-                eye_tensor = torch.from_numpy(eyetrack_gray)
+                eye_tensor = torch.from_numpy(eyetrack_image)
 
                 preds, lower, upper = inference_model.predict(eye_tensor)
                 yaw = preds[0][0].item()
