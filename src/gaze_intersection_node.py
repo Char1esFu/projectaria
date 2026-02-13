@@ -15,8 +15,8 @@ def _yaw_pitch_to_unit_vector(yaw: float, pitch: float) -> np.ndarray:
     cos_pitch = math.cos(pitch)
     return np.array(
         [
-            math.sin(pitch),
             cos_pitch * math.sin(yaw),
+            -math.sin(pitch),
             cos_pitch * math.cos(yaw),
         ],
         dtype=np.float64,
@@ -25,7 +25,7 @@ def _yaw_pitch_to_unit_vector(yaw: float, pitch: float) -> np.ndarray:
 class GazeIntersectionNode(Node):
     def __init__(
         self,
-        gaze_y_offset: float,
+        gaze_x_offset: float,
         publish_static: bool,
         visualize: bool,
     ) -> None:
@@ -33,7 +33,7 @@ class GazeIntersectionNode(Node):
         self._base_frame = "base_link"
         self._camera_frame = "aria_camera_rgb"
         self._gaze_frame = "aria_gaze"
-        self._gaze_y_offset = gaze_y_offset
+        self._gaze_x_offset = gaze_x_offset
         self._visualize = visualize
 
         self._tf_buffer = Buffer()
@@ -50,11 +50,16 @@ class GazeIntersectionNode(Node):
         if self._visualize:
             self._marker_pub = self.create_publisher(Marker, "/aria/gaze_markers", 10)
         self._subscription = self.create_subscription(
-            Vector3, "/aria/gaze", self._on_gaze, 10
+            Vector3, "/aria/gaze_euler", self._on_gaze, 10
         )
         self.get_logger().info(
-            "Listening on /aria/gaze, publishing /aria/gaze_xy_intersect"
+            "Listening on /aria/gaze_euler, publishing /aria/gaze_xy_intersect"
         )
+        self.get_logger().info("ROS2 publishing enabled: /aria/gaze_xy_intersect")
+        if self._visualize:
+            self.get_logger().info("ROS2 publishing enabled: /aria/gaze_markers")
+        if self._static_broadcaster is not None:
+            self.get_logger().info("ROS2 publishing enabled: /tf_static (aria_camera_rgb -> aria_gaze)")
 
     def _publish_static_gaze_frame(self) -> None:
         if self._static_broadcaster is None:
@@ -63,8 +68,8 @@ class GazeIntersectionNode(Node):
         tf_msg.header.stamp = self.get_clock().now().to_msg()
         tf_msg.header.frame_id = self._camera_frame
         tf_msg.child_frame_id = self._gaze_frame
-        tf_msg.transform.translation.x = 0.0
-        tf_msg.transform.translation.y = float(self._gaze_y_offset)
+        tf_msg.transform.translation.x = float(self._gaze_x_offset)
+        tf_msg.transform.translation.y = 0.0
         tf_msg.transform.translation.z = 0.0
         tf_msg.transform.rotation.x = 0.0
         tf_msg.transform.rotation.y = 0.0
@@ -73,8 +78,8 @@ class GazeIntersectionNode(Node):
         self._static_broadcaster.sendTransform(tf_msg)
 
     def _on_gaze(self, msg: Vector3) -> None:
-        yaw = float(msg.x)
-        pitch = -float(msg.y)
+        pitch = float(msg.x)
+        yaw = float(msg.y)
         dir_gaze = _yaw_pitch_to_unit_vector(yaw, pitch)
         if self._visualize:
             self._publish_gaze_ray(dir_gaze)
@@ -174,10 +179,10 @@ class GazeIntersectionNode(Node):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--gaze-y-offset",
+        "--gaze-x-offset",
         type=float,
-        default=-0.05,
-        help="Y offset from aria_camera_rgb to aria_gaze (meters).",
+        default=0.05,
+        help="X offset from aria_camera_rgb to aria_gaze (meters).",
     )
     parser.add_argument(
         "--visualize",
@@ -196,7 +201,7 @@ def main() -> None:
     args = parse_args()
     rclpy.init(args=None)
     node = GazeIntersectionNode(
-        gaze_y_offset=args.gaze_y_offset,
+        gaze_x_offset=args.gaze_x_offset,
         publish_static=not args.no_static_gaze_frame,
         visualize=args.visualize,
     )

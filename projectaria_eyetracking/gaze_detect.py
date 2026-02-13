@@ -43,6 +43,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Update iptables to enable receiving the data stream, only for Linux.",
     )
+    parser.add_argument(
+        "--pitch-bias",
+        type=float,
+        default=0.1,
+        help="Additive bias applied to predicted pitch (radians).",
+    )
     return parser.parse_args()
 
 def main() -> None:
@@ -58,7 +64,9 @@ def main() -> None:
 
         rclpy.init(args=None)
         ros_node = rclpy.create_node("eye_gaze_publisher")
-        gaze_publisher = ros_node.create_publisher(Vector3, "/aria/gaze", 10)
+        gaze_topic = "/aria/gaze_euler"
+        gaze_publisher = ros_node.create_publisher(Vector3, gaze_topic, 10)
+        print(f"ROS2 publishing enabled: {gaze_topic}")
     except Exception as exc:
         raise RuntimeError(f"ROS2 publisher unavailable: {exc}") from exc
 
@@ -105,30 +113,22 @@ def main() -> None:
                 eyetrack_image = observer.images[aria.CameraId.EyeTrack]
                 del observer.images[aria.CameraId.EyeTrack]
 
-                # If your eye image orientation is rotated, uncomment the following line:
-                # eyetrack_image = np.rot90(eyetrack_image, -1)
-
                 cv2.imshow(eyetrack_window, eyetrack_image)
 
                 # The model expects a single grayscale image containing [left | right] eyes.
                 eye_tensor = torch.from_numpy(eyetrack_image)
 
                 preds, lower, upper = inference_model.predict(eye_tensor)
-                yaw = preds[0][0].item()
-                pitch = preds[0][1].item()
-                yaw_l = lower[0][0].item()
-                pitch_l = lower[0][1].item()
-                yaw_u = upper[0][0].item()
-                pitch_u = upper[0][1].item()
+                yaw = -preds[0][0].item() # look left negative, right positive, to match convention
+                pitch = preds[0][1].item() + args.pitch_bias
 
                 print(
-                    f"yaw={yaw:.4f}, pitch={pitch:.4f} "
-                    f"(low={yaw_l:.4f},{pitch_l:.4f} high={yaw_u:.4f},{pitch_u:.4f})"
+                    f"pitch={pitch:.4f}, yaw={yaw:.4f}"
                 )
 
                 gaze_msg = Vector3()
-                gaze_msg.x = yaw
-                gaze_msg.y = pitch
+                gaze_msg.x = pitch
+                gaze_msg.y = yaw
                 gaze_msg.z = 0.0
                 gaze_publisher.publish(gaze_msg)
 

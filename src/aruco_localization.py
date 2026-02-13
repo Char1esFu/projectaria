@@ -57,16 +57,14 @@ def _invert_transform(t: np.ndarray, q_xyzw: np.ndarray) -> tuple[np.ndarray, np
     t_inv = -rot_inv.apply(t)
     return t_inv, rot_inv.as_quat()
 
-def _average_quaternions(quats_xyzw: list[np.ndarray]) -> np.ndarray:
-    if not quats_xyzw:
-        raise ValueError("Cannot average zero quaternions")
+def average_quaternions(quats_xyzw: list[np.ndarray], weights: np.ndarray) -> np.ndarray:
     ref = quats_xyzw[0]
     accum = np.zeros(4, dtype=np.float64)
-    for quat in quats_xyzw:
+    for quat, weight in zip(quats_xyzw, weights):
         if np.dot(ref, quat) < 0.0:
-            accum -= quat
+            accum -= weight * quat
         else:
-            accum += quat
+            accum += weight * quat
     norm = np.linalg.norm(accum)
     if norm < 1e-12:
         return ref
@@ -98,6 +96,7 @@ class ArucoLocalizer:
         self.ros2_topic = "/aria/cam_pose"
         self.ros2_marker_frame_prefix = "aruco_marker_"
         self.ros2_camera_frame = "aria_camera_rgb"
+        self.camera_frame_correction_q_xyzw = Rotation.from_euler("z", -90.0, degrees=True).as_quat()
         self.static_tf_config_path = os.path.abspath(
             os.path.join(os.path.dirname(__file__), "..", "config", "aruco_tf.json")
         )
@@ -189,13 +188,10 @@ class ArucoLocalizer:
             return
 
         if len(pose_entries) == 1:
-            parent_frame, marker_t, marker_q, world_t, world_q_xyzw, marker_id = pose_entries[0]
+            parent_frame, _, _, world_t, world_q_xyzw, _, _ = pose_entries[0]
             world_t, world_q_xyzw = self._apply_ema(parent_frame, world_t, world_q_xyzw)
-            marker_frame = f"{self.ros2_marker_frame_prefix}{marker_id}"
             stamp = self.ros.publish_world_pose(parent_frame, world_t, world_q_xyzw)
-            inv_marker_t, inv_marker_q = _invert_transform(marker_t, marker_q)
-            cam_t, cam_q = _compose_pose(inv_marker_t, inv_marker_q, world_t, world_q_xyzw)
-            self.ros.publish_camera_tf(marker_frame, cam_t, cam_q, stamp)
+            self.ros.publish_world_camera_tf(parent_frame, world_t, world_q_xyzw, stamp)
             return
 
         parent_frame = pose_entries[0][0]
@@ -204,26 +200,30 @@ class ArucoLocalizer:
             print("Mixed parent frames detected; averaging only matching parent frame poses.")
 
         if len(filtered_entries) == 1:
-            parent_frame, marker_t, marker_q, world_t, world_q_xyzw, marker_id = filtered_entries[0]
+            parent_frame, _, _, world_t, world_q_xyzw, _, _ = filtered_entries[0]
             world_t, world_q_xyzw = self._apply_ema(parent_frame, world_t, world_q_xyzw)
-            marker_frame = f"{self.ros2_marker_frame_prefix}{marker_id}"
             stamp = self.ros.publish_world_pose(parent_frame, world_t, world_q_xyzw)
-            inv_marker_t, inv_marker_q = _invert_transform(marker_t, marker_q)
-            cam_t, cam_q = _compose_pose(inv_marker_t, inv_marker_q, world_t, world_q_xyzw)
-            self.ros.publish_camera_tf(marker_frame, cam_t, cam_q, stamp)
+            self.ros.publish_world_camera_tf(parent_frame, world_t, world_q_xyzw, stamp)
             return
 
         world_ts = [entry[3] for entry in filtered_entries]
         world_quats = [entry[4] for entry in filtered_entries]
-        avg_t = np.mean(np.stack(world_ts, axis=0), axis=0)
-        avg_q = _average_quaternions(world_quats)
+        cam_dists = np.array([entry[6] for entry in filtered_entries], dtype=np.float64)
+        weights = 1.0 / (cam_dists + 1e-6)
+        weights_sum = np.sum(weights)
+        if weights_sum > 0.0:
+            weights = weights / weights_sum
+        else:
+            weights = np.ones_like(weights) / float(len(weights))
+        avg_t = np.sum(np.stack(world_ts, axis=0) * weights[:, None], axis=0)
+        avg_q = average_quaternions(world_quats, weights)
         avg_t, avg_q = self._apply_ema(parent_frame, avg_t, avg_q)
         stamp = self.ros.publish_world_pose(parent_frame, avg_t, avg_q)
         self.ros.publish_world_camera_tf(parent_frame, avg_t, avg_q, stamp)
 
     def _compute_world_pose(
         self, marker_id: int, rvec: np.ndarray, tvec: np.ndarray
-    ) -> Optional[tuple[str, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]]:
+    ) -> Optional[tuple[str, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int, float]]:
         rvec_cam_in_marker, tvec_cam_in_marker = _invert_pose(rvec, tvec)
         rotation_cam_in_marker, _ = cv2.Rodrigues(rvec_cam_in_marker)
         quat_xyzw = Rotation.from_matrix(rotation_cam_in_marker).as_quat()
@@ -260,7 +260,8 @@ class ArucoLocalizer:
             dtype=np.float64,
         )
         world_t, world_q_xyzw = _compose_pose(marker_t, marker_q, cam_t, cam_q)
-        return parent_frame, marker_t, marker_q, world_t, world_q_xyzw, marker_id
+        cam_dist = float(np.linalg.norm(cam_t))
+        return parent_frame, marker_t, marker_q, world_t, world_q_xyzw, marker_id, cam_dist
 
     def _apply_ema(self, parent_frame: str, t: np.ndarray, q_xyzw: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         if self.ema_alpha <= 0.0:
@@ -345,6 +346,7 @@ class ArucoLocalizer:
             marker_frame_prefix=self.ros2_marker_frame_prefix,
             camera_frame=self.ros2_camera_frame,
             static_tf_config_path=self.static_tf_config_path,
+            camera_frame_correction_q_xyzw=self.camera_frame_correction_q_xyzw,
         )
         self.ros.setup()
         if self.ros is None:
@@ -375,7 +377,7 @@ class ArucoLocalizer:
                 elapsed = now - self.last_print_time[key]
                 if elapsed >= 1.0:
                     rate = self.sample_counts[key] / elapsed
-                    print(f"{key}: {rate:.2f} Hz")
+                    # print(f"{key}: {rate:.2f} Hz")
                     self.last_print_time[key] = now
                     self.sample_counts[key] = 0
 
@@ -403,11 +405,13 @@ class RosPosePublisher:
         marker_frame_prefix: str,
         camera_frame: str,
         static_tf_config_path: str,
+        camera_frame_correction_q_xyzw: Optional[np.ndarray] = None,
     ) -> None:
         self.topic = topic
         self.marker_frame_prefix = marker_frame_prefix
         self.camera_frame = camera_frame
         self.static_tf_config_path = static_tf_config_path
+        self.camera_frame_correction_q_xyzw = camera_frame_correction_q_xyzw
 
         self.static_marker_transforms = {}
         self._warned_missing_static = set()
@@ -438,6 +442,8 @@ class RosPosePublisher:
             self.tf_broadcaster = TransformBroadcaster(self.ros_node)
             self.static_tf_broadcaster = StaticTransformBroadcaster(self.ros_node)
             print(f"ROS2 publishing enabled: {self.topic}")
+            print("ROS2 publishing enabled: /tf (dynamic transforms)")
+            print("ROS2 publishing enabled: /tf_static (static marker transforms)")
         except Exception as exc:
             raise RuntimeError(f"ROS2 publisher unavailable: {exc}") from exc
 
@@ -498,6 +504,10 @@ class RosPosePublisher:
         return static_entry
 
     def publish_world_pose(self, parent_frame: str, world_t: np.ndarray, world_q_xyzw: np.ndarray):
+        if self.camera_frame_correction_q_xyzw is not None:
+            world_q_xyzw = (
+                Rotation.from_quat(world_q_xyzw) * Rotation.from_quat(self.camera_frame_correction_q_xyzw)
+            ).as_quat()
         pose_msg = self.PoseStamped()
         if self.ros_clock is not None:
             pose_msg.header.stamp = self.ros_clock.now().to_msg()
@@ -513,6 +523,8 @@ class RosPosePublisher:
         return pose_msg.header.stamp
 
     def publish_camera_tf(self, marker_frame: str, cam_t: np.ndarray, cam_q: np.ndarray, stamp):
+        if self.camera_frame_correction_q_xyzw is not None:
+            cam_q = (Rotation.from_quat(cam_q) * Rotation.from_quat(self.camera_frame_correction_q_xyzw)).as_quat()
         tf_msg = self.TransformStamped()
         tf_msg.header.stamp = stamp
         tf_msg.header.frame_id = marker_frame
@@ -527,6 +539,10 @@ class RosPosePublisher:
         self.tf_broadcaster.sendTransform(tf_msg)
 
     def publish_world_camera_tf(self, parent_frame: str, world_t: np.ndarray, world_q: np.ndarray, stamp):
+        if self.camera_frame_correction_q_xyzw is not None:
+            world_q = (
+                Rotation.from_quat(world_q) * Rotation.from_quat(self.camera_frame_correction_q_xyzw)
+            ).as_quat()
         tf_msg = self.TransformStamped()
         tf_msg.header.stamp = stamp
         tf_msg.header.frame_id = parent_frame
@@ -559,7 +575,7 @@ def run_rgb_aruco_localization(
     undistort_height: int = 1408,
     undistort_focal_length: float = 450.0,
     allowed_marker_ids: Optional[list[int]] = None,
-    ema_alpha: float = 0.9,
+    ema_alpha: float = 0.95,
 ) -> None:
     localizer = ArucoLocalizer(
         device_ip=device_ip,
