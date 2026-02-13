@@ -51,12 +51,6 @@ def _compose_pose(
     composed_t = parent_t + parent_rot.apply(child_t)
     return composed_t, composed_rot.as_quat()
 
-def _invert_transform(t: np.ndarray, q_xyzw: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    rot = Rotation.from_quat(q_xyzw)
-    rot_inv = rot.inv()
-    t_inv = -rot_inv.apply(t)
-    return t_inv, rot_inv.as_quat()
-
 def average_quaternions(quats_xyzw: list[np.ndarray], weights: np.ndarray) -> np.ndarray:
     ref = quats_xyzw[0]
     accum = np.zeros(4, dtype=np.float64)
@@ -96,7 +90,10 @@ class ArucoLocalizer:
         self.ros2_topic = "/aria/cam_pose"
         self.ros2_marker_frame_prefix = "aruco_marker_"
         self.ros2_camera_frame = "aria_camera_rgb"
+        
+        # rgb camera frame and image are rotated 90 degrees. Compensate to match convention of camera facing forward and x right, y down, z forward.
         self.camera_frame_correction_q_xyzw = Rotation.from_euler("z", -90.0, degrees=True).as_quat()
+        
         self.static_tf_config_path = os.path.abspath(
             os.path.join(os.path.dirname(__file__), "..", "config", "aruco_tf.json")
         )
