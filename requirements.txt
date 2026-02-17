@@ -10,5 +10,5 @@ torchvision
 projectaria-tools[all]
 projectaria-mps
 scipy
-
+setuptools==80.10.1
 projectaria_client_sdk
