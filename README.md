@@ -84,11 +84,8 @@ For laptop:
 #### On workstation
 ```bash
 # ---- Ethernet setup ----
-sudo ip addr flush dev enp6s0
-sudo ip addr add 192.168.2.1/24 dev enp6s0
+sudo ip addr add 192.168.2.1/24 dev enp6s0 2>/dev/null
 sudo ip link set enp6s0 up
-
-# multicast routing
 sudo ip route add 224.0.0.0/4 dev enp6s0 || true
 
 # ROS2 DDS
@@ -100,11 +97,8 @@ export CYCLONEDDS_URI=file://$HOME/.ros/cyclonedds.xml
 #### On laptop
 ```bash
 # ---- Ethernet setup ----
-sudo ip addr flush dev enx9cbf0d00610d
-sudo ip addr add 192.168.2.2/24 dev enx9cbf0d00610d
+sudo ip addr add 192.168.2.2/24 dev enx9cbf0d00610d 2>/dev/null
 sudo ip link set enx9cbf0d00610d up
-
-# multicast routing
 sudo ip route add 224.0.0.0/4 dev enx9cbf0d00610d || true
 
 # ROS2 DDS
