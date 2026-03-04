@@ -7,7 +7,7 @@ import cv2
 import numpy as np
 import torch
 
-from utils.common import quit_keypress, update_iptables
+from utils.common import update_iptables
 from projectaria_eyetracking.inference.infer import EyeGazeInference
 
 
@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--pitch-bias",
         type=float,
-        default=0.1,
+        default=0.0,
         help="Additive bias applied to predicted pitch (radians).",
     )
     return parser.parse_args()
@@ -107,8 +107,29 @@ def main() -> None:
     cv2.setWindowProperty(eyetrack_window, cv2.WND_PROP_TOPMOST, 1)
     cv2.moveWindow(eyetrack_window, 50, 800)
 
+    # Calibration state
+    calibrating = False
+    calib_start = 0.0
+    calib_pitches = []
+    calib_yaws = []
+    pitch_offset = 0.0
+    yaw_offset = 0.0
+
+    print("Press 'c' to start 3-second calibration, 'q'/ESC to quit")
+
     try:
-        while not quit_keypress():
+        while True:
+            key = cv2.waitKey(1) & 0xFF
+            if key == 27 or key == ord("q"):
+                break
+
+            if key == ord("c") and not calibrating:
+                calibrating = True
+                calib_start = time.time()
+                calib_pitches.clear()
+                calib_yaws.clear()
+                print("Calibration started, recording for 3 seconds...")
+
             if aria.CameraId.EyeTrack in observer.images:
                 eyetrack_image = observer.images[aria.CameraId.EyeTrack]
                 del observer.images[aria.CameraId.EyeTrack]
@@ -119,11 +140,28 @@ def main() -> None:
                 eye_tensor = torch.from_numpy(eyetrack_image)
 
                 preds, lower, upper = inference_model.predict(eye_tensor)
-                yaw = -preds[0][0].item() # look left negative, right positive, to match convention
-                pitch = preds[0][1].item() + args.pitch_bias
+                yaw_raw = -preds[0][0].item()
+                pitch_raw = preds[0][1].item() + args.pitch_bias
+
+                if calibrating:
+                    calib_pitches.append(pitch_raw)
+                    calib_yaws.append(yaw_raw)
+                    elapsed = time.time() - calib_start
+                    if elapsed >= 3.0:
+                        pitch_offset = np.mean(calib_pitches)
+                        yaw_offset = np.mean(calib_yaws)
+                        calibrating = False
+                        print(
+                            f"Calibration done ({len(calib_pitches)} samples). "
+                            f"pitch_offset={pitch_offset:.4f}, yaw_offset={yaw_offset:.4f}"
+                        )
+
+                pitch = pitch_raw - pitch_offset
+                yaw = yaw_raw - yaw_offset
 
                 print(
                     f"pitch={pitch:.4f}, yaw={yaw:.4f}"
+                    + (" [calibrating]" if calibrating else "")
                 )
 
                 gaze_msg = Vector3()

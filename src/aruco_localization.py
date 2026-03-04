@@ -75,6 +75,7 @@ class ArucoLocalizer:
         undistort_height: int,
         undistort_focal_length: float,
         allowed_marker_ids: Optional[list[int]],
+        use_ema: bool,
         ema_alpha: float,
     ) -> None:
         self.device_ip = device_ip
@@ -85,6 +86,7 @@ class ArucoLocalizer:
         self.undistort_height = undistort_height
         self.undistort_focal_length = undistort_focal_length
         self.allowed_marker_ids = allowed_marker_ids
+        self.use_ema = bool(use_ema)
         self.ema_alpha = float(ema_alpha)
 
         self.ros2_topic = "/aria/cam_pose"
@@ -261,7 +263,7 @@ class ArucoLocalizer:
         return parent_frame, marker_t, marker_q, world_t, world_q_xyzw, marker_id, cam_dist
 
     def _apply_ema(self, parent_frame: str, t: np.ndarray, q_xyzw: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        if self.ema_alpha <= 0.0:
+        if (not self.use_ema) or self.ema_alpha <= 0.0:
             return t, q_xyzw
         prev = self._ema_state.get(parent_frame)
         if prev is None:
@@ -572,6 +574,7 @@ def run_rgb_aruco_localization(
     undistort_height: int = 1408,
     undistort_focal_length: float = 450.0,
     allowed_marker_ids: Optional[list[int]] = None,
+    use_ema: bool = True,
     ema_alpha: float = 0.95,
 ) -> None:
     localizer = ArucoLocalizer(
@@ -583,6 +586,7 @@ def run_rgb_aruco_localization(
         undistort_height=undistort_height,
         undistort_focal_length=undistort_focal_length,
         allowed_marker_ids=allowed_marker_ids,
+        use_ema=use_ema,
         ema_alpha=ema_alpha,
     )
     localizer.run()
@@ -640,6 +644,11 @@ def parse_args() -> argparse.Namespace:
         default=0.2,
         help="EMA smoothing factor for pose (0 disables).",
     )
+    parser.add_argument(
+        "--disable-ema",
+        action="store_true",
+        help="Disable EMA smoothing regardless of --ema-alpha.",
+    )
     return parser.parse_args()
 
 
@@ -654,6 +663,7 @@ def main() -> None:
         undistort_height=args.undistort_height,
         undistort_focal_length=args.undistort_focal_length,
         allowed_marker_ids=args.marker_ids,
+        use_ema=not args.disable_ema,
         ema_alpha=args.ema_alpha,
     )
 

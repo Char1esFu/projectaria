@@ -35,8 +35,6 @@ aria streaming start --interface wifi --device-ip 192.168.8.117 --use-ephemeral-
 # glass localization, specify arbitrary aruco marker id(s) in the setup
 source /opt/ros/humble/setup.bash
 python3 -m src.aruco_localization --marker-ids 1 2 # list all used marker ids in argument
-# or
-python3 -m src.aruco_localization --device-ip 192.168.8.117 --marker-ids 1 2
 
 # gaze detection
 # calibrate pitch-bias value by looking straight ahead and check pitch output. Compensate to 0 for each user

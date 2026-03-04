@@ -4,7 +4,7 @@ from typing import Optional
 
 import numpy as np
 import rclpy
-from geometry_msgs.msg import PointStamped, TransformStamped, Vector3
+from geometry_msgs.msg import PointStamped, PoseStamped, TransformStamped, Vector3
 from rclpy.node import Node
 from scipy.spatial.transform import Rotation
 from tf2_ros import Buffer, StaticTransformBroadcaster, TransformListener
@@ -49,6 +49,11 @@ class GazeIntersectionNode(Node):
         self._marker_pub = None
         if self._visualize:
             self._marker_pub = self.create_publisher(Marker, "/aria/gaze_markers", 10)
+        self._cam_pose_timeout = 0.5  # seconds
+        self._last_cam_pose_time: Optional[float] = None
+        self._cam_pose_sub = self.create_subscription(
+            PoseStamped, "/aria/cam_pose", self._on_cam_pose, 10
+        )
         self._subscription = self.create_subscription(
             Vector3, "/aria/gaze_euler", self._on_gaze, 10
         )
@@ -77,12 +82,17 @@ class GazeIntersectionNode(Node):
         tf_msg.transform.rotation.w = 1.0
         self._static_broadcaster.sendTransform(tf_msg)
 
+    def _on_cam_pose(self, msg: PoseStamped) -> None:
+        self._last_cam_pose_time = self.get_clock().now().nanoseconds / 1e9
+
     def _on_gaze(self, msg: Vector3) -> None:
+        now = self.get_clock().now().nanoseconds / 1e9
+        if self._last_cam_pose_time is None or (now - self._last_cam_pose_time) > self._cam_pose_timeout:
+            return
+
         pitch = float(msg.x)
         yaw = float(msg.y)
         dir_gaze = _yaw_pitch_to_unit_vector(yaw, pitch)
-        if self._visualize:
-            self._publish_gaze_ray(dir_gaze)
 
         try:
             transform = self._tf_buffer.lookup_transform(
@@ -112,6 +122,12 @@ class GazeIntersectionNode(Node):
         if t <= 0.0:
             return
         hit = origin + t * dir_base
+
+        if not (0.0 < hit[0] < 0.85 and -0.7 < hit[1] < 0.7):
+            return
+
+        if self._visualize:
+            self._publish_gaze_ray(dir_gaze)
 
         point_msg = PointStamped()
         point_msg.header.stamp = self.get_clock().now().to_msg()
