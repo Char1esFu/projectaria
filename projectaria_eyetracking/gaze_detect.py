@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--pitch-bias",
         type=float,
-        default=0.0,
+        default=0.2,
         help="Additive bias applied to predicted pitch (radians).",
     )
     return parser.parse_args()

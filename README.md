@@ -37,8 +37,8 @@ source /opt/ros/humble/setup.bash
 python3 -m src.aruco_localization --marker-ids 1 2 # list all used marker ids in argument
 
 # gaze detection
-# calibrate pitch-bias value by looking straight ahead and check pitch output. Compensate to 0 for each user
-python3 -m projectaria_eyetracking.gaze_detect --pitch-bias 0.28
+# with mouse focus on gaze image output window, press C to calibrate when user is looking straight ahead
+python3 -m projectaria_eyetracking.gaze_detect --device cuda:0
 
 # publish gaze table intersection
 python3 src/gaze_intersection_node.py --visualize
