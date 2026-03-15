@@ -79,7 +79,7 @@ For both workstation and laptop:
 
 #### Setup DDS config on workstation and laptop
 ```bash
-export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 export ROS_DOMAIN_ID=10
 export CYCLONEDDS_URI=file://$HOME/.ros/cyclonedds.xml
 ```

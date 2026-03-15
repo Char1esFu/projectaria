@@ -598,7 +598,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--marker-length-m",
         type=float,
-        default=0.047,
+        default=0.2,
         help="Marker side length in meters.",
     )
     parser.add_argument(
