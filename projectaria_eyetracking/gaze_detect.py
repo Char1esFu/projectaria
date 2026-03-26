@@ -49,6 +49,18 @@ def parse_args() -> argparse.Namespace:
         default=0.2,
         help="Additive bias applied to predicted pitch (radians).",
     )
+    parser.add_argument(
+        "--pitch-ema-alpha",
+        type=float,
+        default=0.9,
+        help="EMA smoothing factor for pitch (0 < alpha <= 1, lower = smoother).",
+    )
+    parser.add_argument(
+        "--yaw-ema-alpha",
+        type=float,
+        default=0.9,
+        help="EMA smoothing factor for yaw (0 < alpha <= 1, lower = smoother).",
+    )
     return parser.parse_args()
 
 def main() -> None:
@@ -107,6 +119,10 @@ def main() -> None:
     cv2.setWindowProperty(eyetrack_window, cv2.WND_PROP_TOPMOST, 1)
     cv2.moveWindow(eyetrack_window, 50, 800)
 
+    # EMA state
+    pitch_ema: float | None = None
+    yaw_ema: float | None = None
+
     # Calibration state
     calibrating = False
     calib_start = 0.0
@@ -156,8 +172,13 @@ def main() -> None:
                             f"pitch_offset={pitch_offset:.4f}, yaw_offset={yaw_offset:.4f}"
                         )
 
-                pitch = pitch_raw - pitch_offset
-                yaw = yaw_raw - yaw_offset
+                pitch_cal = pitch_raw - pitch_offset
+                yaw_cal = yaw_raw - yaw_offset
+
+                pitch_ema = pitch_cal if pitch_ema is None else args.pitch_ema_alpha * pitch_cal + (1 - args.pitch_ema_alpha) * pitch_ema
+                yaw_ema = yaw_cal if yaw_ema is None else args.yaw_ema_alpha * yaw_cal + (1 - args.yaw_ema_alpha) * yaw_ema
+                pitch = pitch_ema
+                yaw = yaw_ema
 
                 print(
                     f"pitch={pitch:.4f}, yaw={yaw:.4f}"
