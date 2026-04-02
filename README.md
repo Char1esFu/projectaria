@@ -28,9 +28,9 @@ python3 utils/device_stream.py --interface usb --update_iptables
 python3 utils/device_stream.py --interface wifi --device-ip 192.168.8.117 --update_iptables
 
 # subscribe first(needed in all scenarios)
-aria streaming start --interface usb --use-ephemeral-certs
+aria streaming start --interface usb --use-ephemeral-certs --profile profile23 # this profile supports high rgb fps
 # or 
-aria streaming start --interface wifi --device-ip 192.168.8.117 --use-ephemeral-certs
+aria streaming start --interface wifi --device-ip 192.168.8.117 --use-ephemeral-certs --profile profile18
 
 # glass localization, specify arbitrary aruco marker id(s) in the setup
 source /opt/ros/humble/setup.bash
@@ -43,6 +43,8 @@ python3 -m projectaria_eyetracking.gaze_detect --device cuda:0
 # publish gaze table intersection
 python3 src/gaze_intersection_node.py --visualize
 
+# record audio
+python -m src.audio_record --update_iptables --channel 0
 ```
 
 ## Utils
