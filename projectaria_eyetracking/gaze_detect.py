@@ -44,12 +44,6 @@ def parse_args() -> argparse.Namespace:
         help="Update iptables to enable receiving the data stream, only for Linux.",
     )
     parser.add_argument(
-        "--pitch-bias",
-        type=float,
-        default=0.2,
-        help="Additive bias applied to predicted pitch (radians).",
-    )
-    parser.add_argument(
         "--pitch-ema-alpha",
         type=float,
         default=0.9,
@@ -156,8 +150,8 @@ def main() -> None:
                 eye_tensor = torch.from_numpy(eyetrack_image)
 
                 preds, lower, upper = inference_model.predict(eye_tensor)
-                yaw_raw = -preds[0][0].item()
-                pitch_raw = preds[0][1].item() + args.pitch_bias
+                yaw_raw = - preds[0][0].item()
+                pitch_raw = preds[0][1].item()
 
                 if calibrating:
                     calib_pitches.append(pitch_raw)

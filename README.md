@@ -30,11 +30,11 @@ python3 utils/device_stream.py --interface wifi --device-ip 192.168.8.117 --upda
 # subscribe first(needed in all scenarios)
 aria streaming start --interface usb --use-ephemeral-certs --profile profile23 # this profile supports high rgb fps
 # or 
-aria streaming start --interface wifi --device-ip 192.168.8.117 --use-ephemeral-certs --profile profile18
+aria streaming start --interface wifi --device-ip 192.168.8.117 --use-ephemeral-certs --profile profile23
 
 # glass localization, specify arbitrary aruco marker id(s) in the setup
 source /opt/ros/humble/setup.bash
-python3 -m src.aruco_localization --marker-ids 1 2 # list all used marker ids in argument
+python3 -m src.aruco_localization --device-ip 192.168.8.117 --marker-ids 0 1 2 # list all used marker ids in argument
 
 # gaze detection
 # with mouse focus on gaze image output window, press C to calibrate when user is looking straight ahead
@@ -54,14 +54,14 @@ python3 -m src.imu_pose --imu-index 1 # or 0
 
 # streaming demo with individual message
 python3 -m utils.streaming_subscribe
-aria streaming stop
+aria streaming stop --device-ip 192.168.8.117
 ```
 
 ## Multi-device ROS config on local network
 Install dependency:
 ```bash
 sudo apt update
-sudo apt install ros-$ROS_DISTRO-rmw-cyclonedds-cpp
+sudo apt install ros-$ROS_DISTRO-rmw-fastrtps-cpp
 ```
 
 Verify `ip a` to check network interface name accordingly. Set up for both devices. Add cyclonedds config to `~/.ros/cyclonedds.xml`.

@@ -15,41 +15,11 @@ from projectaria_tools.core.calibration import (
     device_calibration_from_json_string,
     distort_by_calibration,
     get_linear_camera_calibration,
+    # get_spherical_camera_calibration,
 )
 from projectaria_tools.core.sensor_data import ImageDataRecord
 
 
-
-def _camera_matrix_from_calib(calib) -> np.ndarray:
-    fx, fy = calib.get_focal_lengths()
-    cx, cy = calib.get_principal_point()
-    return np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
-
-def _get_aruco_dictionary(name: str) -> cv2.aruco_Dictionary:
-    aruco = cv2.aruco
-    dict_id = getattr(aruco, name, None)
-    if dict_id is None:
-        raise ValueError(f"Unknown ArUco dictionary: {name}")
-    return aruco.getPredefinedDictionary(dict_id)
-
-def _invert_pose(rvec: np.ndarray, tvec: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    rotation_matrix, _ = cv2.Rodrigues(rvec)
-    rotation_inv = rotation_matrix.T
-    tvec_inv = -rotation_inv @ tvec.reshape(3, 1)
-    rvec_inv, _ = cv2.Rodrigues(rotation_inv)
-    return rvec_inv.reshape(3, 1), tvec_inv.reshape(3, 1)
-
-def _compose_pose(
-    parent_t: np.ndarray,
-    parent_q_xyzw: np.ndarray,
-    child_t: np.ndarray,
-    child_q_xyzw: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    parent_rot = Rotation.from_quat(parent_q_xyzw)
-    child_rot = Rotation.from_quat(child_q_xyzw)
-    composed_rot = parent_rot * child_rot
-    composed_t = parent_t + parent_rot.apply(child_t)
-    return composed_t, composed_rot.as_quat()
 
 def average_quaternions(quats_xyzw: list[np.ndarray], weights: np.ndarray) -> np.ndarray:
     ref = quats_xyzw[0]
@@ -186,28 +156,10 @@ class ArucoLocalizer:
         if not pose_entries:
             return
 
-        if len(pose_entries) == 1:
-            parent_frame, _, _, world_t, world_q_xyzw, _, _ = pose_entries[0]
-            world_t, world_q_xyzw = self._apply_ema(parent_frame, world_t, world_q_xyzw)
-            stamp = self.ros.publish_world_pose(parent_frame, world_t, world_q_xyzw)
-            self.ros.publish_world_camera_tf(parent_frame, world_t, world_q_xyzw, stamp)
-            return
-
         parent_frame = pose_entries[0][0]
-        filtered_entries = [entry for entry in pose_entries if entry[0] == parent_frame]
-        if len(filtered_entries) != len(pose_entries):
-            print("Mixed parent frames detected; averaging only matching parent frame poses.")
-
-        if len(filtered_entries) == 1:
-            parent_frame, _, _, world_t, world_q_xyzw, _, _ = filtered_entries[0]
-            world_t, world_q_xyzw = self._apply_ema(parent_frame, world_t, world_q_xyzw)
-            stamp = self.ros.publish_world_pose(parent_frame, world_t, world_q_xyzw)
-            self.ros.publish_world_camera_tf(parent_frame, world_t, world_q_xyzw, stamp)
-            return
-
-        world_ts = [entry[3] for entry in filtered_entries]
-        world_quats = [entry[4] for entry in filtered_entries]
-        cam_dists = np.array([entry[6] for entry in filtered_entries], dtype=np.float64)
+        world_ts = [entry[3] for entry in pose_entries]
+        world_quats = [entry[4] for entry in pose_entries]
+        cam_dists = np.array([entry[6] for entry in pose_entries], dtype=np.float64)
         weights = 1.0 / (cam_dists + 1e-6)
         weights_sum = np.sum(weights)
         if weights_sum > 0.0:
@@ -223,8 +175,10 @@ class ArucoLocalizer:
     def _compute_world_pose(
         self, marker_id: int, rvec: np.ndarray, tvec: np.ndarray
     ) -> Optional[tuple[str, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int, float]]:
-        rvec_cam_in_marker, tvec_cam_in_marker = _invert_pose(rvec, tvec)
-        rotation_cam_in_marker, _ = cv2.Rodrigues(rvec_cam_in_marker)
+        # invert marker-in-camera pose to get camera-in-marker pose: R^T, -R^T @ t
+        rotation_marker_in_cam, _ = cv2.Rodrigues(rvec)
+        rotation_cam_in_marker = rotation_marker_in_cam.T
+        tvec_cam_in_marker = -rotation_cam_in_marker @ tvec.reshape(3, 1)
         quat_xyzw = Rotation.from_matrix(rotation_cam_in_marker).as_quat()
         quat_cam_in_marker = np.array(
             [
@@ -258,7 +212,9 @@ class ArucoLocalizer:
             ],
             dtype=np.float64,
         )
-        world_t, world_q_xyzw = _compose_pose(marker_t, marker_q, cam_t, cam_q)
+        marker_rot = Rotation.from_quat(marker_q)
+        world_t = marker_t + marker_rot.apply(cam_t)
+        world_q_xyzw = (marker_rot * Rotation.from_quat(cam_q)).as_quat()
         cam_dist = float(np.linalg.norm(cam_t))
         return parent_frame, marker_t, marker_q, world_t, world_q_xyzw, marker_id, cam_dist
 
@@ -320,17 +276,29 @@ class ArucoLocalizer:
                 device_client.disconnect(device)
 
     def _setup_dst_calib(self) -> None:
+        # self.dst_calib = get_spherical_camera_calibration(
         self.dst_calib = get_linear_camera_calibration(
             self.undistort_width,
             self.undistort_height,
             self.undistort_focal_length,
             "camera-rgb",
         )
-        self.camera_matrix = _camera_matrix_from_calib(self.dst_calib)
+        fx, fy = self.dst_calib.get_focal_lengths()
+        cx, cy = self.dst_calib.get_principal_point()
+        
+        self.camera_matrix = np.array([
+            [fx, 0.0, cx], 
+            [0.0, fy, cy], 
+            [0.0, 0.0, 1.0]], 
+            dtype=np.float64)
 
     def _setup_aruco_detector(self) -> None:
-        self.dictionary = _get_aruco_dictionary(self.dictionary_name)
         self.aruco = cv2.aruco
+        dict_id = getattr(self.aruco, self.dictionary_name, None)
+        if dict_id is None:
+            raise ValueError(f"Unknown ArUco dictionary: {self.dictionary_name}")
+        self.dictionary = self.aruco.getPredefinedDictionary(dict_id)
+
         self.detector_params = self.aruco.DetectorParameters()
         if hasattr(self.aruco, "CORNER_REFINE_SUBPIX"):
             self.detector_params.cornerRefinementMethod = self.aruco.CORNER_REFINE_SUBPIX
