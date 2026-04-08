@@ -108,6 +108,10 @@ class GazeRgbVisualizer:
             rgb_image = distort_by_calibration(rgb_image, self.dst_calib, self.rgb_calib)
         return rgb_image
 
+    # Gaze ray origin not the optical center.
+    # Camera X maps to display row (after rot90), so the projection shifts by
+    GAZE_ORIGIN_X_OFFSET: float = 0.05
+
     def _draw_gaze(self, display_image: np.ndarray) -> None:
         """Project gaze (pitch, yaw) onto the display image (already rot90'd) and draw crosshair.
 
@@ -115,17 +119,17 @@ class GazeRgbVisualizer:
           raw col (u) → display row   →  vertical axis  → pitch
           raw row (v) → display col   →  horizontal axis → yaw
 
-        In display coordinates directly:
-          display_col = cx + fx * tan(yaw)    (yaw+ = look right = larger col)
-          display_row = cy - fy * tan(pitch)  (pitch+ = look up = smaller row)
+        The gaze ray origin is offset GAZE_ORIGIN_X_OFFSET in camera X (→ display row):
+          display_col = cx + fx * tan(yaw)
+          display_row = cy - fy * tan(pitch) + fy * GAZE_ORIGIN_X_OFFSET
         """
         fx = self.camera_matrix[0, 0]
         fy = self.camera_matrix[1, 1]
         cx = self.camera_matrix[0, 2]
         cy = self.camera_matrix[1, 2]
 
-        display_col = cx + fx * np.tan(self.gaze_yaw)
-        display_row = cy - fy * np.tan(self.gaze_pitch)
+        display_col = cx + fx * np.tan(self.gaze_yaw) + fx * self.GAZE_ORIGIN_X_OFFSET
+        display_row = cy - fy * np.tan(self.gaze_pitch) 
 
         gaze_pt = (int(round(display_col)), int(round(display_row)))
 

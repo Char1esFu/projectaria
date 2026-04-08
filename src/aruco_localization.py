@@ -43,7 +43,6 @@ class ArucoLocalizer:
         update_iptables_rules: bool,
         undistort_width: int,
         undistort_height: int,
-        undistort_focal_length: float,
         allowed_marker_ids: Optional[list[int]],
         use_ema: bool,
         ema_alpha: float,
@@ -54,7 +53,6 @@ class ArucoLocalizer:
         self.update_iptables_rules = update_iptables_rules
         self.undistort_width = undistort_width
         self.undistort_height = undistort_height
-        self.undistort_focal_length = undistort_focal_length
         self.allowed_marker_ids = allowed_marker_ids
         self.use_ema = bool(use_ema)
         self.ema_alpha = float(ema_alpha)
@@ -123,9 +121,15 @@ class ArucoLocalizer:
 
             rgb_image = self._prepare_rgb_image(self.observer.rgb_image)
             self._detect_markers(rgb_image, allowed_id_set)
-
-            cv2.imshow(window_name, np.rot90(rgb_image, -1))
             self.observer.rgb_image = None
+
+            display = np.ascontiguousarray(np.rot90(rgb_image, -1))
+            h, w = display.shape[:2]
+            crop_size = int(min(w, h) / 1.4143)
+            ox = (w - crop_size) // 2
+            oy = (h - crop_size) // 2
+            display = display[oy:oy + crop_size, ox:ox + crop_size]
+            cv2.imshow(window_name, display)
 
     def _prepare_rgb_image(self, bgr_image: np.ndarray) -> np.ndarray:
         rgb_image = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
@@ -276,21 +280,25 @@ class ArucoLocalizer:
                 device_client.disconnect(device)
 
     def _setup_dst_calib(self) -> None:
-        # self.dst_calib = get_spherical_camera_calibration(
+        src_w, _ = self.rgb_calib.get_image_size()
+        src_focal = self.rgb_calib.get_focal_lengths()[0]
+        focal_length = src_focal * self.undistort_width / src_w
+        print(
+            f"dst_calib: focal_length={focal_length:.2f} px "
+            f"({src_focal:.2f} * {self.undistort_width}/{src_w})"
+        )
         self.dst_calib = get_linear_camera_calibration(
             self.undistort_width,
             self.undistort_height,
-            self.undistort_focal_length,
+            focal_length,
             "camera-rgb",
         )
         fx, fy = self.dst_calib.get_focal_lengths()
         cx, cy = self.dst_calib.get_principal_point()
-        
-        self.camera_matrix = np.array([
-            [fx, 0.0, cx], 
-            [0.0, fy, cy], 
-            [0.0, 0.0, 1.0]], 
-            dtype=np.float64)
+        self.camera_matrix = np.array(
+            [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64
+        )
+        print(f"camera_matrix: fx={fx:.2f} fy={fy:.2f} cx={cx:.2f} cy={cy:.2f}")
 
     def _setup_aruco_detector(self) -> None:
         self.aruco = cv2.aruco
@@ -538,9 +546,8 @@ def run_rgb_aruco_localization(
     marker_length_m: float = 0.04,
     dictionary_name: str = "DICT_4X4_50",
     update_iptables_rules: bool = False,
-    undistort_width: int = 2880,
-    undistort_height: int = 2880,
-    undistort_focal_length: float = 450.0,
+    undistort_width: int = 1408,
+    undistort_height: int = 1408,
     allowed_marker_ids: Optional[list[int]] = None,
     use_ema: bool = True,
     ema_alpha: float = 0.95,
@@ -552,7 +559,6 @@ def run_rgb_aruco_localization(
         update_iptables_rules=update_iptables_rules,
         undistort_width=undistort_width,
         undistort_height=undistort_height,
-        undistort_focal_length=undistort_focal_length,
         allowed_marker_ids=allowed_marker_ids,
         use_ema=use_ema,
         ema_alpha=ema_alpha,
@@ -594,12 +600,6 @@ def parse_args() -> argparse.Namespace:
         help="Height of the undistorted RGB output image.",
     )
     parser.add_argument(
-        "--undistort-focal-length",
-        type=float,
-        default=450.0,
-        help="Focal length for the undistorted RGB output calibration.",
-    )
-    parser.add_argument(
         "--marker-ids",
         type=int,
         nargs="+",
@@ -629,7 +629,6 @@ def main() -> None:
         update_iptables_rules=args.update_iptables,
         undistort_width=args.undistort_width,
         undistort_height=args.undistort_height,
-        undistort_focal_length=args.undistort_focal_length,
         allowed_marker_ids=args.marker_ids,
         use_ema=not args.disable_ema,
         ema_alpha=args.ema_alpha,

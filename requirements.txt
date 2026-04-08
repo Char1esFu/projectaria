@@ -10,5 +10,6 @@ torchvision
 projectaria-tools[all]
 projectaria-mps
 scipy
+mediapipe==0.10.14
 setuptools==80.10.1
 projectaria_client_sdk

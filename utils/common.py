@@ -14,6 +14,7 @@
 
 import signal
 import subprocess
+import sys
 from contextlib import contextmanager
 
 import cv2
@@ -39,6 +40,8 @@ def update_iptables() -> None:
     ]
     print("Running the following command to update iptables:")
     print(update_iptables_cmd)
+    sys.stdout.flush()
+    sys.stderr.flush()
     subprocess.run(update_iptables_cmd)
 
 
