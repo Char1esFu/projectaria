@@ -37,7 +37,7 @@ source /opt/ros/humble/setup.bash
 python3 -m src.aruco_localization --device-ip 192.168.8.117 --marker-ids 0 1 2 # list all used marker ids in argument
 
 # gaze detection
-# with mouse focus on gaze image output window, press C to calibrate when user is looking straight ahead
+# with mouse focus on gaze image output window, keep pressing C to calibrate while focusing on center of marker 
 python3 -m projectaria_eyetracking.gaze_detect --device cuda:0
 
 # publish gaze table intersection
@@ -45,6 +45,12 @@ python3 src/gaze_intersection_node.py --visualize
 
 # record audio
 python -m src.audio_record --update_iptables --channel 0
+
+# hand gesture detection on egocentric camera
+python3 -m src.hand_gesture --device-ip 192.168.8.117
+
+# gaze projection on egocentric image
+python -m src.gaze_rgb_visualizer --device-ip 192.168.8.117
 ```
 
 ## Utils
