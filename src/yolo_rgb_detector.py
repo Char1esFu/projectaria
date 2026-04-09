@@ -19,12 +19,11 @@ class YoloOverlay(RgbOverlay):
         self.model = YOLO(str(model_path))
         self.conf_threshold = conf_threshold
 
-    def draw(self, rgb_image: np.ndarray, camera_matrix: Optional[np.ndarray]) -> None:
-        bgr = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
+    def draw(self, display_image: np.ndarray, _camera_matrix: Optional[np.ndarray]) -> None:
+        bgr = cv2.cvtColor(display_image, cv2.COLOR_RGB2BGR)
         results = self.model(bgr, conf=self.conf_threshold, verbose=False)
         annotated_bgr = results[0].plot()
-        # Write detections back into rgb_image in-place
-        np.copyto(rgb_image, cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB))
+        np.copyto(display_image, cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB))
 
 
 def parse_args() -> argparse.Namespace:

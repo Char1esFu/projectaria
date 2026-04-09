@@ -40,12 +40,12 @@ class HandGestureOverlay(RgbOverlay):
             min_tracking_confidence=tracking_confidence,
         )
 
-    def draw(self, rgb_image: np.ndarray, camera_matrix: Optional[np.ndarray]) -> None:
-        results = self.hands.process(rgb_image)
+    def draw(self, display_image: np.ndarray, camera_matrix: Optional[np.ndarray]) -> None:
+        results = self.hands.process(display_image)
         if not results.multi_hand_landmarks:
             return
 
-        h, w = rgb_image.shape[:2]
+        h, w = display_image.shape[:2]
 
         for hand_landmarks, hand_world_landmarks, handedness in zip(
             results.multi_hand_landmarks,
@@ -53,7 +53,7 @@ class HandGestureOverlay(RgbOverlay):
             results.multi_handedness,
         ):
             self.mp_drawing.draw_landmarks(
-                rgb_image,
+                display_image,
                 hand_landmarks,
                 self.mp_hands.HAND_CONNECTIONS,
                 self.mp_drawing_styles.get_default_hand_landmarks_style(),
@@ -76,14 +76,14 @@ class HandGestureOverlay(RgbOverlay):
             if not success:
                 continue
 
-            cv2.drawFrameAxes(rgb_image, camera_matrix, self.dist_coeffs, rvec, tvec, 0.05)
+            cv2.drawFrameAxes(display_image, camera_matrix, self.dist_coeffs, rvec, tvec, 0.05)
 
             label = handedness.classification[0].label
             dist_m = float(np.linalg.norm(tvec))
             wrist = hand_landmarks.landmark[self.mp_hands.HandLandmark.WRIST]
             px, py = int(wrist.x * w), int(wrist.y * h)
             cv2.putText(
-                rgb_image,
+                display_image,
                 f"{label}  {dist_m:.2f} m",
                 (px, py - 12),
                 cv2.FONT_HERSHEY_SIMPLEX,

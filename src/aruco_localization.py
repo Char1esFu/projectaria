@@ -63,11 +63,11 @@ class ArucoOverlay(RgbOverlay):
 
         self._allowed_id_set = set(allowed_marker_ids) if allowed_marker_ids else None
 
-    def draw(self, rgb_image: np.ndarray, camera_matrix: Optional[np.ndarray]) -> None:
-        self._detect_markers(rgb_image, camera_matrix)
+    def draw(self, display_image: np.ndarray, camera_matrix: Optional[np.ndarray]) -> None:
+        self._detect_markers(display_image, camera_matrix)
 
-    def _detect_markers(self, rgb_image: np.ndarray, camera_matrix: Optional[np.ndarray]) -> None:
-        gray = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2GRAY)
+    def _detect_markers(self, display_image: np.ndarray, camera_matrix: Optional[np.ndarray]) -> None:
+        gray = cv2.cvtColor(display_image, cv2.COLOR_RGB2GRAY)
         if self.aruco_detector is not None:
             corners, ids, _ = self.aruco_detector.detectMarkers(gray)
         else:
@@ -87,7 +87,7 @@ class ArucoOverlay(RgbOverlay):
             entry = self._compute_world_pose(int(marker_id), rvec, tvec)
             if entry is not None:
                 pose_entries.append(entry)
-            self._draw_marker(rgb_image, int(marker_id), corner_set, rvec, tvec, camera_matrix)
+            self._draw_marker(display_image, int(marker_id), corner_set, rvec, tvec, camera_matrix)
 
         if not pose_entries:
             return

@@ -5,9 +5,8 @@ AriaRgbStream handles device connection, calibration loading, undistortion,
 and the display loop. Feature-specific logic is implemented as RgbOverlay
 subclasses and registered via add_overlay().
 
-Overlay draw hooks:
-  draw(rgb_image, camera_matrix)         -- called on the pre-rotation RGB image
-  draw_display(display_image, camera_matrix) -- called after rot90 + crop
+Overlays implement draw(display_image, camera_matrix), which is called after
+rot90 + crop. camera_matrix has cx/cy adjusted to the cropped image origin.
 
 Example usage (single feature):
     stream = AriaRgbStream(device_ip="192.168.x.x")
@@ -41,14 +40,14 @@ from projectaria_tools.core.sensor_data import ImageDataRecord
 class RgbOverlay:
     """Base class for overlays drawn on the Aria RGB stream.
 
-    Subclasses override draw() and/or draw_display().
+    Subclasses implement draw(display_image, camera_matrix).
+    display_image is the post-rotation, cropped image ready for imshow.
+    camera_matrix has cx/cy adjusted to the cropped image coordinate origin.
     """
 
-    def draw(self, rgb_image: np.ndarray, camera_matrix: Optional[np.ndarray]) -> None:
-        """Draw on the pre-rotation undistorted RGB image (camera coordinate space)."""
-
-    def draw_display(self, display_image: np.ndarray, camera_matrix: Optional[np.ndarray]) -> None:
-        """Draw on the post-rotation cropped display image (display coordinate space)."""
+    def draw(self, display_image: np.ndarray, camera_matrix: np.ndarray) -> None:
+        """Draw on the post-rotation cropped display image."""
+        _ = display_image, camera_matrix
 
 
 class AriaRgbStream:
@@ -110,9 +109,6 @@ class AriaRgbStream:
             rgb_image = self._prepare_rgb_image(self.observer.rgb_image)
             self.observer.rgb_image = None
 
-            for overlay in self._overlays:
-                overlay.draw(rgb_image, self.camera_matrix)
-
             display = np.ascontiguousarray(np.rot90(rgb_image, -1))
             h, w = display.shape[:2]
             crop_size = int(min(w, h) / 1.4143)
@@ -120,8 +116,13 @@ class AriaRgbStream:
             oy = (h - crop_size) // 2
             display = display[oy:oy + crop_size, ox:ox + crop_size]
 
+            # Shift cx/cy so overlays can use camera_matrix directly in cropped image coordinates.
+            display_matrix = self.camera_matrix.copy()
+            display_matrix[0, 2] -= ox
+            display_matrix[1, 2] -= oy
+
             for overlay in self._overlays:
-                overlay.draw_display(display, self.camera_matrix)
+                overlay.draw(display, display_matrix)
 
             cv2.imshow(self.window_name, display)
 
