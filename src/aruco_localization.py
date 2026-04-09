@@ -3,22 +3,13 @@ import sys
 
 import argparse
 import json
-import time
 from typing import Optional
 import aria.sdk as aria
 import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation, Slerp
 
-from utils.common import quit_keypress, update_iptables
-from projectaria_tools.core.calibration import (
-    device_calibration_from_json_string,
-    distort_by_calibration,
-    get_linear_camera_calibration,
-    # get_spherical_camera_calibration,
-)
-from projectaria_tools.core.sensor_data import ImageDataRecord
-
+from utils.aria_rgb_stream import AriaRgbStream, RgbOverlay
 
 
 def average_quaternions(quats_xyzw: list[np.ndarray], weights: np.ndarray) -> np.ndarray:
@@ -34,128 +25,71 @@ def average_quaternions(quats_xyzw: list[np.ndarray], weights: np.ndarray) -> np
         return ref
     return accum / norm
 
-class ArucoLocalizer:
+
+class ArucoOverlay(RgbOverlay):
+    """Detects ArUco markers, draws them, and publishes poses via ROS2."""
+
+    requires_calibration: bool = True
+
     def __init__(
         self,
-        device_ip: Optional[str],
         marker_length_m: float,
         dictionary_name: str,
-        update_iptables_rules: bool,
-        undistort_width: int,
-        undistort_height: int,
         allowed_marker_ids: Optional[list[int]],
         use_ema: bool,
         ema_alpha: float,
+        ros: "RosPosePublisher",
     ) -> None:
-        self.device_ip = device_ip
         self.marker_length_m = marker_length_m
-        self.dictionary_name = dictionary_name
-        self.update_iptables_rules = update_iptables_rules
-        self.undistort_width = undistort_width
-        self.undistort_height = undistort_height
         self.allowed_marker_ids = allowed_marker_ids
         self.use_ema = bool(use_ema)
         self.ema_alpha = float(ema_alpha)
-
-        self.ros2_topic = "/aria/cam_pose"
-        self.ros2_marker_frame_prefix = "aruco_marker_"
-        self.ros2_camera_frame = "aria_camera_rgb"
-        
-        # rgb camera frame and image are rotated 90 degrees. Compensate to match convention of camera facing forward and x right, y down, z forward.
-        self.camera_frame_correction_q_xyzw = Rotation.from_euler("z", -90.0, degrees=True).as_quat()
-        
-        self.static_tf_config_path = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "..", "config", "aruco_tf.json")
-        )
-
-        self.rgb_calib = None
-        self.dst_calib = None
-        self.camera_matrix = None
+        self.ros = ros
         self.dist_coeffs = np.zeros((5, 1), dtype=np.float64)
-
-        self.aruco = None
-        self.dictionary = None
-        self.detector_params = None
-        self.aruco_detector = None
-
-        self.ros = None
-
-        self.streaming_client = None
-        self.observer = None
-
         self._ema_state = {}
 
-    def run(self) -> None:
-        if self.update_iptables_rules and sys.platform.startswith("linux"):
-            update_iptables()
+        self.aruco = cv2.aruco
+        dict_id = getattr(self.aruco, dictionary_name, None)
+        if dict_id is None:
+            raise ValueError(f"Unknown ArUco dictionary: {dictionary_name}")
+        dictionary = self.aruco.getPredefinedDictionary(dict_id)
+        detector_params = self.aruco.DetectorParameters()
+        if hasattr(self.aruco, "CORNER_REFINE_SUBPIX"):
+            detector_params.cornerRefinementMethod = self.aruco.CORNER_REFINE_SUBPIX
+        if hasattr(self.aruco, "ArucoDetector"):
+            self.aruco_detector = self.aruco.ArucoDetector(dictionary, detector_params)
+        else:
+            self.aruco_detector = None
+        self._dictionary = dictionary
+        self._detector_params = detector_params
 
-        self._load_rgb_calibration()
-        self._setup_dst_calib()
-        self._setup_aruco_detector()
+        self._allowed_id_set = set(allowed_marker_ids) if allowed_marker_ids else None
 
-        aria.set_log_level(aria.Level.Info)
+    def draw(self, rgb_image: np.ndarray, camera_matrix: Optional[np.ndarray]) -> None:
+        self._detect_markers(rgb_image, camera_matrix)
 
-        self._setup_ros()
-        self.ros.publish_static_tf()
-        self._setup_streaming()
-
-        self._run_loop()
-
-        print("Stop listening to RGB data")
-        self.streaming_client.unsubscribe()
-        self._shutdown_ros()
-
-    def _run_loop(self) -> None:
-        window_name = "Aria RGB ArUco"
-        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(window_name, 1024, 1024)
-        cv2.setWindowProperty(window_name, cv2.WND_PROP_TOPMOST, 1)
-        cv2.moveWindow(window_name, 50, 50)
-
-        allowed_id_set = set(self.allowed_marker_ids) if self.allowed_marker_ids else None
-
-        while not quit_keypress():
-            if self.observer.rgb_image is None:
-                time.sleep(0.001)
-                continue
-
-            rgb_image = self._prepare_rgb_image(self.observer.rgb_image)
-            self._detect_markers(rgb_image, allowed_id_set)
-            self.observer.rgb_image = None
-
-            display = np.ascontiguousarray(np.rot90(rgb_image, -1))
-            h, w = display.shape[:2]
-            crop_size = int(min(w, h) / 1.4143)
-            ox = (w - crop_size) // 2
-            oy = (h - crop_size) // 2
-            display = display[oy:oy + crop_size, ox:ox + crop_size]
-            cv2.imshow(window_name, display)
-
-    def _prepare_rgb_image(self, bgr_image: np.ndarray) -> np.ndarray:
-        rgb_image = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
-        if self.rgb_calib is not None and self.dst_calib is not None:
-            rgb_image = distort_by_calibration(rgb_image, self.dst_calib, self.rgb_calib)
-        return rgb_image
-
-    def _detect_markers(self, rgb_image: np.ndarray, allowed_id_set: Optional[set[int]]):
+    def _detect_markers(self, rgb_image: np.ndarray, camera_matrix: Optional[np.ndarray]) -> None:
         gray = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2GRAY)
-        corners, ids, _ = self.aruco_detector.detectMarkers(gray)
+        if self.aruco_detector is not None:
+            corners, ids, _ = self.aruco_detector.detectMarkers(gray)
+        else:
+            corners, ids, _ = cv2.aruco.detectMarkers(gray, self._dictionary, parameters=self._detector_params)
 
         if ids is None or len(ids) == 0:
             return
 
         rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(
-            corners, self.marker_length_m, self.camera_matrix, self.dist_coeffs
+            corners, self.marker_length_m, camera_matrix, self.dist_coeffs
         )
 
         pose_entries = []
         for marker_id, corner_set, rvec, tvec in zip(ids.flatten(), corners, rvecs, tvecs):
-            if allowed_id_set is not None and int(marker_id) not in allowed_id_set:
+            if self._allowed_id_set is not None and int(marker_id) not in self._allowed_id_set:
                 continue
             entry = self._compute_world_pose(int(marker_id), rvec, tvec)
             if entry is not None:
                 pose_entries.append(entry)
-            self._draw_marker(rgb_image, int(marker_id), corner_set, rvec, tvec)
+            self._draw_marker(rgb_image, int(marker_id), corner_set, rvec, tvec, camera_matrix)
 
         if not pose_entries:
             return
@@ -166,10 +100,7 @@ class ArucoLocalizer:
         cam_dists = np.array([entry[6] for entry in pose_entries], dtype=np.float64)
         weights = 1.0 / (cam_dists + 1e-6)
         weights_sum = np.sum(weights)
-        if weights_sum > 0.0:
-            weights = weights / weights_sum
-        else:
-            weights = np.ones_like(weights) / float(len(weights))
+        weights = weights / weights_sum if weights_sum > 0.0 else np.ones_like(weights) / float(len(weights))
         avg_t = np.sum(np.stack(world_ts, axis=0) * weights[:, None], axis=0)
         avg_q = average_quaternions(world_quats, weights)
         avg_t, avg_q = self._apply_ema(parent_frame, avg_t, avg_q)
@@ -178,19 +109,13 @@ class ArucoLocalizer:
 
     def _compute_world_pose(
         self, marker_id: int, rvec: np.ndarray, tvec: np.ndarray
-    ) -> Optional[tuple[str, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int, float]]:
-        # invert marker-in-camera pose to get camera-in-marker pose: R^T, -R^T @ t
+    ) -> Optional[tuple]:
         rotation_marker_in_cam, _ = cv2.Rodrigues(rvec)
         rotation_cam_in_marker = rotation_marker_in_cam.T
         tvec_cam_in_marker = -rotation_cam_in_marker @ tvec.reshape(3, 1)
         quat_xyzw = Rotation.from_matrix(rotation_cam_in_marker).as_quat()
         quat_cam_in_marker = np.array(
-            [
-                float(quat_xyzw[3]),
-                float(quat_xyzw[0]),
-                float(quat_xyzw[1]),
-                float(quat_xyzw[2]),
-            ],
+            [float(quat_xyzw[3]), float(quat_xyzw[0]), float(quat_xyzw[1]), float(quat_xyzw[2])],
             dtype=np.float64,
         )
 
@@ -200,20 +125,12 @@ class ArucoLocalizer:
 
         parent_frame, marker_t, marker_q = static_entry
         cam_t = np.array(
-            [
-                float(tvec_cam_in_marker[0][0]),
-                float(tvec_cam_in_marker[1][0]),
-                float(tvec_cam_in_marker[2][0]),
-            ],
+            [float(tvec_cam_in_marker[0][0]), float(tvec_cam_in_marker[1][0]), float(tvec_cam_in_marker[2][0])],
             dtype=np.float64,
         )
         cam_q = np.array(
-            [
-                float(quat_cam_in_marker[1]),
-                float(quat_cam_in_marker[2]),
-                float(quat_cam_in_marker[3]),
-                float(quat_cam_in_marker[0]),
-            ],
+            [float(quat_cam_in_marker[1]), float(quat_cam_in_marker[2]),
+             float(quat_cam_in_marker[3]), float(quat_cam_in_marker[0])],
             dtype=np.float64,
         )
         marker_rot = Rotation.from_quat(marker_q)
@@ -245,132 +162,16 @@ class ArucoLocalizer:
         corner_set,
         rvec: np.ndarray,
         tvec: np.ndarray,
+        camera_matrix: np.ndarray,
     ) -> None:
         pts = corner_set.reshape(-1, 2).astype(np.int32)
         cv2.polylines(rgb_image, [pts], True, (0, 255, 0), 2)
         text_pos = (int(pts[0][0]), int(pts[0][1]) - 6)
         cv2.putText(
-            rgb_image,
-            f"id:{marker_id}",
-            text_pos,
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (0, 255, 0),
-            1,
-            cv2.LINE_AA,
+            rgb_image, f"id:{marker_id}", text_pos,
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA,
         )
-        cv2.drawFrameAxes(rgb_image, self.camera_matrix, self.dist_coeffs, rvec, tvec, 0.03)
-
-    def _load_rgb_calibration(self) -> None:
-        device_client = aria.DeviceClient()
-        client_config = aria.DeviceClientConfig()
-        if self.device_ip:
-            client_config.ip_v4_address = self.device_ip
-        device_client.set_client_config(client_config)
-        device = None
-        try:
-            device = device_client.connect()
-            sensors_calib_json = device.streaming_manager.sensors_calibration()
-            sensors_calib = device_calibration_from_json_string(sensors_calib_json)
-            self.rgb_calib = sensors_calib.get_camera_calib("camera-rgb")
-        except Exception as exc:
-            raise RuntimeError(f"Failed to load RGB calibration: {exc}") from exc
-        finally:
-            if device is not None:
-                device_client.disconnect(device)
-
-    def _setup_dst_calib(self) -> None:
-        src_w, _ = self.rgb_calib.get_image_size()
-        src_focal = self.rgb_calib.get_focal_lengths()[0]
-        focal_length = src_focal * self.undistort_width / src_w
-        print(
-            f"dst_calib: focal_length={focal_length:.2f} px "
-            f"({src_focal:.2f} * {self.undistort_width}/{src_w})"
-        )
-        self.dst_calib = get_linear_camera_calibration(
-            self.undistort_width,
-            self.undistort_height,
-            focal_length,
-            "camera-rgb",
-        )
-        fx, fy = self.dst_calib.get_focal_lengths()
-        cx, cy = self.dst_calib.get_principal_point()
-        self.camera_matrix = np.array(
-            [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64
-        )
-        print(f"camera_matrix: fx={fx:.2f} fy={fy:.2f} cx={cx:.2f} cy={cy:.2f}")
-
-    def _setup_aruco_detector(self) -> None:
-        self.aruco = cv2.aruco
-        dict_id = getattr(self.aruco, self.dictionary_name, None)
-        if dict_id is None:
-            raise ValueError(f"Unknown ArUco dictionary: {self.dictionary_name}")
-        self.dictionary = self.aruco.getPredefinedDictionary(dict_id)
-
-        self.detector_params = self.aruco.DetectorParameters()
-        if hasattr(self.aruco, "CORNER_REFINE_SUBPIX"):
-            self.detector_params.cornerRefinementMethod = self.aruco.CORNER_REFINE_SUBPIX
-        if hasattr(self.aruco, "ArucoDetector"):
-            self.aruco_detector = self.aruco.ArucoDetector(self.dictionary, self.detector_params)
-        else:
-            self.aruco_detector = None
-
-    def _setup_ros(self) -> None:
-        self.ros = RosPosePublisher(
-            topic=self.ros2_topic,
-            marker_frame_prefix=self.ros2_marker_frame_prefix,
-            camera_frame=self.ros2_camera_frame,
-            static_tf_config_path=self.static_tf_config_path,
-            camera_frame_correction_q_xyzw=self.camera_frame_correction_q_xyzw,
-        )
-        self.ros.setup()
-        if self.ros is None:
-            raise RuntimeError("ROS2 publisher setup failed: ros instance is None.")
-
-    def _setup_streaming(self) -> None:
-        self.streaming_client = aria.StreamingClient()
-        config = self.streaming_client.subscription_config
-        config.subscriber_data_type = aria.StreamingDataType.Rgb
-        config.message_queue_size[aria.StreamingDataType.Rgb] = 1
-        options = aria.StreamingSecurityOptions()
-        options.use_ephemeral_certs = True
-        config.security_options = options
-        self.streaming_client.subscription_config = config
-
-        class StreamingClientObserver:
-            def __init__(self):
-                self.rgb_image = None
-                self.last_print_time = {}
-                self.sample_counts = {}
-
-            def _tick(self, key: str, count: int = 1):
-                now = time.time()
-                if key not in self.last_print_time:
-                    self.last_print_time[key] = now
-                    self.sample_counts[key] = 0
-                self.sample_counts[key] += count
-                elapsed = now - self.last_print_time[key]
-                if elapsed >= 1.0:
-                    rate = self.sample_counts[key] / elapsed
-                    # print(f"{key}: {rate:.2f} Hz")
-                    self.last_print_time[key] = now
-                    self.sample_counts[key] = 0
-
-            def on_image_received(self, image: np.ndarray, record: ImageDataRecord):
-                if record.camera_id != aria.CameraId.Rgb:
-                    return
-                self.rgb_image = image
-                self._tick("RGB")
-
-        self.observer = StreamingClientObserver()
-        self.streaming_client.set_streaming_client_observer(self.observer)
-
-        print("Start listening to RGB data")
-        self.streaming_client.subscribe()
-
-    def _shutdown_ros(self) -> None:
-        if self.ros is not None:
-            self.ros.shutdown()
+        cv2.drawFrameAxes(rgb_image, camera_matrix, self.dist_coeffs, rvec, tvec, 0.03)
 
 
 class RosPosePublisher:
@@ -438,14 +239,8 @@ class RosPosePublisher:
 
                 self.static_marker_transforms[marker_id] = (
                     parent_frame,
-                    np.array(
-                        [float(translation[0]), float(translation[1]), float(translation[2])],
-                        dtype=np.float64,
-                    ),
-                    np.array(
-                        [float(rotation[0]), float(rotation[1]), float(rotation[2]), float(rotation[3])],
-                        dtype=np.float64,
-                    ),
+                    np.array([float(translation[0]), float(translation[1]), float(translation[2])], dtype=np.float64),
+                    np.array([float(rotation[0]), float(rotation[1]), float(rotation[2]), float(rotation[3])], dtype=np.float64),
                 )
 
                 tf_msg = self.TransformStamped()
@@ -552,71 +347,55 @@ def run_rgb_aruco_localization(
     use_ema: bool = True,
     ema_alpha: float = 0.95,
 ) -> None:
-    localizer = ArucoLocalizer(
-        device_ip=device_ip,
+    static_tf_config_path = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "config", "aruco_tf.json")
+    )
+    camera_frame_correction_q_xyzw = Rotation.from_euler("z", -90.0, degrees=True).as_quat()
+
+    ros = RosPosePublisher(
+        topic="/aria/cam_pose",
+        marker_frame_prefix="aruco_marker_",
+        camera_frame="aria_camera_rgb",
+        static_tf_config_path=static_tf_config_path,
+        camera_frame_correction_q_xyzw=camera_frame_correction_q_xyzw,
+    )
+    ros.setup()
+    ros.publish_static_tf()
+
+    overlay = ArucoOverlay(
         marker_length_m=marker_length_m,
         dictionary_name=dictionary_name,
-        update_iptables_rules=update_iptables_rules,
-        undistort_width=undistort_width,
-        undistort_height=undistort_height,
         allowed_marker_ids=allowed_marker_ids,
         use_ema=use_ema,
         ema_alpha=ema_alpha,
+        ros=ros,
     )
-    localizer.run()
+
+    stream = AriaRgbStream(
+        device_ip=device_ip,
+        update_iptables_rules=update_iptables_rules,
+        undistort_width=undistort_width,
+        undistort_height=undistort_height,
+        window_name="Aria RGB ArUco",
+    )
+    stream.add_overlay(overlay)
+    try:
+        stream.run()
+    finally:
+        ros.shutdown()
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device-ip", help="IP address to connect to the device")
-    parser.add_argument(
-        "--marker-length-m",
-        type=float,
-        default=0.2,
-        help="Marker side length in meters.",
-    )
-    parser.add_argument(
-        "--dictionary",
-        type=str,
-        default="DICT_4X4_50",
-        help="OpenCV ArUco dictionary name (e.g., DICT_5X5_100).",
-    )
-    parser.add_argument(
-        "--update_iptables",
-        default=True,
-        action="store_true",
-        help="Update iptables to enable receiving the data stream, only for Linux.",
-    )
-    parser.add_argument(
-        "--undistort-width",
-        type=int,
-        default=1408,
-        help="Width of the undistorted RGB output image.",
-    )
-    parser.add_argument(
-        "--undistort-height",
-        type=int,
-        default=1408,
-        help="Height of the undistorted RGB output image.",
-    )
-    parser.add_argument(
-        "--marker-ids",
-        type=int,
-        nargs="+",
-        default=None,
-        help="Only detect/publish these marker IDs (space-separated).",
-    )
-    parser.add_argument(
-        "--ema-alpha",
-        type=float,
-        default=0.2,
-        help="EMA smoothing factor for pose (0 disables).",
-    )
-    parser.add_argument(
-        "--disable-ema",
-        action="store_true",
-        help="Disable EMA smoothing regardless of --ema-alpha.",
-    )
+    parser.add_argument("--marker-length-m", type=float, default=0.2)
+    parser.add_argument("--dictionary", type=str, default="DICT_4X4_50")
+    parser.add_argument("--update_iptables", default=True, action="store_true")
+    parser.add_argument("--undistort-width", type=int, default=1408)
+    parser.add_argument("--undistort-height", type=int, default=1408)
+    parser.add_argument("--marker-ids", type=int, nargs="+", default=None)
+    parser.add_argument("--ema-alpha", type=float, default=0.2)
+    parser.add_argument("--disable-ema", action="store_true")
     return parser.parse_args()
 
 

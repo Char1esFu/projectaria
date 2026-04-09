@@ -23,14 +23,10 @@ Scenario 2: Connect the glass to a laptop, publish topics to the workstation on 
 Scenario 3: Publish sensor data on the glass directly through local network(avoid public network due to firewalls) --> wifi
 ```bash
 # streaming demo with glfw window. Run this first to give sudo access, otherwise streaming will fail later.
-python3 utils/device_stream.py --interface usb --update_iptables
-# or 
 python3 utils/device_stream.py --interface wifi --device-ip 192.168.8.117 --update_iptables
 
 # subscribe first(needed in all scenarios)
-aria streaming start --interface usb --use-ephemeral-certs --profile profile23 # this profile supports high rgb fps
-# or 
-aria streaming start --interface wifi --device-ip 192.168.8.117 --use-ephemeral-certs --profile profile23
+aria streaming start --interface wifi --device-ip 192.168.8.117 --use-ephemeral-certs --profile profile23 # this profile supports high rgb fps
 
 # glass localization, specify arbitrary aruco marker id(s) in the setup
 source /opt/ros/humble/setup.bash
@@ -40,9 +36,6 @@ python3 -m src.aruco_localization --device-ip 192.168.8.117 --marker-ids 0 1 2 #
 # with mouse focus on gaze image output window, keep pressing C to calibrate while focusing on center of marker 
 python3 -m projectaria_eyetracking.gaze_detect --device cuda:0
 
-# publish gaze table intersection
-python3 src/gaze_intersection_node.py --visualize
-
 # record audio
 python -m src.audio_record --update_iptables --channel 0
 
@@ -51,15 +44,8 @@ python3 -m src.hand_gesture --device-ip 192.168.8.117
 
 # gaze projection on egocentric image
 python -m src.gaze_rgb_visualizer --device-ip 192.168.8.117
-```
 
-## Utils
-```bash
-# estimate pose with IMU data and Madgwick filter as failsafe
-python3 -m src.imu_pose --imu-index 1 # or 0
-
-# streaming demo with individual message
-python3 -m utils.streaming_subscribe
+# stop streaming
 aria streaming stop --device-ip 192.168.8.117
 ```
 
