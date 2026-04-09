@@ -114,7 +114,7 @@ class AriaRgbStream:
             crop_size = int(min(w, h) / 1.4143)
             ox = (w - crop_size) // 2
             oy = (h - crop_size) // 2
-            display = display[oy:oy + crop_size, ox:ox + crop_size]
+            display = np.ascontiguousarray(display[oy:oy + crop_size, ox:ox + crop_size])
 
             # Shift cx/cy so overlays can use camera_matrix directly in cropped image coordinates.
             display_matrix = self.camera_matrix.copy()

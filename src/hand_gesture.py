@@ -68,7 +68,6 @@ class HandGestureOverlay(RgbOverlay):
                 [[lm.x, lm.y, lm.z] for lm in hand_world_landmarks.landmark],
                 dtype=np.float64,
             )
-            print(pts_3d)
             success, rvec, tvec = cv2.solvePnP(
                 pts_3d, pts_2d, camera_matrix, self.dist_coeffs,
                 flags=cv2.SOLVEPNP_SQPNP,

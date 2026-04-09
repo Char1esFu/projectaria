@@ -26,7 +26,8 @@ class GazeOverlay(RgbOverlay):
             import rclpy
             from geometry_msgs.msg import Vector3
 
-            rclpy.init(args=None)
+            if not rclpy.ok():
+                rclpy.init(args=None)
             self._rclpy = rclpy
             self._ros_node = rclpy.create_node("gaze_rgb_visualizer")
 

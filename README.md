@@ -26,7 +26,7 @@ Scenario 3: Publish sensor data on the glass directly through local network(avoi
 python3 utils/device_stream.py --interface wifi --device-ip 192.168.8.117 --update_iptables
 
 # subscribe first(needed in all scenarios)
-aria streaming start --interface wifi --device-ip 192.168.8.117 --use-ephemeral-certs --profile profile23 # this profile supports high rgb fps
+aria streaming start --interface wifi --device-ip 192.168.8.117 --use-ephemeral-certs --profile profile18
 
 # glass localization, specify arbitrary aruco marker id(s) in the setup
 source /opt/ros/humble/setup.bash
@@ -44,6 +44,12 @@ python3 -m src.hand_gesture --device-ip 192.168.8.117
 
 # gaze projection on egocentric image
 python -m src.gaze_rgb_visualizer --device-ip 192.168.8.117
+
+# yolo inference
+python3 -m src.yolo_rgb_detector
+
+# run all features together
+python3 main.py --yolo --gaze --aruco --hands --marker-ids 0 1 2
 
 # stop streaming
 aria streaming stop --device-ip 192.168.8.117

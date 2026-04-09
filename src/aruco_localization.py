@@ -1,10 +1,8 @@
 import os
-import sys
-
 import argparse
 import json
 from typing import Optional
-import aria.sdk as aria
+
 import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation, Slerp
@@ -76,9 +74,18 @@ class ArucoOverlay(RgbOverlay):
         if ids is None or len(ids) == 0:
             return
 
-        rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(
-            corners, self.marker_length_m, camera_matrix, self.dist_coeffs
-        )
+        half = self.marker_length_m / 2.0
+        obj_pts = np.array([
+            [-half,  half, 0],
+            [ half,  half, 0],
+            [ half, -half, 0],
+            [-half, -half, 0],
+        ], dtype=np.float32)
+        rvecs, tvecs = [], []
+        for corner in corners:
+            _, rvec, tvec = cv2.solvePnP(obj_pts, corner[0], camera_matrix, self.dist_coeffs)
+            rvecs.append(rvec)
+            tvecs.append(tvec)
 
         pose_entries = []
         for marker_id, corner_set, rvec, tvec in zip(ids.flatten(), corners, rvecs, tvecs):
@@ -206,7 +213,8 @@ class RosPosePublisher:
             from geometry_msgs.msg import TransformStamped
             from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster
 
-            rclpy.init(args=None)
+            if not rclpy.ok():
+                rclpy.init(args=None)
             self.rclpy = rclpy
             self.PoseStamped = PoseStamped
             self.TransformStamped = TransformStamped
