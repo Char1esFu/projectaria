@@ -22,8 +22,6 @@ from utils.common import update_iptables
 class HandGestureOverlay(RgbOverlay):
     """MediaPipe hand detection drawn on the pre-rotation RGB image."""
 
-    requires_calibration: bool = True
-
     def __init__(
         self,
         max_hands: int = 2,

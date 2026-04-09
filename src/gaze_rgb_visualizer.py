@@ -99,7 +99,6 @@ def run_gaze_rgb_visualizer(
     update_iptables_rules: bool = False,
     undistort_width: int = 1408,
     undistort_height: int = 1408,
-    undistort_focal_length: float = 450.0,
 ) -> None:
     overlay = GazeOverlay()
     stream = AriaRgbStream(
@@ -107,7 +106,6 @@ def run_gaze_rgb_visualizer(
         update_iptables_rules=update_iptables_rules,
         undistort_width=undistort_width,
         undistort_height=undistort_height,
-        undistort_focal_length=undistort_focal_length,
         window_name="Aria RGB Gaze",
     )
     stream.add_overlay(overlay)
@@ -130,7 +128,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--undistort-width", type=int, default=1408)
     parser.add_argument("--undistort-height", type=int, default=1408)
-    parser.add_argument("--undistort-focal-length", type=float, default=450.0)
     return parser.parse_args()
 
 
@@ -141,7 +138,6 @@ def main() -> None:
         update_iptables_rules=args.update_iptables,
         undistort_width=args.undistort_width,
         undistort_height=args.undistort_height,
-        undistort_focal_length=args.undistort_focal_length,
     )
 
 

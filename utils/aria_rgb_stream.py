@@ -42,11 +42,7 @@ class RgbOverlay:
     """Base class for overlays drawn on the Aria RGB stream.
 
     Subclasses override draw() and/or draw_display().
-    Set requires_calibration = True to make AriaRgbStream raise at startup
-    if calibration could not be loaded from the device.
     """
-
-    requires_calibration: bool = False
 
     def draw(self, rgb_image: np.ndarray, camera_matrix: Optional[np.ndarray]) -> None:
         """Draw on the pre-rotation undistorted RGB image (camera coordinate space)."""
@@ -64,7 +60,6 @@ class AriaRgbStream:
         update_iptables_rules: bool = False,
         undistort_width: int = 1408,
         undistort_height: int = 1408,
-        undistort_focal_length: float = 450.0,
         window_name: str = "Aria RGB",
         window_size: int = 1024,
     ) -> None:
@@ -72,7 +67,6 @@ class AriaRgbStream:
         self.update_iptables_rules = update_iptables_rules
         self.undistort_width = undistort_width
         self.undistort_height = undistort_height
-        self.undistort_focal_length = undistort_focal_length
         self.window_name = window_name
         self.window_size = window_size
 
@@ -94,12 +88,6 @@ class AriaRgbStream:
 
         self._load_rgb_calibration()
         self._setup_dst_calib()
-
-        if any(o.requires_calibration for o in self._overlays) and self.camera_matrix is None:
-            raise RuntimeError(
-                "One or more overlays require device calibration, "
-                "but calibration could not be loaded from the device."
-            )
 
         aria.set_log_level(aria.Level.Info)
         self._setup_streaming()
@@ -139,9 +127,7 @@ class AriaRgbStream:
 
     def _prepare_rgb_image(self, bgr_image: np.ndarray) -> np.ndarray:
         rgb_image = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
-        if self.rgb_calib is not None and self.dst_calib is not None:
-            rgb_image = distort_by_calibration(rgb_image, self.dst_calib, self.rgb_calib)
-        return rgb_image
+        return distort_by_calibration(rgb_image, self.dst_calib, self.rgb_calib)
 
     def _load_rgb_calibration(self) -> None:
         device_client = aria.DeviceClient()
@@ -157,11 +143,7 @@ class AriaRgbStream:
             self.rgb_calib = sensors_calib.get_camera_calib("camera-rgb")
             print("RGB calibration loaded from device.")
         except Exception as exc:
-            print(
-                f"Warning: could not load RGB calibration from device ({exc}). "
-                "Undistortion will be skipped; raw fisheye image will be used."
-            )
-            self.rgb_calib = None
+            raise RuntimeError(f"Failed to load RGB calibration from device: {exc}") from exc
         finally:
             if device is not None:
                 try:
@@ -170,19 +152,15 @@ class AriaRgbStream:
                     pass
 
     def _setup_dst_calib(self) -> None:
-        if self.rgb_calib is not None:
-            src_w, src_h = self.rgb_calib.get_image_size()
-            if self.undistort_width != self.undistort_height or src_w != src_h:
-                raise ValueError(
-                    f"Non-square images are not supported (src={src_w}x{src_h}, "
-                    f"dst={self.undistort_width}x{self.undistort_height})."
-                )
-            src_focal = self.rgb_calib.get_focal_lengths()[0]
-            focal_length = src_focal * self.undistort_width / src_w
-            print(f"dst_calib: focal_length={focal_length:.2f} px ({src_focal:.2f} * {self.undistort_width}/{src_w})")
-        else:
-            focal_length = self.undistort_focal_length
-            print(f"dst_calib: focal_length={focal_length:.2f} px (fallback)")
+        src_w, src_h = self.rgb_calib.get_image_size()
+        if self.undistort_width != self.undistort_height or src_w != src_h:
+            raise ValueError(
+                f"Non-square images are not supported (src={src_w}x{src_h}, "
+                f"dst={self.undistort_width}x{self.undistort_height})."
+            )
+        src_focal = self.rgb_calib.get_focal_lengths()[0]
+        focal_length = src_focal * self.undistort_width / src_w
+        print(f"dst_calib: focal_length={focal_length:.2f} px ({src_focal:.2f} * {self.undistort_width}/{src_w})")
 
         self.dst_calib = get_linear_camera_calibration(
             self.undistort_width,

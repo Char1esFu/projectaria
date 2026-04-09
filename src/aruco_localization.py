@@ -29,8 +29,6 @@ def average_quaternions(quats_xyzw: list[np.ndarray], weights: np.ndarray) -> np
 class ArucoOverlay(RgbOverlay):
     """Detects ArUco markers, draws them, and publishes poses via ROS2."""
 
-    requires_calibration: bool = True
-
     def __init__(
         self,
         marker_length_m: float,
