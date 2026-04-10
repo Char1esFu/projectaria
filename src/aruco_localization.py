@@ -7,7 +7,7 @@ import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation, Slerp
 
-from utils.aria_rgb_stream import AriaRgbStream, RgbOverlay
+from utils.aria_rgb_stream import AriaRgbStream
 
 
 def average_quaternions(quats_xyzw: list[np.ndarray], weights: np.ndarray) -> np.ndarray:
@@ -24,7 +24,7 @@ def average_quaternions(quats_xyzw: list[np.ndarray], weights: np.ndarray) -> np
     return accum / norm
 
 
-class ArucoOverlay(RgbOverlay):
+class ArucoOverlay:
     """Detects ArUco markers, draws them, and publishes poses via ROS2."""
 
     def __init__(

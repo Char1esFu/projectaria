@@ -2,8 +2,8 @@
 Shared Aria RGB streaming infrastructure.
 
 AriaRgbStream handles device connection, calibration loading, undistortion,
-and the display loop. Feature-specific logic is implemented as RgbOverlay
-subclasses and registered via add_overlay().
+and the display loop. Overlays are objects with a draw(display_image, camera_matrix)
+method and are registered via add_overlay().
 
 Overlays implement draw(display_image, camera_matrix), which is called after
 rot90 + crop. camera_matrix has cx/cy adjusted to the cropped image origin.
@@ -37,19 +37,6 @@ from projectaria_tools.core.calibration import (
 from projectaria_tools.core.sensor_data import ImageDataRecord
 
 
-class RgbOverlay:
-    """Base class for overlays drawn on the Aria RGB stream.
-
-    Subclasses implement draw(display_image, camera_matrix).
-    display_image is the post-rotation, cropped image ready for imshow.
-    camera_matrix has cx/cy adjusted to the cropped image coordinate origin.
-    """
-
-    def draw(self, display_image: np.ndarray, camera_matrix: np.ndarray) -> None:
-        """Draw on the post-rotation cropped display image."""
-        _ = display_image, camera_matrix
-
-
 class AriaRgbStream:
     """Single RGB stream + display loop shared across all overlays."""
 
@@ -76,9 +63,9 @@ class AriaRgbStream:
         self.streaming_client = None
         self.observer = None
 
-        self._overlays: list[RgbOverlay] = []
+        self._overlays: list = []
 
-    def add_overlay(self, overlay: RgbOverlay) -> None:
+    def add_overlay(self, overlay) -> None:
         self._overlays.append(overlay)
 
     def run(self) -> None:

@@ -15,11 +15,11 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
-from utils.aria_rgb_stream import AriaRgbStream, RgbOverlay
+from utils.aria_rgb_stream import AriaRgbStream
 from utils.common import update_iptables
 
 
-class HandGestureOverlay(RgbOverlay):
+class HandGestureOverlay:
     """MediaPipe hand detection drawn on the pre-rotation RGB image."""
 
     def __init__(

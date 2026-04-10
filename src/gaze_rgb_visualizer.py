@@ -5,10 +5,10 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from utils.aria_rgb_stream import AriaRgbStream, RgbOverlay
+from utils.aria_rgb_stream import AriaRgbStream
 
 
-class GazeOverlay(RgbOverlay):
+class GazeOverlay:
     """Subscribes to /aria/gaze_euler and draws a crosshair on the display image."""
 
     GAZE_ORIGIN_X_OFFSET: float = 0.05

@@ -6,12 +6,12 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
-from utils.aria_rgb_stream import AriaRgbStream, RgbOverlay
+from utils.aria_rgb_stream import AriaRgbStream
 
 MODEL_PATH = Path(__file__).parent.parent / "yolo_model" / "best.pt"
 
 
-class YoloOverlay(RgbOverlay):
+class YoloOverlay:
     """Runs YOLO inference and draws detections on the pre-rotation RGB image."""
 
     def __init__(
