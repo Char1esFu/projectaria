@@ -98,15 +98,11 @@ class GazeOverlay:
 def run_gaze_rgb_visualizer(
     device_ip: Optional[str] = None,
     update_iptables_rules: bool = False,
-    undistort_width: int = 1408,
-    undistort_height: int = 1408,
 ) -> None:
     overlay = GazeOverlay()
     stream = AriaRgbStream(
         device_ip=device_ip,
         update_iptables_rules=update_iptables_rules,
-        undistort_width=undistort_width,
-        undistort_height=undistort_height,
         window_name="Aria RGB Gaze",
     )
     stream.add_overlay(overlay)
@@ -127,8 +123,6 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Update iptables for DDS UDP stream (Linux only).",
     )
-    parser.add_argument("--undistort-width", type=int, default=1408)
-    parser.add_argument("--undistort-height", type=int, default=1408)
     return parser.parse_args()
 
 
@@ -137,8 +131,6 @@ def main() -> None:
     run_gaze_rgb_visualizer(
         device_ip=args.device_ip,
         update_iptables_rules=args.update_iptables,
-        undistort_width=args.undistort_width,
-        undistort_height=args.undistort_height,
     )
 
 

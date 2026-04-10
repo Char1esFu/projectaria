@@ -44,15 +44,11 @@ class AriaRgbStream:
         self,
         device_ip: Optional[str] = None,
         update_iptables_rules: bool = False,
-        undistort_width: int = 1408,
-        undistort_height: int = 1408,
         window_name: str = "Aria RGB",
         window_size: int = 1024,
     ) -> None:
         self.device_ip = device_ip
         self.update_iptables_rules = update_iptables_rules
-        self.undistort_width = undistort_width
-        self.undistort_height = undistort_height
         self.window_name = window_name
         self.window_size = window_size
 
@@ -141,19 +137,13 @@ class AriaRgbStream:
 
     def _setup_dst_calib(self) -> None:
         src_w, src_h = self.rgb_calib.get_image_size()
-        if self.undistort_width != self.undistort_height or src_w != src_h:
-            raise ValueError(
-                f"Non-square images are not supported (src={src_w}x{src_h}, "
-                f"dst={self.undistort_width}x{self.undistort_height})."
-            )
         src_focal = self.rgb_calib.get_focal_lengths()[0]
-        focal_length = src_focal * self.undistort_width / src_w
-        print(f"dst_calib: focal_length={focal_length:.2f} px ({src_focal:.2f} * {self.undistort_width}/{src_w})")
+        print(f"dst_calib: focal_length={src_focal:.2f} px, resolution={src_w}x{src_h}")
 
         self.dst_calib = get_linear_camera_calibration(
-            self.undistort_width,
-            self.undistort_height,
-            focal_length,
+            src_w,
+            src_h,
+            src_focal,
             "camera-rgb",
         )
         fx, fy = self.dst_calib.get_focal_lengths()

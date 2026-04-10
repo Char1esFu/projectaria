@@ -100,8 +100,6 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="MediaPipe hand gesture on Aria RGB stream")
     parser.add_argument("--device-ip", help="IP address of the Aria device")
     parser.add_argument("--update_iptables", default=True, action="store_true")
-    parser.add_argument("--undistort-width", type=int, default=1408)
-    parser.add_argument("--undistort-height", type=int, default=1408)
     parser.add_argument("--max-hands", type=int, default=2)
     parser.add_argument("--detection-confidence", type=float, default=0.5)
     parser.add_argument("--tracking-confidence", type=float, default=0.5)
@@ -121,8 +119,6 @@ def main() -> None:
     stream = AriaRgbStream(
         device_ip=args.device_ip,
         update_iptables_rules=False,
-        undistort_width=args.undistort_width,
-        undistort_height=args.undistort_height,
         window_name="Aria RGB Hand Gesture",
     )
     stream.add_overlay(overlay)

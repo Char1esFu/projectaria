@@ -22,8 +22,6 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Aria RGB combined overlay visualizer.")
     parser.add_argument("--device-ip", help="IP address of the Aria device")
     parser.add_argument("--update_iptables", default=False, action="store_true")
-    parser.add_argument("--undistort-width", type=int, default=1408)
-    parser.add_argument("--undistort-height", type=int, default=1408)
 
     parser.add_argument("--aruco", action="store_true", help="Enable ArUco localization overlay")
     parser.add_argument("--marker-length-m", type=float, default=0.2)
@@ -109,8 +107,6 @@ def main() -> None:
     stream = AriaRgbStream(
         device_ip=args.device_ip,
         update_iptables_rules=args.update_iptables,
-        undistort_width=args.undistort_width,
-        undistort_height=args.undistort_height,
         window_name=f"Aria RGB [{feature_names}]",
     )
     for _, overlay, _ in overlays:

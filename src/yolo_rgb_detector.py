@@ -49,8 +49,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--conf", type=float, default=0.25)
     parser.add_argument("--device", type=str, default=None, help="Inference device: cuda / cpu / mps (default: auto)")
     parser.add_argument("--infer-size", type=int, default=640, help="YOLO input size (pixels)")
-    parser.add_argument("--undistort-width", type=int, default=1408)
-    parser.add_argument("--undistort-height", type=int, default=1408)
     return parser.parse_args()
 
 
@@ -65,8 +63,6 @@ def main() -> None:
     stream = AriaRgbStream(
         device_ip=args.device_ip,
         update_iptables_rules=args.update_iptables,
-        undistort_width=args.undistort_width,
-        undistort_height=args.undistort_height,
         window_name="Aria RGB YOLO",
     )
     stream.add_overlay(overlay)

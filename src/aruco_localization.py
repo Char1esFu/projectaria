@@ -347,8 +347,6 @@ def run_rgb_aruco_localization(
     marker_length_m: float = 0.04,
     dictionary_name: str = "DICT_4X4_50",
     update_iptables_rules: bool = False,
-    undistort_width: int = 1408,
-    undistort_height: int = 1408,
     allowed_marker_ids: Optional[list[int]] = None,
     use_ema: bool = True,
     ema_alpha: float = 0.95,
@@ -380,8 +378,6 @@ def run_rgb_aruco_localization(
     stream = AriaRgbStream(
         device_ip=device_ip,
         update_iptables_rules=update_iptables_rules,
-        undistort_width=undistort_width,
-        undistort_height=undistort_height,
         window_name="Aria RGB ArUco",
     )
     stream.add_overlay(overlay)
@@ -397,8 +393,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--marker-length-m", type=float, default=0.2)
     parser.add_argument("--dictionary", type=str, default="DICT_4X4_50")
     parser.add_argument("--update_iptables", default=True, action="store_true")
-    parser.add_argument("--undistort-width", type=int, default=1408)
-    parser.add_argument("--undistort-height", type=int, default=1408)
     parser.add_argument("--marker-ids", type=int, nargs="+", default=None)
     parser.add_argument("--ema-alpha", type=float, default=0.2)
     parser.add_argument("--disable-ema", action="store_true")
@@ -412,8 +406,6 @@ def main() -> None:
         marker_length_m=args.marker_length_m,
         dictionary_name=args.dictionary,
         update_iptables_rules=args.update_iptables,
-        undistort_width=args.undistort_width,
-        undistort_height=args.undistort_height,
         allowed_marker_ids=args.marker_ids,
         use_ema=not args.disable_ema,
         ema_alpha=args.ema_alpha,
