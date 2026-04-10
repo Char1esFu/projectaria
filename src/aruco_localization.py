@@ -44,37 +44,26 @@ class ArucoOverlay:
         self.dist_coeffs = np.zeros((5, 1), dtype=np.float64)
         self._ema_state = {}
 
-        self.aruco = cv2.aruco
-        dict_id = getattr(self.aruco, dictionary_name, None)
+        dict_id = getattr(cv2.aruco, dictionary_name, None)
         if dict_id is None:
             raise ValueError(f"Unknown ArUco dictionary: {dictionary_name}")
-        dictionary = self.aruco.getPredefinedDictionary(dict_id)
-        detector_params = self.aruco.DetectorParameters()
-        if hasattr(self.aruco, "CORNER_REFINE_SUBPIX"):
-            detector_params.cornerRefinementMethod = self.aruco.CORNER_REFINE_SUBPIX
-        if hasattr(self.aruco, "ArucoDetector"):
-            self.aruco_detector = self.aruco.ArucoDetector(dictionary, detector_params)
-        else:
-            self.aruco_detector = None
-        self._dictionary = dictionary
-        self._detector_params = detector_params
+        dictionary = cv2.aruco.getPredefinedDictionary(dict_id)
+        detector_params = cv2.aruco.DetectorParameters()
+        detector_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+        self.aruco_detector = cv2.aruco.ArucoDetector(dictionary, detector_params)
 
         self._allowed_id_set = set(allowed_marker_ids) if allowed_marker_ids else None
 
     def draw(self, display_image: np.ndarray, camera_matrix: Optional[np.ndarray]) -> None:
-        self._detect_markers(display_image, camera_matrix)
-
-    def _detect_markers(self, display_image: np.ndarray, camera_matrix: Optional[np.ndarray]) -> None:
         gray = cv2.cvtColor(display_image, cv2.COLOR_RGB2GRAY)
-        if self.aruco_detector is not None:
-            corners, ids, _ = self.aruco_detector.detectMarkers(gray)
-        else:
-            corners, ids, _ = cv2.aruco.detectMarkers(gray, self._dictionary, parameters=self._detector_params)
+        corners, ids, _ = self.aruco_detector.detectMarkers(gray)
 
         if ids is None or len(ids) == 0:
             return
 
         half = self.marker_length_m / 2.0
+        # ArUco corner order: top-left, top-right, bottom-right, bottom-left
+        # in marker frame (x right, y up, z out of marker).
         obj_pts = np.array([
             [-half,  half, 0],
             [ half,  half, 0],
@@ -103,26 +92,29 @@ class ArucoOverlay:
         world_ts = [entry[3] for entry in pose_entries]
         world_quats = [entry[4] for entry in pose_entries]
         cam_dists = np.array([entry[6] for entry in pose_entries], dtype=np.float64)
+        
+        # Weight each marker inversely by camera distance: closer markers give more accurate poses.
         weights = 1.0 / (cam_dists + 1e-6)
         weights_sum = np.sum(weights)
         weights = weights / weights_sum if weights_sum > 0.0 else np.ones_like(weights) / float(len(weights))
         avg_t = np.sum(np.stack(world_ts, axis=0) * weights[:, None], axis=0)
         avg_q = average_quaternions(world_quats, weights)
         avg_t, avg_q = self._apply_ema(parent_frame, avg_t, avg_q)
+        
+        # publish camera pose as PoseStamped and TF
         stamp = self.ros.publish_world_pose(parent_frame, avg_t, avg_q)
         self.ros.publish_world_camera_tf(parent_frame, avg_t, avg_q, stamp)
 
     def _compute_world_pose(
         self, marker_id: int, rvec: np.ndarray, tvec: np.ndarray
     ) -> Optional[tuple]:
+        '''
+        Returns (parent_frame, marker_t, marker_q, world_t, world_q_xyzw, marker_id, cam_dist) or None if static TF not found.
+        '''
+        # solvePnP gives marker-in-camera pose; invert to get camera-in-marker pose.
         rotation_marker_in_cam, _ = cv2.Rodrigues(rvec)
         rotation_cam_in_marker = rotation_marker_in_cam.T
         tvec_cam_in_marker = -rotation_cam_in_marker @ tvec.reshape(3, 1)
-        quat_xyzw = Rotation.from_matrix(rotation_cam_in_marker).as_quat()
-        quat_cam_in_marker = np.array(
-            [float(quat_xyzw[3]), float(quat_xyzw[0]), float(quat_xyzw[1]), float(quat_xyzw[2])],
-            dtype=np.float64,
-        )
 
         static_entry = self.ros.get_static_entry(marker_id)
         if static_entry is None:
@@ -133,11 +125,7 @@ class ArucoOverlay:
             [float(tvec_cam_in_marker[0][0]), float(tvec_cam_in_marker[1][0]), float(tvec_cam_in_marker[2][0])],
             dtype=np.float64,
         )
-        cam_q = np.array(
-            [float(quat_cam_in_marker[1]), float(quat_cam_in_marker[2]),
-             float(quat_cam_in_marker[3]), float(quat_cam_in_marker[0])],
-            dtype=np.float64,
-        )
+        cam_q = Rotation.from_matrix(rotation_cam_in_marker).as_quat()
         marker_rot = Rotation.from_quat(marker_q)
         world_t = marker_t + marker_rot.apply(cam_t)
         world_q_xyzw = (marker_rot * Rotation.from_quat(cam_q)).as_quat()
@@ -154,6 +142,7 @@ class ArucoOverlay:
         prev_t, prev_q = prev
         alpha = self.ema_alpha
         new_t = (1.0 - alpha) * prev_t + alpha * t
+        # Slerp for rotation (linear interpolation would denormalize the quaternion).
         rotations = Rotation.from_quat([prev_q, q_xyzw])
         slerp = Slerp([0.0, 1.0], rotations)
         new_q = slerp(alpha).as_quat()
@@ -271,6 +260,9 @@ class RosPosePublisher:
             print(f"Failed to load static TF config {self.static_tf_config_path}: {exc}")
 
     def get_static_entry(self, marker_id: int):
+        '''
+        Returns (parent_frame, marker_t, marker_q) for the given marker_id, or None if not found.
+        '''
         static_entry = self.static_marker_transforms.get(marker_id)
         if static_entry is None:
             if marker_id not in self._warned_missing_static:

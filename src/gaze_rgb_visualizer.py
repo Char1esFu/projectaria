@@ -11,6 +11,8 @@ from utils.aria_rgb_stream import AriaRgbStream
 class GazeOverlay:
     """Subscribes to /aria/gaze_euler and draws a crosshair on the display image."""
 
+    # The gaze ray origin is slightly to the right of the camera principal point.
+    # This offset (in tan units) compensates for that physical displacement.
     GAZE_ORIGIN_X_OFFSET: float = 0.05
 
     def __init__(self) -> None:
@@ -38,6 +40,7 @@ class GazeOverlay:
             self._ros_node.create_subscription(
                 Vector3, "/aria/gaze_euler", _gaze_callback, 10
             )
+            # daemon=True so the thread exits automatically when main exits.
             self._ros_thread = threading.Thread(
                 target=rclpy.spin, args=(self._ros_node,), daemon=True
             )
@@ -62,7 +65,7 @@ class GazeOverlay:
         gaze_pt = (int(round(display_col)), int(round(display_row)))
 
         h, w = display_image.shape[:2]
-        cross_size = max(20, min(w, h) // 30)
+        cross_size = 40
         color = (0, 0, 255)
 
         cv2.putText(
@@ -77,15 +80,8 @@ class GazeOverlay:
         )
 
         if 0 <= gaze_pt[0] < w and 0 <= gaze_pt[1] < h:
-            cv2.drawMarker(
-                display_image,
-                gaze_pt,
-                color,
-                markerType=cv2.MARKER_CROSS,
-                markerSize=cross_size * 2,
-                thickness=2,
-            )
             cv2.circle(display_image, gaze_pt, cross_size, color, 2)
+            cv2.circle(display_image, gaze_pt, 4, color, -1)
 
     def shutdown(self) -> None:
         try:

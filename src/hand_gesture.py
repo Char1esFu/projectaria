@@ -60,6 +60,8 @@ class HandGestureOverlay:
                 self.mp_drawing_styles.get_default_hand_connections_style(),
             )
 
+            # hand_world_landmarks are metric 3D coords; hand_landmarks are normalized 2D.
+            # solvePnP aligns them to recover the hand's pose in camera frame.
             pts_2d = np.array(
                 [[lm.x * w, lm.y * h] for lm in hand_landmarks.landmark],
                 dtype=np.float64,
@@ -78,7 +80,7 @@ class HandGestureOverlay:
             cv2.drawFrameAxes(display_image, camera_matrix, self.dist_coeffs, rvec, tvec, 0.05)
 
             label = handedness.classification[0].label
-            dist_m = float(np.linalg.norm(tvec))
+            dist_m = float(np.linalg.norm(tvec))  # distance from camera to wrist origin, metres
             wrist = hand_landmarks.landmark[self.mp_hands.HandLandmark.WRIST]
             px, py = int(wrist.x * w), int(wrist.y * h)
             cv2.putText(

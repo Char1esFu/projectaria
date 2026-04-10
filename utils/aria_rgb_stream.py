@@ -92,8 +92,11 @@ class AriaRgbStream:
             rgb_image = self._prepare_rgb_image(self.observer.rgb_image)
             self.observer.rgb_image = None
 
+            # Aria RGB sensor is mounted rotated; rot90(-1) puts the image upright.
             display = np.ascontiguousarray(np.rot90(rgb_image, -1))
             h, w = display.shape[:2]
+            # The undistorted image is square but rotated, so the inscribed axis-aligned
+            # square has side = original_side / sqrt(2) ≈ original_side / 1.4143.
             crop_size = int(min(w, h) / 1.4143)
             ox = (w - crop_size) // 2
             oy = (h - crop_size) // 2
@@ -114,6 +117,8 @@ class AriaRgbStream:
         return distort_by_calibration(rgb_image, self.dst_calib, self.rgb_calib)
 
     def _load_rgb_calibration(self) -> None:
+        # Connect only to read calibration JSON, then disconnect immediately.
+        # Streaming is set up separately via StreamingClient.
         device_client = aria.DeviceClient()
         client_config = aria.DeviceClientConfig()
         if self.device_ip:

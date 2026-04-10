@@ -38,6 +38,7 @@ class YoloOverlay:
             device=self.device,
             verbose=False,
         )
+        # Write annotated frame back in-place so the caller's array reflects detections.
         np.copyto(display_image, results[0].plot())
 
 
