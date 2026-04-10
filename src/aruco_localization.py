@@ -101,9 +101,7 @@ class ArucoOverlay:
         avg_q = average_quaternions(world_quats, weights)
         avg_t, avg_q = self._apply_ema(parent_frame, avg_t, avg_q)
         
-        # publish camera pose as PoseStamped and TF
-        stamp = self.ros.publish_world_pose(parent_frame, avg_t, avg_q)
-        self.ros.publish_world_camera_tf(parent_frame, avg_t, avg_q, stamp)
+        self.ros.publish_cam_pose(parent_frame, avg_t, avg_q)
 
     def _compute_world_pose(
         self, marker_id: int, rvec: np.ndarray, tvec: np.ndarray
@@ -218,7 +216,7 @@ class RosPosePublisher:
         except Exception as exc:
             raise RuntimeError(f"ROS2 publisher unavailable: {exc}") from exc
 
-    def publish_static_tf(self) -> None:
+    def publish_static_marker_tf(self) -> None:
         if not os.path.isfile(self.static_tf_config_path):
             return
         try:
@@ -271,14 +269,15 @@ class RosPosePublisher:
             return None
         return static_entry
 
-    def publish_world_pose(self, parent_frame: str, world_t: np.ndarray, world_q_xyzw: np.ndarray):
+    def publish_cam_pose(self, parent_frame: str, world_t: np.ndarray, world_q_xyzw: np.ndarray) -> None:
         if self.camera_frame_correction_q_xyzw is not None:
             world_q_xyzw = (
                 Rotation.from_quat(world_q_xyzw) * Rotation.from_quat(self.camera_frame_correction_q_xyzw)
             ).as_quat()
+        stamp = self.ros_clock.now().to_msg() if self.ros_clock is not None else self.rclpy.time.Time().to_msg()
+
         pose_msg = self.PoseStamped()
-        if self.ros_clock is not None:
-            pose_msg.header.stamp = self.ros_clock.now().to_msg()
+        pose_msg.header.stamp = stamp
         pose_msg.header.frame_id = parent_frame
         pose_msg.pose.position.x = float(world_t[0])
         pose_msg.pose.position.y = float(world_t[1])
@@ -288,29 +287,7 @@ class RosPosePublisher:
         pose_msg.pose.orientation.z = float(world_q_xyzw[2])
         pose_msg.pose.orientation.w = float(world_q_xyzw[3])
         self.ros_publisher.publish(pose_msg)
-        return pose_msg.header.stamp
 
-    def publish_camera_tf(self, marker_frame: str, cam_t: np.ndarray, cam_q: np.ndarray, stamp):
-        if self.camera_frame_correction_q_xyzw is not None:
-            cam_q = (Rotation.from_quat(cam_q) * Rotation.from_quat(self.camera_frame_correction_q_xyzw)).as_quat()
-        tf_msg = self.TransformStamped()
-        tf_msg.header.stamp = stamp
-        tf_msg.header.frame_id = marker_frame
-        tf_msg.child_frame_id = self.camera_frame
-        tf_msg.transform.translation.x = float(cam_t[0])
-        tf_msg.transform.translation.y = float(cam_t[1])
-        tf_msg.transform.translation.z = float(cam_t[2])
-        tf_msg.transform.rotation.w = float(cam_q[3])
-        tf_msg.transform.rotation.x = float(cam_q[0])
-        tf_msg.transform.rotation.y = float(cam_q[1])
-        tf_msg.transform.rotation.z = float(cam_q[2])
-        self.tf_broadcaster.sendTransform(tf_msg)
-
-    def publish_world_camera_tf(self, parent_frame: str, world_t: np.ndarray, world_q: np.ndarray, stamp):
-        if self.camera_frame_correction_q_xyzw is not None:
-            world_q = (
-                Rotation.from_quat(world_q) * Rotation.from_quat(self.camera_frame_correction_q_xyzw)
-            ).as_quat()
         tf_msg = self.TransformStamped()
         tf_msg.header.stamp = stamp
         tf_msg.header.frame_id = parent_frame
@@ -318,10 +295,10 @@ class RosPosePublisher:
         tf_msg.transform.translation.x = float(world_t[0])
         tf_msg.transform.translation.y = float(world_t[1])
         tf_msg.transform.translation.z = float(world_t[2])
-        tf_msg.transform.rotation.x = float(world_q[0])
-        tf_msg.transform.rotation.y = float(world_q[1])
-        tf_msg.transform.rotation.z = float(world_q[2])
-        tf_msg.transform.rotation.w = float(world_q[3])
+        tf_msg.transform.rotation.x = float(world_q_xyzw[0])
+        tf_msg.transform.rotation.y = float(world_q_xyzw[1])
+        tf_msg.transform.rotation.z = float(world_q_xyzw[2])
+        tf_msg.transform.rotation.w = float(world_q_xyzw[3])
         self.tf_broadcaster.sendTransform(tf_msg)
 
     def shutdown(self) -> None:
@@ -356,7 +333,7 @@ def run_rgb_aruco_localization(
         camera_frame_correction_q_xyzw=camera_frame_correction_q_xyzw,
     )
     ros.setup()
-    ros.publish_static_tf()
+    ros.publish_static_marker_tf()
 
     overlay = ArucoOverlay(
         marker_length_m=marker_length_m,
