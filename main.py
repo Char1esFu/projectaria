@@ -70,7 +70,7 @@ def main() -> None:
             camera_frame_correction_q_xyzw=Rotation.from_euler("z", -90.0, degrees=True).as_quat(),
         )
         ros.setup()
-        ros.publish_static_tf()
+        ros.publish_static_marker_tf()
         overlays.append(("aruco", ArucoOverlay(
             marker_length_m=args.marker_length_m,
             dictionary_name=args.dictionary,

@@ -12,8 +12,6 @@ from rclpy.node import Node
 from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point
 from std_msgs.msg import ColorRGBA, Header
-from tf2_ros import StaticTransformBroadcaster
-from geometry_msgs.msg import TransformStamped
 
 from utils.aria_rgb_stream import AriaRgbStream
 
@@ -72,7 +70,7 @@ def draw_hand_skeleton(img, kpts_2d, is_right):
     label = "R" if is_right > 0.5 else "L"
     cv2.putText(img, label, wrist, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
-def build_hand_markers(hand_idx, kpts_3d, cam_t, is_right, stamp, frame_id="camera_optical_link"):
+def build_hand_markers(hand_idx, kpts_3d, cam_t, is_right, stamp, frame_id="aria_camera_rgb"):
     """Build MarkerArray for one hand: joints (SPHERE_LIST) + bones (LINE_LIST)."""
     markers = []
     # Transform to camera space
@@ -184,7 +182,7 @@ class WilorHandOverlay:
         # Clear previous markers
         clear_marker = Marker()
         clear_marker.header.stamp = stamp
-        clear_marker.header.frame_id = "camera_optical_link"
+        clear_marker.header.frame_id = "aria_camera_rgb"
         clear_marker.action = Marker.DELETEALL
         marker_array.markers.append(clear_marker)
 
@@ -213,32 +211,6 @@ def run_wilor_hand_publisher(
     node = Node('wilor_hand_publisher')
     marker_pub = node.create_publisher(MarkerArray, '/hand_markers', 10)
 
-    # Publish static TF tree: base_link -> camera_link -> camera_optical_link
-    tf_broadcaster = StaticTransformBroadcaster(node)
-    stamp = node.get_clock().now().to_msg()
-
-    # base_link -> camera_link: z offset 0.5m, no rotation
-    t1 = TransformStamped()
-    t1.header.stamp = stamp
-    t1.header.frame_id = 'base_link'
-    t1.child_frame_id = 'camera_link'
-    t1.transform.translation.z = 0.5
-    t1.transform.rotation.w = 1.0
-
-    # camera_link -> camera_optical_link: standard ROS optical frame rotation
-    # camera_link: x-forward, y-left, z-up (ROS convention)
-    # optical:     x-right, y-down, z-forward
-    # Rotation: Ry(+90°) then Rz(-90°)
-    t2 = TransformStamped()
-    t2.header.stamp = stamp
-    t2.header.frame_id = 'camera_link'
-    t2.child_frame_id = 'camera_optical_link'
-    t2.transform.rotation.w = 0.5
-    t2.transform.rotation.x = -0.5
-    t2.transform.rotation.y = 0.5
-    t2.transform.rotation.z = -0.5
-
-    tf_broadcaster.sendTransform([t1, t2])
     node.get_logger().info('Publishing hand markers on /hand_markers')
 
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")

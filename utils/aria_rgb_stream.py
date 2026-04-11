@@ -69,7 +69,6 @@ class AriaRgbStream:
             update_iptables()
 
         self._load_rgb_calibration()
-        self._setup_dst_calib()
 
         aria.set_log_level(aria.Level.Info)
         self._setup_streaming()
@@ -88,6 +87,11 @@ class AriaRgbStream:
             if self.observer.rgb_image is None:
                 time.sleep(0.001)
                 continue
+
+            if self.dst_calib is None:
+                # Initialise calibration on first frame using actual streaming resolution.
+                frame_h, frame_w = self.observer.rgb_image.shape[:2]
+                self._setup_dst_calib(frame_w, frame_h)
 
             rgb_image = self._prepare_rgb_image(self.observer.rgb_image)
             self.observer.rgb_image = None
@@ -140,15 +144,18 @@ class AriaRgbStream:
                 except Exception:
                     pass
 
-    def _setup_dst_calib(self) -> None:
-        src_w, src_h = self.rgb_calib.get_image_size()
-        src_focal = self.rgb_calib.get_focal_lengths()[0]
-        print(f"dst_calib: focal_length={src_focal:.2f} px, resolution={src_w}x{src_h}")
+    def _setup_dst_calib(self, stream_w: int, stream_h: int) -> None:
+        calib_w, calib_h = self.rgb_calib.get_image_size()
+        calib_focal = self.rgb_calib.get_focal_lengths()[0]
+        # Scale focal length proportionally from calibration resolution to actual stream resolution.
+        scale = stream_w / calib_w
+        dst_focal = calib_focal * scale
+        print(f"dst_calib: calib_res={calib_w}x{calib_h}, stream_res={stream_w}x{stream_h}, scale={scale:.4f}, focal={dst_focal:.2f} px")
 
         self.dst_calib = get_linear_camera_calibration(
-            src_w,
-            src_h,
-            src_focal,
+            stream_w,
+            stream_h,
+            dst_focal,
             "camera-rgb",
         )
         fx, fy = self.dst_calib.get_focal_lengths()

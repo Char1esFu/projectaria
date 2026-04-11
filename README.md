@@ -6,6 +6,8 @@ source .venv/bin/activate
 uv pip install --upgrade pip
 uv pip install -r requirements.txt
 uv pip install projectaria_client_sdk==1.1.0 --no-cache-dir --prerelease=allow
+uv pip install "ultralytics>=8.3"
+
 ```
 
 When the glass is reset or paired to a new device, setup everything in the companion app first. Then follow the instructions below. 
@@ -34,7 +36,7 @@ python3 -m src.aruco_localization --device-ip 192.168.8.117 --marker-ids 0 1 2 #
 
 # gaze detection
 # with mouse focus on gaze image output window, keep pressing C to calibrate while focusing on center of marker 
-python3 -m projectaria_eyetracking.gaze_detect --device cuda:0
+python3 -m projectaria_eyetracking.gaze_detect --device cpu # or cuda:0, nvidia driver update needed
 
 # record audio
 python -m src.audio_record --update_iptables --channel 0
