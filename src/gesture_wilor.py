@@ -3,6 +3,8 @@ import argparse
 import cv2
 import numpy as np
 import torch
+from typing import Optional
+
 from wilor_mini.pipelines.wilor_hand_pose3d_estimation_pipeline import WiLorHandPose3dEstimationPipeline
 
 import rclpy
@@ -13,6 +15,7 @@ from std_msgs.msg import ColorRGBA, Header
 from tf2_ros import StaticTransformBroadcaster
 from geometry_msgs.msg import TransformStamped
 
+from utils.aria_rgb_stream import AriaRgbStream
 
 
 FINGER_COLORS = [
@@ -137,32 +140,75 @@ def build_hand_markers(hand_idx, kpts_3d, cam_t, is_right, stamp, frame_id="came
     return markers
 
 
-def main():
-    parser = argparse.ArgumentParser(description='WiLoR-Mini webcam demo')
-    parser.add_argument('--cam_id', type=int, default=0, help='Camera device ID')
-    parser.add_argument('--focal_length', type=float, default=None,
-                        help='Actual camera focal length in pixels at native resolution. '
-                             'If not set, defaults to 300 * max(W,H) / 256 (WiLoR internal default).')
-    args = parser.parse_args()
+class WilorHandOverlay:
+    """Runs WiLoR-Mini hand pose estimation and publishes ROS2 markers.
 
-    # Open camera first to get resolution for focal length scaling
-    cap = cv2.VideoCapture(args.cam_id)
-    if not cap.isOpened():
-        print(f"Error: Cannot open camera {args.cam_id}")
-        return
-    img_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    img_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    max_side = max(img_w, img_h)
+    Follows the AriaRgbStream overlay interface:
+        draw(display_image: np.ndarray, camera_matrix: Optional[np.ndarray]) -> None
 
-    # TODO: finalize focal length reading with Aria glass.
-    # WiLoR expects focal_length pre-scaled to 256px space: f_wilor = f_px * 256 / max(W, H)
-    if args.focal_length is not None:
-        focal_length_wilor = args.focal_length * 256.0 / max_side
-    else:
-        focal_length_wilor = 298.9  # WiLoR default (already in 256px space)
-    print(f"Camera resolution: {img_w}x{img_h}, focal_length_wilor={focal_length_wilor:.2f}")
+    The pipeline is initialized lazily on the first call to draw(), using the
+    actual image dimensions and camera intrinsics (fx) from camera_matrix.
+    """
 
-    # Init ROS2
+    def __init__(self, node: Node, marker_pub, device, dtype) -> None:
+        self.node = node
+        self.marker_pub = marker_pub
+        self.device = device
+        self.dtype = dtype
+        self.pipe = None
+        self._prev_time = time.time()
+
+    def _init_pipeline(self, image: np.ndarray, camera_matrix: Optional[np.ndarray]) -> None:
+        h, w = image.shape[:2]
+        if camera_matrix is not None:
+            fx = float(camera_matrix[0, 0])
+        else:
+            # Fallback: WiLoR internal default (300) already in 256px space
+            fx = 300.0 * max(w, h) / 256.0
+        # WiLoR expects focal_length pre-scaled to 256px space: f_wilor = f_px * 256 / max(W, H)
+        focal_length_wilor = fx * 256.0 / max(w, h)
+        print(f"Initializing WiLoR pipeline: {w}x{h}, fx={fx:.1f} px, focal_length_wilor={focal_length_wilor:.2f}")
+        self.pipe = WiLorHandPose3dEstimationPipeline(
+            device=self.device, dtype=self.dtype, focal_length=focal_length_wilor)
+
+    def draw(self, display_image: np.ndarray, camera_matrix: Optional[np.ndarray]) -> None:
+        if self.pipe is None:
+            self._init_pipeline(display_image, camera_matrix)
+
+        # AriaRgbStream provides RGB images; WiLoR pipeline also expects RGB.
+        outputs = self.pipe.predict(display_image)
+
+        stamp = self.node.get_clock().now().to_msg()
+        marker_array = MarkerArray()
+
+        # Clear previous markers
+        clear_marker = Marker()
+        clear_marker.header.stamp = stamp
+        clear_marker.header.frame_id = "camera_optical_link"
+        clear_marker.action = Marker.DELETEALL
+        marker_array.markers.append(clear_marker)
+
+        for hand_idx, hand in enumerate(outputs):
+            preds = hand["wilor_preds"]
+            kpts_2d = preds["pred_keypoints_2d"][0]  # (21, 2)
+            kpts_3d = preds["pred_keypoints_3d"][0]  # (21, 3)
+            cam_t = preds["pred_cam_t_full"][0]      # (3,)
+            draw_hand_skeleton(display_image, kpts_2d, hand["is_right"])
+            markers = build_hand_markers(hand_idx, kpts_3d, cam_t, hand["is_right"], stamp)
+            marker_array.markers.extend(markers)
+
+        self.marker_pub.publish(marker_array)
+
+        curr_time = time.time()
+        fps = 1.0 / (curr_time - self._prev_time) if (curr_time - self._prev_time) > 0 else 0
+        self._prev_time = curr_time
+        cv2.putText(display_image, f'FPS: {fps:.1f}', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+
+
+def run_wilor_hand_publisher(
+    device_ip: Optional[str] = None,
+    update_iptables_rules: bool = False,
+) -> None:
     rclpy.init()
     node = Node('wilor_hand_publisher')
     marker_pub = node.create_publisher(MarkerArray, '/hand_markers', 10)
@@ -198,57 +244,34 @@ def main():
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     dtype = torch.float16
 
-    print("Loading WiLoR-Mini pipeline...")
-    pipe = WiLorHandPose3dEstimationPipeline(device=device, dtype=dtype, focal_length=focal_length_wilor)
-    print(f"Pipeline loaded.")
-
-    print("Webcam started. Press 'q' to quit.")
-    prev_time = time.time()
-
+    overlay = WilorHandOverlay(node, marker_pub, device, dtype)
+    stream = AriaRgbStream(
+        device_ip=device_ip,
+        update_iptables_rules=update_iptables_rules,
+        window_name="WiLoR-Mini Aria",
+    )
+    stream.add_overlay(overlay)
     try:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            outputs = pipe.predict(image_rgb)
-
-            display = frame.copy()
-            stamp = node.get_clock().now().to_msg()
-            marker_array = MarkerArray()
-
-            # Clear previous markers
-            clear_marker = Marker()
-            clear_marker.header.stamp = stamp
-            clear_marker.header.frame_id = "camera_optical_link"
-            clear_marker.action = Marker.DELETEALL
-            marker_array.markers.append(clear_marker)
-
-            for hand_idx, hand in enumerate(outputs):
-                preds = hand["wilor_preds"]
-                kpts_2d = preds["pred_keypoints_2d"][0]  # (21, 2)
-                kpts_3d = preds["pred_keypoints_3d"][0]  # (21, 3)
-                cam_t = preds["pred_cam_t_full"][0]      # (3,)
-                draw_hand_skeleton(display, kpts_2d, hand["is_right"])
-                markers = build_hand_markers(hand_idx, kpts_3d, cam_t, hand["is_right"], stamp)
-                marker_array.markers.extend(markers)
-
-            marker_pub.publish(marker_array)
-
-            curr_time = time.time()
-            fps = 1.0 / (curr_time - prev_time) if (curr_time - prev_time) > 0 else 0
-            prev_time = curr_time
-            cv2.putText(display, f'FPS: {fps:.1f}', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-
-            cv2.imshow('WiLoR-Mini Webcam', display)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
+        stream.run()
     finally:
-        cap.release()
-        cv2.destroyAllWindows()
         node.destroy_node()
         rclpy.shutdown()
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description='WiLoR-Mini hand gesture on Aria RGB stream')
+    parser.add_argument('--device-ip', help='IP address of the Aria device')
+    parser.add_argument('--update_iptables', default=False, action='store_true',
+                        help='Update iptables for DDS UDP stream (Linux only).')
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    run_wilor_hand_publisher(
+        device_ip=args.device_ip,
+        update_iptables_rules=args.update_iptables,
+    )
 
 
 if __name__ == '__main__':
