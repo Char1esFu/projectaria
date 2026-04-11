@@ -144,9 +144,18 @@ class ArucoLocalizer:
         if ids is None or len(ids) == 0:
             return
 
-        rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(
-            corners, self.marker_length_m, self.camera_matrix, self.dist_coeffs
-        )
+        half = self.marker_length_m / 2.0
+        obj_pts = np.array([
+            [-half,  half, 0],
+            [ half,  half, 0],
+            [ half, -half, 0],
+            [-half, -half, 0],
+        ], dtype=np.float32)
+        rvecs, tvecs = [], []
+        for corner in corners:
+            _, rvec, tvec = cv2.solvePnP(obj_pts, corner[0], self.camera_matrix, self.dist_coeffs)
+            rvecs.append(rvec)
+            tvecs.append(tvec)
 
         pose_entries = []
         for marker_id, corner_set, rvec, tvec in zip(ids.flatten(), corners, rvecs, tvecs):
