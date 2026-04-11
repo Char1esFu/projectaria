@@ -16,6 +16,9 @@ from std_msgs.msg import ColorRGBA, Header
 from utils.aria_rgb_stream import AriaRgbStream
 
 
+CALIB_MARKER_ID: int = 0
+
+
 FINGER_COLORS = [
     (0, 0, 255),    # thumb - red
     (0, 165, 255),  # index - orange
@@ -148,7 +151,7 @@ class WilorHandOverlay:
     actual image dimensions and camera intrinsics (fx) from camera_matrix.
     """
 
-    def __init__(self, node: Node, marker_pub, device, dtype) -> None:
+    def __init__(self, node: Node, marker_pub, device, dtype, marker_length_m: float) -> None:
         self.node = node
         self.marker_pub = marker_pub
         self.device = device
@@ -156,26 +159,112 @@ class WilorHandOverlay:
         self.pipe = None
         self._prev_time = time.time()
 
+        self.marker_length_m = marker_length_m
+        self.dist_coeffs = np.zeros((5, 1), dtype=np.float64)
+        self._setup_aruco_detector()
+
+        self._calib_held: bool = False
+        self._calib_samples: list[tuple[float, float]] = []  # (est_wrist_z, marker_z)
+        self.depth_scale: float = 1.0
+
+    def _setup_aruco_detector(self) -> None:
+        aruco = cv2.aruco
+        dictionary = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
+        params = aruco.DetectorParameters()
+        self.aruco_detector = aruco.ArucoDetector(dictionary, params)
+        half = self.marker_length_m / 2.0
+        # ArUco corner order: top-left, top-right, bottom-right, bottom-left
+        self.aruco_obj_pts = np.array([
+            [-half,  half, 0],
+            [ half,  half, 0],
+            [ half, -half, 0],
+            [-half, -half, 0],
+        ], dtype=np.float32)
+
+    def _detect_marker(self, image: np.ndarray, camera_matrix: np.ndarray) -> Optional[float]:
+        """Detect ArUco marker CALIB_MARKER_ID, draw it, and return its z-depth (m). Returns None if not found."""
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        corners, ids, _ = self.aruco_detector.detectMarkers(gray)
+        if ids is None:
+            return None
+        for mid, corner_set in zip(ids.flatten(), corners):
+            if int(mid) != CALIB_MARKER_ID:
+                continue
+            _, rvec, tvec = cv2.solvePnP(
+                self.aruco_obj_pts, corner_set[0], camera_matrix, self.dist_coeffs
+            )
+            pts = corner_set.reshape(-1, 2).astype(np.int32)
+            cv2.polylines(image, [pts], True, (0, 255, 0), 2)
+            cv2.putText(image, f"id:{CALIB_MARKER_ID}", (int(pts[0][0]), int(pts[0][1]) - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+            cv2.drawFrameAxes(image, camera_matrix, self.dist_coeffs, rvec, tvec, 0.03)
+            return float(tvec[2])
+        return None
+
+    def _compute_scale(self) -> None:
+        """Fit depth_scale via least squares through origin: scale = Σ(x·y) / Σ(x²)."""
+        if len(self._calib_samples) < 2:
+            print("Not enough calibration samples (need >= 2).")
+            return
+        xs = np.array([s[0] for s in self._calib_samples], dtype=np.float64)
+        ys = np.array([s[1] for s in self._calib_samples], dtype=np.float64)
+        self.depth_scale = float(np.dot(xs, ys) / np.dot(xs, xs))
+        print(
+            f"Calibration done ({len(self._calib_samples)} samples). "
+            f"depth_scale={self.depth_scale:.4f}"
+        )
+
     def _init_pipeline(self, image: np.ndarray, camera_matrix: Optional[np.ndarray]) -> None:
         h, w = image.shape[:2]
         if camera_matrix is not None:
             fx = float(camera_matrix[0, 0])
         else:
             # Fallback: WiLoR internal default (300) already in 256px space
-            fx = 300.0 * max(w, h) / 256.0
+            fx = 298.19 * max(w, h) / 256.0
         # WiLoR expects focal_length pre-scaled to 256px space: f_wilor = f_px * 256 / max(W, H)
         focal_length_wilor = fx * 256.0 / max(w, h)
         print(f"Initializing WiLoR pipeline: {w}x{h}, fx={fx:.1f} px, focal_length_wilor={focal_length_wilor:.2f}")
         self.pipe = WiLorHandPose3dEstimationPipeline(
             device=self.device, dtype=self.dtype, focal_length=focal_length_wilor)
 
-    def draw(self, display_image: np.ndarray, camera_matrix: Optional[np.ndarray]) -> None:
+    def draw(self, display_image: np.ndarray, camera_matrix: Optional[np.ndarray], key: int = -1) -> None:
         if self.pipe is None:
             self._init_pipeline(display_image, camera_matrix)
 
+        # --- Calibration key handling (C to start/stop, like gaze_detect.py) ---
+        c_down_now = (key == ord('c'))
+        if c_down_now and not self._calib_held:
+            self._calib_held = True
+            self._calib_samples.clear()
+            print(
+                f"Calibrating: hold C with both hands on either side of marker {CALIB_MARKER_ID} "
+                "and move your head. Release to compute depth_scale."
+            )
+        elif not c_down_now and self._calib_held:
+            self._calib_held = False
+            self._compute_scale()
+
+        # --- ArUco marker detection ---
+        marker_z: Optional[float] = None
+        if camera_matrix is not None:
+            marker_z = self._detect_marker(display_image, camera_matrix)
+
+        # --- WiLoR inference ---
         # AriaRgbStream provides RGB images; WiLoR pipeline also expects RGB.
         outputs = self.pipe.predict(display_image)
 
+        # --- Collect calibration samples (both hands + marker visible) ---
+        if self._calib_held and marker_z is not None and len(outputs) == 2:
+            wrist_depths = [float(h["wilor_preds"]["pred_cam_t_full"][0][2]) for h in outputs]
+            avg_wrist_z = float(np.mean(wrist_depths))
+            if avg_wrist_z > 0.0:
+                self._calib_samples.append((avg_wrist_z, marker_z))
+                print(
+                    f"  sample {len(self._calib_samples)}: "
+                    f"wrist_z={avg_wrist_z:.3f}  marker_z={marker_z:.3f}"
+                )
+
+        # --- Build and publish ROS markers with depth_scale applied ---
         stamp = self.node.get_clock().now().to_msg()
         marker_array = MarkerArray()
 
@@ -188,9 +277,9 @@ class WilorHandOverlay:
 
         for hand_idx, hand in enumerate(outputs):
             preds = hand["wilor_preds"]
-            kpts_2d = preds["pred_keypoints_2d"][0]  # (21, 2)
-            kpts_3d = preds["pred_keypoints_3d"][0]  # (21, 3)
-            cam_t = preds["pred_cam_t_full"][0]      # (3,)
+            kpts_2d = preds["pred_keypoints_2d"][0]           # (21, 2)
+            kpts_3d = preds["pred_keypoints_3d"][0] * self.depth_scale  # (21, 3)
+            cam_t   = preds["pred_cam_t_full"][0]   * self.depth_scale  # (3,)
             draw_hand_skeleton(display_image, kpts_2d, hand["is_right"])
             markers = build_hand_markers(hand_idx, kpts_3d, cam_t, hand["is_right"], stamp)
             marker_array.markers.extend(markers)
@@ -200,23 +289,30 @@ class WilorHandOverlay:
         curr_time = time.time()
         fps = 1.0 / (curr_time - self._prev_time) if (curr_time - self._prev_time) > 0 else 0
         self._prev_time = curr_time
-        cv2.putText(display_image, f'FPS: {fps:.1f}', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+        scale_str = f"scale:{self.depth_scale:.3f}" + (" [calib]" if self._calib_held else "")
+        cv2.putText(display_image, f'FPS: {fps:.1f}  {scale_str}', (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
 
 
 def run_wilor_hand_publisher(
     device_ip: Optional[str] = None,
     update_iptables_rules: bool = False,
+    marker_length_m: float = 0.13,
 ) -> None:
     rclpy.init()
     node = Node('wilor_hand_publisher')
     marker_pub = node.create_publisher(MarkerArray, '/hand_markers', 10)
 
     node.get_logger().info('Publishing hand markers on /hand_markers')
+    node.get_logger().info(
+        f'ArUco depth calibration: hold C with both hands flanking marker {CALIB_MARKER_ID} '
+        f'(size {marker_length_m*100:.0f} cm) and move head; release to compute depth_scale.'
+    )
 
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     dtype = torch.float16
 
-    overlay = WilorHandOverlay(node, marker_pub, device, dtype)
+    overlay = WilorHandOverlay(node, marker_pub, device, dtype, marker_length_m=marker_length_m)
     stream = AriaRgbStream(
         device_ip=device_ip,
         update_iptables_rules=update_iptables_rules,
@@ -235,6 +331,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--device-ip', help='IP address of the Aria device')
     parser.add_argument('--update_iptables', default=False, action='store_true',
                         help='Update iptables for DDS UDP stream (Linux only).')
+    parser.add_argument('--marker-length-m', type=float, default=0.13,
+                        help='Physical side length of the ArUco calibration marker in metres.')
     return parser.parse_args()
 
 
@@ -243,6 +341,7 @@ def main() -> None:
     run_wilor_hand_publisher(
         device_ip=args.device_ip,
         update_iptables_rules=args.update_iptables,
+        marker_length_m=args.marker_length_m,
     )
 
 

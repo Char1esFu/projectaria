@@ -38,19 +38,22 @@ python3 -m src.aruco_localization --device-ip 192.168.8.117 --marker-ids 0 1 2 #
 # with mouse focus on gaze image output window, keep pressing C to calibrate while focusing on center of marker 
 python3 -m projectaria_eyetracking.gaze_detect --device cpu # or cuda:0, nvidia driver update needed
 
+# gaze projection on egocentric image
+python -m src.gaze_rgb_visualizer --device-ip 192.168.8.117
+
 # record audio
 python -m src.audio_record --update_iptables --channel 0
 
 # hand gesture detection on egocentric camera
-python3 -m src.hand_gesture --device-ip 192.168.8.117
+python3 -m src.gesture_wilor --device-ip 192.168.8.117
 
-# gaze projection on egocentric image
-python -m src.gaze_rgb_visualizer --device-ip 192.168.8.117
+# visualize gesture intersection with desk
+python3 -m src.gesture_intersect
 
 # yolo inference
 python3 -m src.yolo_rgb_detector
 
-# run all features together
+# run all features together #TODO: calibration not integrated
 python3 main.py --yolo --gaze --aruco --hands --marker-ids 0 1 2
 
 # stop streaming

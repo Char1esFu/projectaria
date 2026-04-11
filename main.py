@@ -57,7 +57,6 @@ def main() -> None:
 
     if args.aruco:
         from src.aruco_localization import ArucoOverlay, RosPosePublisher
-        from scipy.spatial.transform import Rotation
 
         static_tf_config_path = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "config", "aruco_tf.json"
@@ -67,7 +66,7 @@ def main() -> None:
             marker_frame_prefix="aruco_marker_",
             camera_frame="aria_camera_rgb",
             static_tf_config_path=static_tf_config_path,
-            camera_frame_correction_q_xyzw=Rotation.from_euler("z", -90.0, degrees=True).as_quat(),
+            camera_frame_correction_q_xyzw=None,
         )
         ros.setup()
         ros.publish_static_marker_tf()

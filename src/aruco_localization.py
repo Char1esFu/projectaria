@@ -1,6 +1,7 @@
 import os
 import argparse
 import json
+import time
 from typing import Optional
 
 import cv2
@@ -43,6 +44,7 @@ class ArucoOverlay:
         self.ros = ros
         self.dist_coeffs = np.zeros((5, 1), dtype=np.float64)
         self._ema_state = {}
+        self._prev_time = time.time()
 
         dict_id = getattr(cv2.aruco, dictionary_name, None)
         if dict_id is None:
@@ -54,7 +56,15 @@ class ArucoOverlay:
 
         self._allowed_id_set = set(allowed_marker_ids) if allowed_marker_ids else None
 
-    def draw(self, display_image: np.ndarray, camera_matrix: Optional[np.ndarray]) -> None:
+    def draw(self, display_image: np.ndarray, camera_matrix: Optional[np.ndarray], key: int = -1) -> None:
+        # camera_matrix is provided by AriaRgbStream from device calibration on first frame.
+        if camera_matrix is None:
+            return
+        curr_time = time.time()
+        fps = 1.0 / (curr_time - self._prev_time) if (curr_time - self._prev_time) > 0 else 0.0
+        self._prev_time = curr_time
+        cv2.putText(display_image, f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+
         gray = cv2.cvtColor(display_image, cv2.COLOR_RGB2GRAY)
         corners, ids, _ = self.aruco_detector.detectMarkers(gray)
 
@@ -313,7 +323,7 @@ class RosPosePublisher:
 
 def run_rgb_aruco_localization(
     device_ip: Optional[str] = None,
-    marker_length_m: float = 0.04,
+    marker_length_m: float = 0.13,
     dictionary_name: str = "DICT_4X4_50",
     update_iptables_rules: bool = False,
     allowed_marker_ids: Optional[list[int]] = None,
@@ -323,14 +333,13 @@ def run_rgb_aruco_localization(
     static_tf_config_path = os.path.abspath(
         os.path.join(os.path.dirname(__file__), "..", "config", "aruco_tf.json")
     )
-    camera_frame_correction_q_xyzw = Rotation.from_euler("z", -90.0, degrees=True).as_quat()
 
     ros = RosPosePublisher(
         topic="/aria/cam_pose",
         marker_frame_prefix="aruco_marker_",
         camera_frame="aria_camera_rgb",
         static_tf_config_path=static_tf_config_path,
-        camera_frame_correction_q_xyzw=camera_frame_correction_q_xyzw,
+        camera_frame_correction_q_xyzw=None,
     )
     ros.setup()
     ros.publish_static_marker_tf()
@@ -359,7 +368,7 @@ def run_rgb_aruco_localization(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device-ip", help="IP address to connect to the device")
-    parser.add_argument("--marker-length-m", type=float, default=0.2)
+    parser.add_argument("--marker-length-m", type=float, default=0.13)
     parser.add_argument("--dictionary", type=str, default="DICT_4X4_50")
     parser.add_argument("--update_iptables", default=True, action="store_true")
     parser.add_argument("--marker-ids", type=int, nargs="+", default=None)

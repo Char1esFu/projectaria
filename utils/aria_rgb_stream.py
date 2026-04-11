@@ -28,7 +28,7 @@ import aria.sdk as aria
 import cv2
 import numpy as np
 
-from utils.common import quit_keypress, update_iptables
+from utils.common import update_iptables
 from projectaria_tools.core.calibration import (
     device_calibration_from_json_string,
     distort_by_calibration,
@@ -83,7 +83,11 @@ class AriaRgbStream:
         cv2.setWindowProperty(self.window_name, cv2.WND_PROP_TOPMOST, 1)
         cv2.moveWindow(self.window_name, 50, 50)
 
-        while not quit_keypress():
+        while True:
+            key = cv2.waitKey(1) & 0xFF
+            if key == 27 or key == ord("q"):
+                break
+
             if self.observer.rgb_image is None:
                 time.sleep(0.001)
                 continue
@@ -112,7 +116,7 @@ class AriaRgbStream:
             display_matrix[1, 2] -= oy
 
             for overlay in self._overlays:
-                overlay.draw(display, display_matrix)
+                overlay.draw(display, display_matrix, key)
 
             cv2.imshow(self.window_name, display)
 

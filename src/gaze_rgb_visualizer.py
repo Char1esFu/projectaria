@@ -49,7 +49,7 @@ class GazeOverlay:
         except Exception as exc:
             raise RuntimeError(f"ROS2 subscriber unavailable: {exc}") from exc
 
-    def draw(self, display_image: np.ndarray, camera_matrix: Optional[np.ndarray]) -> None:
+    def draw(self, display_image: np.ndarray, camera_matrix: Optional[np.ndarray], key: int = -1) -> None:
         if camera_matrix is None:
             return
 
