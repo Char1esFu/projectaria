@@ -11,20 +11,6 @@ from scipy.spatial.transform import Rotation, Slerp
 from utils.aria_rgb_stream import AriaRgbStream
 
 
-def average_quaternions(quats_xyzw: list[np.ndarray], weights: np.ndarray) -> np.ndarray:
-    ref = quats_xyzw[0]
-    accum = np.zeros(4, dtype=np.float64)
-    for quat, weight in zip(quats_xyzw, weights):
-        if np.dot(ref, quat) < 0.0:
-            accum -= weight * quat
-        else:
-            accum += weight * quat
-    norm = np.linalg.norm(accum)
-    if norm < 1e-12:
-        return ref
-    return accum / norm
-
-
 class ArucoOverlay:
     """Detects ArUco markers, draws them, and publishes poses via ROS2."""
 
@@ -56,6 +42,16 @@ class ArucoOverlay:
 
         self._allowed_id_set = set(allowed_marker_ids) if allowed_marker_ids else None
 
+        half = marker_length_m / 2.0
+        # ArUco corner order: top-left, top-right, bottom-right, bottom-left
+        # in marker-local frame (x right, y up, z out of marker).
+        self._local_corners = np.array([
+            [-half,  half, 0],
+            [ half,  half, 0],
+            [ half, -half, 0],
+            [-half, -half, 0],
+        ], dtype=np.float64)
+
     def draw(self, display_image: np.ndarray, camera_matrix: Optional[np.ndarray], key: int = -1) -> None:
         # camera_matrix is provided by AriaRgbStream from device calibration on first frame.
         if camera_matrix is None:
@@ -71,74 +67,57 @@ class ArucoOverlay:
         if ids is None or len(ids) == 0:
             return
 
-        half = self.marker_length_m / 2.0
-        # ArUco corner order: top-left, top-right, bottom-right, bottom-left
-        # in marker frame (x right, y up, z out of marker).
-        obj_pts = np.array([
-            [-half,  half, 0],
-            [ half,  half, 0],
-            [ half, -half, 0],
-            [-half, -half, 0],
-        ], dtype=np.float32)
-        rvecs, tvecs = [], []
-        for corner in corners:
-            _, rvec, tvec = cv2.solvePnP(obj_pts, corner[0], camera_matrix, self.dist_coeffs)
-            rvecs.append(rvec)
-            tvecs.append(tvec)
+        # Accumulate multi-marker PnP correspondences in world frame.
+        all_obj_pts = []   # 3D corners in world frame
+        all_img_pts = []   # corresponding 2D image corners
+        valid_markers = [] # (marker_id, corner_set, parent_frame, marker_t, marker_q)
 
-        pose_entries = []
-        for marker_id, corner_set, rvec, tvec in zip(ids.flatten(), corners, rvecs, tvecs):
+        for marker_id, corner_set in zip(ids.flatten(), corners):
             if self._allowed_id_set is not None and int(marker_id) not in self._allowed_id_set:
                 continue
-            entry = self._compute_world_pose(int(marker_id), rvec, tvec)
-            if entry is not None:
-                pose_entries.append(entry)
-            self._draw_marker(display_image, int(marker_id), corner_set, rvec, tvec, camera_matrix)
+            static_entry = self.ros.get_static_entry(int(marker_id))
+            if static_entry is None:
+                continue
+            parent_frame, marker_t, marker_q = static_entry
+            # Transform marker-local corners into world frame.
+            world_corners = marker_t + Rotation.from_quat(marker_q).apply(self._local_corners)
+            all_obj_pts.append(world_corners)
+            all_img_pts.append(corner_set[0])
+            valid_markers.append((int(marker_id), corner_set, parent_frame, marker_t, marker_q))
 
-        if not pose_entries:
+        if not valid_markers:
             return
 
-        parent_frame = pose_entries[0][0]
-        world_ts = [entry[3] for entry in pose_entries]
-        world_quats = [entry[4] for entry in pose_entries]
-        cam_dists = np.array([entry[6] for entry in pose_entries], dtype=np.float64)
-        
-        # Weight each marker inversely by camera distance: closer markers give more accurate poses.
-        weights = 1.0 / (cam_dists + 1e-6)
-        weights_sum = np.sum(weights)
-        weights = weights / weights_sum if weights_sum > 0.0 else np.ones_like(weights) / float(len(weights))
-        avg_t = np.sum(np.stack(world_ts, axis=0) * weights[:, None], axis=0)
-        avg_q = average_quaternions(world_quats, weights)
-        avg_t, avg_q = self._apply_ema(parent_frame, avg_t, avg_q)
-        
-        self.ros.publish_cam_pose(parent_frame, avg_t, avg_q)
+        obj_pts = np.vstack(all_obj_pts).astype(np.float32)  # (N*4, 3)
+        img_pts = np.vstack(all_img_pts).astype(np.float32)  # (N*4, 2)
 
-    def _compute_world_pose(
-        self, marker_id: int, rvec: np.ndarray, tvec: np.ndarray
-    ) -> Optional[tuple]:
-        '''
-        Returns (parent_frame, marker_t, marker_q, world_t, world_q_xyzw, marker_id, cam_dist) or None if static TF not found.
-        '''
-        # solvePnP gives marker-in-camera pose; invert to get camera-in-marker pose.
-        rotation_marker_in_cam, _ = cv2.Rodrigues(rvec)
-        rotation_cam_in_marker = rotation_marker_in_cam.T
-        tvec_cam_in_marker = -rotation_cam_in_marker @ tvec.reshape(3, 1)
-
-        static_entry = self.ros.get_static_entry(marker_id)
-        if static_entry is None:
-            return None
-
-        parent_frame, marker_t, marker_q = static_entry
-        cam_t = np.array(
-            [float(tvec_cam_in_marker[0][0]), float(tvec_cam_in_marker[1][0]), float(tvec_cam_in_marker[2][0])],
-            dtype=np.float64,
+        # Joint PnP: solve for the world-to-camera transform over all visible markers.
+        # solvePnP returns rvec/tvec such that p_cam = R * p_world + t  (world-in-camera).
+        success, rvec, tvec = cv2.solvePnP(
+            obj_pts, img_pts, camera_matrix, self.dist_coeffs,
+            flags=cv2.SOLVEPNP_ITERATIVE,
         )
-        cam_q = Rotation.from_matrix(rotation_cam_in_marker).as_quat()
-        marker_rot = Rotation.from_quat(marker_q)
-        world_t = marker_t + marker_rot.apply(cam_t)
-        world_q_xyzw = (marker_rot * Rotation.from_quat(cam_q)).as_quat()
-        cam_dist = float(np.linalg.norm(cam_t))
-        return parent_frame, marker_t, marker_q, world_t, world_q_xyzw, marker_id, cam_dist
+        if not success:
+            return
+
+        R_wc, _ = cv2.Rodrigues(rvec)  # world-in-camera rotation
+        # Invert to get camera-in-world pose.
+        R_cw = R_wc.T
+        world_t = (-R_cw @ tvec.reshape(3, 1)).flatten()
+        world_q_xyzw = Rotation.from_matrix(R_cw).as_quat()
+
+        # Draw each detected marker using its pose derived from the joint solution.
+        for marker_id, corner_set, _, marker_t_m, marker_q_m in valid_markers:
+            R_mw = Rotation.from_quat(marker_q_m).as_matrix()
+            # marker-in-camera: R_mc = R_wc @ R_mw,  t_mc = R_wc @ marker_t_m + tvec
+            R_mc = R_wc @ R_mw
+            t_mc = R_wc @ marker_t_m.reshape(3, 1) + tvec.reshape(3, 1)
+            rvec_m, _ = cv2.Rodrigues(R_mc)
+            self._draw_marker(display_image, marker_id, corner_set, rvec_m, t_mc, camera_matrix)
+
+        parent_frame = valid_markers[0][2]
+        world_t, world_q_xyzw = self._apply_ema(parent_frame, world_t, world_q_xyzw)
+        self.ros.publish_cam_pose(parent_frame, world_t, world_q_xyzw)
 
     def _apply_ema(self, parent_frame: str, t: np.ndarray, q_xyzw: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         if (not self.use_ema) or self.ema_alpha <= 0.0:
