@@ -83,10 +83,15 @@ class AriaRgbStream:
         cv2.setWindowProperty(self.window_name, cv2.WND_PROP_TOPMOST, 1)
         cv2.moveWindow(self.window_name, 50, 50)
 
+        pending_key = 255  # buffer key presses between frames (waitKey polls at 1ms, frames arrive ~33ms)
+
         while True:
             key = cv2.waitKey(1) & 0xFF
             if key == 27 or key == ord("q"):
                 break
+
+            if key != 255:
+                pending_key = key
 
             if self.observer.rgb_image is None:
                 time.sleep(0.001)
@@ -115,8 +120,11 @@ class AriaRgbStream:
             display_matrix[0, 2] -= ox
             display_matrix[1, 2] -= oy
 
+            frame_key = pending_key
+            pending_key = 255
+
             for overlay in self._overlays:
-                overlay.draw(display, display_matrix, key)
+                overlay.draw(display, display_matrix, frame_key)
 
             cv2.imshow(self.window_name, display)
 
