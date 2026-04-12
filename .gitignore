@@ -211,3 +211,7 @@ __marimo__/
 
 # agent
 .claude/
+
+# image folder
+test_homography/images/
+test_homography/results/
