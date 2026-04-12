@@ -4,7 +4,8 @@ uv venv .venv -p 3.10
 source .venv/bin/activate
 
 uv pip install --upgrade pip
-uv pip install -r requirements.txt
+uv pip install setuptools
+uv pip install -r requirements.txt --no-build-isolation
 uv pip install projectaria_client_sdk==1.1.0 --no-cache-dir --prerelease=allow
 uv pip install "ultralytics>=8.3"
 

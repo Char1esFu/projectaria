@@ -235,17 +235,17 @@ def main() -> None:
                     # gaze_row = cy - fy * tan(pitch_raw - pitch_offset)  →  match marker_row
                     res_p = minimize_scalar(
                         lambda dp: float(np.sum((rows - cy + fy * np.tan(pitches - dp)) ** 2)),
-                        bounds=(-0.5, 0.5),
+                        bounds=(-np.pi, np.pi),
                         method="bounded",
                     )
                     # gaze_col = cx + fx*(tan(yaw_raw - yaw_offset) + GAZE_ORIGIN_X_OFFSET)  →  match marker_col
                     res_y = minimize_scalar(
                         lambda dy: float(
                             np.sum(
-                                (cols - cx - fx * (np.tan(yaws - dy) + GAZE_ORIGIN_X_OFFSET)) ** 2
+                                (cols - cx + fx * (np.tan(yaws - dy) + GAZE_ORIGIN_X_OFFSET)) ** 2
                             )
                         ),
-                        bounds=(-0.5, 0.5),
+                        bounds=(-np.pi, np.pi),
                         method="bounded",
                     )
                     pitch_offset = float(res_p.x)

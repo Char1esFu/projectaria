@@ -30,7 +30,7 @@ class YoloOverlay:
         self.infer_size = infer_size
         self.device = device
 
-    def draw(self, display_image: np.ndarray, _camera_matrix: Optional[np.ndarray]) -> None:
+    def draw(self, display_image: np.ndarray, _camera_matrix: Optional[np.ndarray], _key: int = -1) -> None:
         results = self.model(
             display_image,
             conf=self.conf_threshold,
