@@ -11,20 +11,31 @@ from utils.aria_rgb_stream import AriaRgbStream
 from utils.ros_pose_publisher import RosPosePublisher
 
 
-class ArucoOverlay:
-    """Detects ArUco markers, draws them, and publishes poses via ROS2."""
+class AprilTagOverlay:
+    """Detects AprilTag markers, draws them, and publishes poses via ROS2.
+
+    Multi-marker joint PnP: all visible tags whose world poses are known from the
+    static TF config contribute corner correspondences to a single solvePnP call,
+    giving one camera-in-world estimate directly — no per-tag inversion or
+    weighted averaging needed.
+
+    AprilTag corner convention (pupil-apriltags / C apriltag library):
+        corners[0] = lower-left,  corners[1] = lower-right,
+        corners[2] = upper-right, corners[3] = upper-left
+    Tag-local frame: x right, y up, z toward viewer (same as ArUco).
+    """
 
     def __init__(
         self,
-        marker_length_m: float,
-        dictionary_name: str,
-        allowed_marker_ids: Optional[list[int]],
+        tag_size_m: float,
+        tag_family: str,
+        allowed_tag_ids: Optional[list[int]],
         use_ema: bool,
         ema_alpha: float,
         ros: "RosPosePublisher",
     ) -> None:
-        self.marker_length_m = marker_length_m
-        self.allowed_marker_ids = allowed_marker_ids
+        self.tag_size_m = tag_size_m
+        self.allowed_tag_ids = allowed_tag_ids
         self.use_ema = bool(use_ema)
         self.ema_alpha = float(ema_alpha)
         self.ros = ros
@@ -32,28 +43,30 @@ class ArucoOverlay:
         self._ema_state = {}
         self._prev_time = time.time()
 
-        dict_id = getattr(cv2.aruco, dictionary_name, None)
-        if dict_id is None:
-            raise ValueError(f"Unknown ArUco dictionary: {dictionary_name}")
-        dictionary = cv2.aruco.getPredefinedDictionary(dict_id)
-        detector_params = cv2.aruco.DetectorParameters()
-        detector_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
-        self.aruco_detector = cv2.aruco.ArucoDetector(dictionary, detector_params)
+        from pupil_apriltags import Detector
+        self.detector = Detector(
+            families=tag_family,
+            nthreads=2,
+            quad_decimate=1.0,
+            quad_sigma=0.0,
+            refine_edges=1,
+            decode_sharpening=0.25,
+        )
 
-        self._allowed_id_set = set(allowed_marker_ids) if allowed_marker_ids else None
+        self._allowed_id_set = set(allowed_tag_ids) if allowed_tag_ids else None
 
-        half = marker_length_m / 2.0
-        # ArUco corner order: top-left, top-right, bottom-right, bottom-left
-        # in marker-local frame (x right, y up, z out of marker).
+        half = tag_size_m / 2.0
+        # Tag-local corners matching pupil-apriltags detection order:
+        #   lower-left, lower-right, upper-right, upper-left
+        # in tag frame (x right, y up, z out of tag).
         self._local_corners = np.array([
-            [-half,  half, 0],
-            [ half,  half, 0],
-            [ half, -half, 0],
-            [-half, -half, 0],
+            [-half, -half, 0],  # lower-left  = corners[0]
+            [ half, -half, 0],  # lower-right = corners[1]
+            [ half,  half, 0],  # upper-right = corners[2]
+            [-half,  half, 0],  # upper-left  = corners[3]
         ], dtype=np.float64)
 
     def draw(self, display_image: np.ndarray, camera_matrix: Optional[np.ndarray], key: int = -1) -> None:
-        # camera_matrix is provided by AriaRgbStream from device calibration on first frame.
         if camera_matrix is None:
             return
         curr_time = time.time()
@@ -62,36 +75,37 @@ class ArucoOverlay:
         cv2.putText(display_image, f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
 
         gray = cv2.cvtColor(display_image, cv2.COLOR_RGB2GRAY)
-        corners, ids, _ = self.aruco_detector.detectMarkers(gray)
+        detections = self.detector.detect(gray)
 
-        if ids is None or len(ids) == 0:
+        if not detections:
             return
 
         # Accumulate multi-marker PnP correspondences in world frame.
         all_obj_pts = []   # 3D corners in world frame
         all_img_pts = []   # corresponding 2D image corners
-        valid_markers = [] # (marker_id, corner_set, parent_frame, marker_t, marker_q)
+        valid_tags = []    # (tag_id, corners_2d, parent_frame, marker_t, marker_q)
 
-        for marker_id, corner_set in zip(ids.flatten(), corners):
-            if self._allowed_id_set is not None and int(marker_id) not in self._allowed_id_set:
+        for det in detections:
+            tag_id = int(det.tag_id)
+            if self._allowed_id_set is not None and tag_id not in self._allowed_id_set:
                 continue
-            static_entry = self.ros.get_static_entry(int(marker_id))
+            static_entry = self.ros.get_static_entry(tag_id)
             if static_entry is None:
                 continue
             parent_frame, marker_t, marker_q = static_entry
-            # Transform marker-local corners into world frame.
+            # Transform tag-local corners into world frame.
             world_corners = marker_t + Rotation.from_quat(marker_q).apply(self._local_corners)
             all_obj_pts.append(world_corners)
-            all_img_pts.append(corner_set[0])
-            valid_markers.append((int(marker_id), corner_set, parent_frame, marker_t, marker_q))
+            all_img_pts.append(det.corners)  # already (4, 2) float64
+            valid_tags.append((tag_id, det.corners, parent_frame, marker_t, marker_q))
 
-        if not valid_markers:
+        if not valid_tags:
             return
 
         obj_pts = np.vstack(all_obj_pts).astype(np.float32)  # (N*4, 3)
         img_pts = np.vstack(all_img_pts).astype(np.float32)  # (N*4, 2)
 
-        # Joint PnP: solve for the world-to-camera transform over all visible markers.
+        # Joint PnP: solve for world-to-camera transform over all visible tags.
         # solvePnP returns rvec/tvec such that p_cam = R * p_world + t  (world-in-camera).
         success, rvec, tvec = cv2.solvePnP(
             obj_pts, img_pts, camera_matrix, self.dist_coeffs,
@@ -106,16 +120,16 @@ class ArucoOverlay:
         world_t = (-R_cw @ tvec.reshape(3, 1)).flatten()
         world_q_xyzw = Rotation.from_matrix(R_cw).as_quat()
 
-        # Draw each detected marker using its pose derived from the joint solution.
-        for marker_id, corner_set, _, marker_t_m, marker_q_m in valid_markers:
+        # Draw each detected tag using its pose derived from the joint solution.
+        for tag_id, corners_2d, _, marker_t_m, marker_q_m in valid_tags:
             R_mw = Rotation.from_quat(marker_q_m).as_matrix()
-            # marker-in-camera: R_mc = R_wc @ R_mw,  t_mc = R_wc @ marker_t_m + tvec
-            R_mc = R_wc @ R_mw
-            t_mc = R_wc @ marker_t_m.reshape(3, 1) + tvec.reshape(3, 1)
-            rvec_m, _ = cv2.Rodrigues(R_mc)
-            self._draw_marker(display_image, marker_id, corner_set, rvec_m, t_mc, camera_matrix)
+            # tag-in-camera: R_tc = R_wc @ R_mw,  t_tc = R_wc @ marker_t_m + tvec
+            R_tc = R_wc @ R_mw
+            t_tc = R_wc @ marker_t_m.reshape(3, 1) + tvec.reshape(3, 1)
+            rvec_t, _ = cv2.Rodrigues(R_tc)
+            self._draw_tag(display_image, tag_id, corners_2d, rvec_t, t_tc, camera_matrix)
 
-        parent_frame = valid_markers[0][2]
+        parent_frame = valid_tags[0][2]
         world_t, world_q_xyzw = self._apply_ema(parent_frame, world_t, world_q_xyzw)
         self.ros.publish_cam_pose(parent_frame, world_t, world_q_xyzw)
 
@@ -129,48 +143,47 @@ class ArucoOverlay:
         prev_t, prev_q = prev
         alpha = self.ema_alpha
         new_t = (1.0 - alpha) * prev_t + alpha * t
-        # Slerp for rotation (linear interpolation would denormalize the quaternion).
         rotations = Rotation.from_quat([prev_q, q_xyzw])
         slerp = Slerp([0.0, 1.0], rotations)
         new_q = slerp(alpha).as_quat()
         self._ema_state[parent_frame] = (new_t, new_q)
         return new_t, new_q
 
-    def _draw_marker(
+    def _draw_tag(
         self,
         rgb_image: np.ndarray,
-        marker_id: int,
-        corner_set,
+        tag_id: int,
+        corners_2d: np.ndarray,
         rvec: np.ndarray,
         tvec: np.ndarray,
         camera_matrix: np.ndarray,
     ) -> None:
-        pts = corner_set.reshape(-1, 2).astype(np.int32)
-        cv2.polylines(rgb_image, [pts], True, (0, 255, 0), 2)
-        text_pos = (int(pts[0][0]), int(pts[0][1]) - 6)
+        pts = corners_2d.reshape(-1, 2).astype(np.int32)
+        cv2.polylines(rgb_image, [pts], True, (0, 200, 255), 2)
+        text_pos = (int(pts[3][0]), int(pts[3][1]) - 6)  # above upper-left corner
         cv2.putText(
-            rgb_image, f"id:{marker_id}", text_pos,
-            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA,
+            rgb_image, f"id:{tag_id}", text_pos,
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1, cv2.LINE_AA,
         )
         cv2.drawFrameAxes(rgb_image, camera_matrix, self.dist_coeffs, rvec, tvec, 0.03)
 
 
-def run_rgb_aruco_localization(
+def run_rgb_apriltag_localization(
     device_ip: Optional[str] = None,
-    marker_length_m: float = 0.13,
-    dictionary_name: str = "DICT_4X4_50",
+    tag_size_m: float = 0.13,
+    tag_family: str = "tag36h11",
     update_iptables_rules: bool = False,
-    allowed_marker_ids: Optional[list[int]] = None,
+    allowed_tag_ids: Optional[list[int]] = None,
     use_ema: bool = True,
-    ema_alpha: float = 0.95,
+    ema_alpha: float = 0.2,
 ) -> None:
     static_tf_config_path = os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "..", "config", "aruco_tf.json")
+        os.path.join(os.path.dirname(__file__), "..", "config", "apriltag_tf.json")
     )
 
     ros = RosPosePublisher(
         topic="/aria/cam_pose",
-        marker_frame_prefix="aruco_marker_",
+        marker_frame_prefix="apriltag_",
         camera_frame="aria_camera_rgb",
         static_tf_config_path=static_tf_config_path,
         camera_frame_correction_q_xyzw=None,
@@ -178,10 +191,10 @@ def run_rgb_aruco_localization(
     ros.setup()
     ros.publish_static_marker_tf()
 
-    overlay = ArucoOverlay(
-        marker_length_m=marker_length_m,
-        dictionary_name=dictionary_name,
-        allowed_marker_ids=allowed_marker_ids,
+    overlay = AprilTagOverlay(
+        tag_size_m=tag_size_m,
+        tag_family=tag_family,
+        allowed_tag_ids=allowed_tag_ids,
         use_ema=use_ema,
         ema_alpha=ema_alpha,
         ros=ros,
@@ -190,7 +203,7 @@ def run_rgb_aruco_localization(
     stream = AriaRgbStream(
         device_ip=device_ip,
         update_iptables_rules=update_iptables_rules,
-        window_name="Aria RGB ArUco",
+        window_name="Aria RGB AprilTag",
     )
     stream.add_overlay(overlay)
     try:
@@ -202,10 +215,11 @@ def run_rgb_aruco_localization(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device-ip", help="IP address to connect to the device")
-    parser.add_argument("--marker-length-m", type=float, default=0.13)
-    parser.add_argument("--dictionary", type=str, default="DICT_4X4_50")
+    parser.add_argument("--tag-size-m", type=float, default=0.13)
+    parser.add_argument("--tag-family", type=str, default="tag36h11",
+                        help="AprilTag family: tag36h11, tag25h9, tag16h5, tagStandard41h12, ...")
     parser.add_argument("--update_iptables", default=True, action="store_true")
-    parser.add_argument("--marker-ids", type=int, nargs="+", default=None)
+    parser.add_argument("--tag-ids", type=int, nargs="+", default=None)
     parser.add_argument("--ema-alpha", type=float, default=0.2)
     parser.add_argument("--disable-ema", action="store_true")
     return parser.parse_args()
@@ -213,12 +227,12 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    run_rgb_aruco_localization(
+    run_rgb_apriltag_localization(
         device_ip=args.device_ip,
-        marker_length_m=args.marker_length_m,
-        dictionary_name=args.dictionary,
+        tag_size_m=args.tag_size_m,
+        tag_family=args.tag_family,
         update_iptables_rules=args.update_iptables,
-        allowed_marker_ids=args.marker_ids,
+        allowed_tag_ids=args.tag_ids,
         use_ema=not args.disable_ema,
         ema_alpha=args.ema_alpha,
     )
