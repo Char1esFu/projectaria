@@ -130,7 +130,7 @@ def parse_args() -> argparse.Namespace:
         help="Update iptables for DDS UDP stream (Linux only).",
     )
     parser.add_argument(
-        "--homography", type=Path, default=None,
+        "--homography", type=Path, default="test_homography/homography.txt",
         help="Path to a homography matrix file (e.g. test_homography/homography.txt). "
              "If provided, the RGB image is warped before gaze overlay.",
     )
