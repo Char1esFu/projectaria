@@ -24,6 +24,7 @@ class GazeOverlay:
         crop: bool = False,
         crop_size: int = 480,
         resize_size: int = 1920,
+        filter_labels: Optional[list[str]] = None,
     ) -> None:
         self.gaze_pitch: float = 0.0
         self.gaze_yaw: float = 0.0
@@ -53,6 +54,9 @@ class GazeOverlay:
         self.crop = crop
         self.crop_size = crop_size
         self.resize_size = resize_size
+
+        # Labels to filter out from YOLO results
+        self.filter_labels: set[str] = set(l.lower() for l in (filter_labels or []))
 
     def _setup_ros_subscriber(self) -> None:
         try:
@@ -126,6 +130,7 @@ class GazeOverlay:
 
                 # YOLO inference on enhanced crop
                 results = self.model(resized, conf=self.conf_threshold, device=self.yolo_device, verbose=False)
+                self._filter_results(results[0])
                 annotated = results[0].plot()
 
                 # Resize annotated back to display image size
@@ -140,6 +145,7 @@ class GazeOverlay:
             else:
                 # No crop: YOLO on full image
                 results = self.model(display_image, conf=self.conf_threshold, device=self.yolo_device, verbose=False)
+                self._filter_results(results[0])
                 np.copyto(display_image, results[0].plot())
                 gaze_pt = (gx, gy)
         elif gaze_valid:
@@ -160,6 +166,15 @@ class GazeOverlay:
             cv2.circle(display_image, gaze_pt, cross_size, color, 2)
             cv2.circle(display_image, gaze_pt, 4, color, -1)
 
+    def _filter_results(self, result) -> None:
+        """Remove detections whose label is in self.filter_labels (in-place)."""
+        if not self.filter_labels or result.boxes is None or len(result.boxes) == 0:
+            return
+        names = result.names  # {class_id: label_str}
+        cls_ids = result.boxes.cls.int().tolist()
+        keep = [i for i, cid in enumerate(cls_ids) if names.get(cid, "").lower() not in self.filter_labels]
+        result.boxes = result.boxes[keep]
+
     def shutdown(self) -> None:
         try:
             self._ros_node.destroy_node()
@@ -178,6 +193,7 @@ def run_gaze_rgb_visualizer(
     crop: bool = False,
     crop_size: int = 480,
     resize_size: int = 1920,
+    filter_labels: Optional[list[str]] = None,
 ) -> None:
     overlay = GazeOverlay(
         homography_path=homography_path,
@@ -187,6 +203,7 @@ def run_gaze_rgb_visualizer(
         crop=crop,
         crop_size=crop_size,
         resize_size=resize_size,
+        filter_labels=filter_labels,
     )
     stream = AriaRgbStream(
         device_ip=device_ip,
@@ -225,6 +242,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--crop-size", type=int, default=200, help="Side length of square crop around gaze point (pixels)")
     parser.add_argument("--resize-size", type=int, default=1920, help="Resize crop to this size before YOLO inference")
+    parser.add_argument(
+        "--filter-label", type=str, nargs="+", default=["beer bottle", "mayonnaise bottle", "oil bottle", "water bottle"],
+        help="Labels to exclude from YOLO results (e.g. --filter-label 'beer bottle' 'water bottle').",
+    )
     return parser.parse_args()
 
 
@@ -240,6 +261,7 @@ def main() -> None:
         crop=args.crop,
         crop_size=args.crop_size,
         resize_size=args.resize_size,
+        filter_labels=args.filter_label,
     )
 
 
