@@ -40,7 +40,7 @@ python3 -m src.aruco_localization --device-ip 192.168.8.117 --marker-ids 0 1 2 #
 python3 -m projectaria_eyetracking.gaze_detect --device cpu # or cuda:0, nvidia driver update needed
 
 # gaze projection on egocentric image
-python -m src.gaze_rgb_visualizer --device-ip 192.168.8.117
+python3 -m src.gaze_rgb_visualizer --device-ip 192.168.8.117 --crop --homography test_homography/homography.txt
 
 # record audio
 python -m src.audio_record --update_iptables --channel 0
