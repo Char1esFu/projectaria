@@ -1,5 +1,6 @@
 import argparse
 import threading
+from pathlib import Path
 from typing import Optional
 
 import cv2
@@ -11,17 +12,19 @@ from utils.aria_rgb_stream import AriaRgbStream
 class GazeOverlay:
     """Subscribes to /aria/gaze_euler and draws a crosshair on the display image."""
 
-    # The gaze ray origin is slightly to the right of the camera principal point.
-    # This offset (in tan units) compensates for that physical displacement.
-    GAZE_ORIGIN_X_OFFSET: float = 0.05
-
-    def __init__(self) -> None:
+    def __init__(self, homography_path: Optional[Path] = None) -> None:
         self.gaze_pitch: float = 0.0
         self.gaze_yaw: float = 0.0
         self._rclpy = None
         self._ros_node = None
         self._ros_thread = None
         self._setup_ros_subscriber()
+        
+        # Optional homography to shift RGB view to the symmetric center
+        self.H: Optional[np.ndarray] = None
+        if homography_path is not None:
+            self.H = np.loadtxt(homography_path)
+            print(f"Loaded homography from {homography_path}")
 
     def _setup_ros_subscriber(self) -> None:
         try:
@@ -50,6 +53,12 @@ class GazeOverlay:
             raise RuntimeError(f"ROS2 subscriber unavailable: {exc}") from exc
 
     def draw(self, display_image: np.ndarray, camera_matrix: Optional[np.ndarray], key: int = -1) -> None:
+        # Warp RGB to symmetric center if homography is available
+        if self.H is not None:
+            h, w = display_image.shape[:2]
+            warped = cv2.warpPerspective(display_image, self.H, (w, h))
+            display_image[:] = warped
+
         if camera_matrix is None:
             return
 
@@ -60,7 +69,7 @@ class GazeOverlay:
 
         # After rot90(-1): raw col → display row (pitch), raw row → display col (yaw).
         # Display image has been cropped so we use its actual dimensions for bounds check.
-        display_col = cx + fx * np.tan(self.gaze_yaw) + fx * self.GAZE_ORIGIN_X_OFFSET
+        display_col = cx + fx * np.tan(self.gaze_yaw)
         display_row = cy - fy * np.tan(self.gaze_pitch)
         gaze_pt = (int(round(display_col)), int(round(display_row)))
 
@@ -94,8 +103,9 @@ class GazeOverlay:
 def run_gaze_rgb_visualizer(
     device_ip: Optional[str] = None,
     update_iptables_rules: bool = False,
+    homography_path: Optional[Path] = None,
 ) -> None:
-    overlay = GazeOverlay()
+    overlay = GazeOverlay(homography_path=homography_path)
     stream = AriaRgbStream(
         device_ip=device_ip,
         update_iptables_rules=update_iptables_rules,
@@ -119,6 +129,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Update iptables for DDS UDP stream (Linux only).",
     )
+    parser.add_argument(
+        "--homography", type=Path, default=None,
+        help="Path to a homography matrix file (e.g. test_homography/homography.txt). "
+             "If provided, the RGB image is warped before gaze overlay.",
+    )
     return parser.parse_args()
 
 
@@ -127,6 +142,7 @@ def main() -> None:
     run_gaze_rgb_visualizer(
         device_ip=args.device_ip,
         update_iptables_rules=args.update_iptables,
+        homography_path=args.homography,
     )
 
 
