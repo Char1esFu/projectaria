@@ -202,7 +202,7 @@ def run_rgb_aruco_localization(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device-ip", help="IP address to connect to the device")
-    parser.add_argument("--marker-length-m", type=float, default=0.13)
+    parser.add_argument("--marker-length-m", type=float, default=0.201)
     parser.add_argument("--dictionary", type=str, default="DICT_4X4_50")
     parser.add_argument("--update_iptables", default=True, action="store_true")
     parser.add_argument("--marker-ids", type=int, nargs="+", default=None)

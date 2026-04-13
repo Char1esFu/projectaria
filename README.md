@@ -35,12 +35,6 @@ aria streaming start --interface wifi --device-ip 192.168.8.117 --use-ephemeral-
 source /opt/ros/humble/setup.bash
 python3 -m src.aruco_localization --device-ip 192.168.8.117 --marker-ids 0 1 2 # list all used marker ids in argument
 
-# TODO: check if it's correct with real camera stream
-# ArUco（default）
-python src/marker_localization.py --marker-type aruco --dictionary DICT_4X4_50 --marker-ids 0 1 2
-# AprilTag
-python src/marker_localization.py --marker-type apriltag --tag-family tag36h11 --marker-ids 0 1 2
-
 # gaze detection
 # with mouse focus on gaze image output window, keep pressing C to calibrate while focusing on center of marker 
 python3 -m projectaria_eyetracking.gaze_detect --device cpu # or cuda:0, nvidia driver update needed

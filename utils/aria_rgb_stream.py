@@ -43,7 +43,7 @@ def crop_fisheye_img(image: np.ndarray):
     Returns (cropped_image, ox, oy) where (ox, oy) is the crop offset.
     """
     h, w = image.shape[:2]
-    crop_size = int(min(w, h) / 1.4143)
+    crop_size = int(min(w, h) / 1.5)
     ox = (w - crop_size) // 2
     oy = (h - crop_size) // 2
     cropped = np.ascontiguousarray(image[oy:oy + crop_size, ox:ox + crop_size])

@@ -90,20 +90,18 @@ def _load_camera_matrix(undistort_width: int, undistort_height: int):
     """Load RGB calibration from device and return (rgb_calib, dst_calib, camera_matrix).
     Falls back to a reasonable default if the device connection fails."""
     rgb_calib = None
-    try:
-        device_client = aria.DeviceClient()
-        device = device_client.connect()
-        sensors_calib_json = device.streaming_manager.sensors_calibration()
-        sensors_calib = device_calibration_from_json_string(sensors_calib_json)
-        rgb_calib = sensors_calib.get_camera_calib("camera-rgb")
-        device_client.disconnect(device)
-        src_w, _ = rgb_calib.get_image_size()
-        src_focal = rgb_calib.get_focal_lengths()[0]
-        focal_length = src_focal * undistort_width / src_w
-        print(f"RGB calib loaded: focal_length={focal_length:.2f} px")
-    except Exception as exc:
-        print(f"Warning: could not load RGB calibration ({exc}). Using fallback focal=450.")
-        focal_length = 450.0 * undistort_width / 1408
+
+    device_client = aria.DeviceClient()
+    device = device_client.connect()
+    sensors_calib_json = device.streaming_manager.sensors_calibration()
+    sensors_calib = device_calibration_from_json_string(sensors_calib_json)
+    rgb_calib = sensors_calib.get_camera_calib("camera-rgb")
+    device_client.disconnect(device)
+    src_w, _ = rgb_calib.get_image_size()
+    src_focal = rgb_calib.get_focal_lengths()[0]
+    focal_length = src_focal * undistort_width / src_w
+    print(f"RGB calib loaded: focal_length={focal_length:.2f} px")
+
 
     dst_calib = get_linear_camera_calibration(
         undistort_width, undistort_height, focal_length, "camera-rgb"
