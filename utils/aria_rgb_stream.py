@@ -37,6 +37,19 @@ from projectaria_tools.core.calibration import (
 from projectaria_tools.core.sensor_data import ImageDataRecord
 
 
+def crop_fisheye_img(image: np.ndarray):
+    """Crop the largest inscribed square from an undistorted fisheye image.
+
+    Returns (cropped_image, ox, oy) where (ox, oy) is the crop offset.
+    """
+    h, w = image.shape[:2]
+    crop_size = int(min(w, h) / 1.4143)
+    ox = (w - crop_size) // 2
+    oy = (h - crop_size) // 2
+    cropped = np.ascontiguousarray(image[oy:oy + crop_size, ox:ox + crop_size])
+    return cropped, ox, oy
+
+
 class AriaRgbStream:
     """Single RGB stream + display loop shared across all overlays."""
 
@@ -107,13 +120,7 @@ class AriaRgbStream:
 
             # Aria RGB sensor is mounted rotated; rot90(-1) puts the image upright.
             display = np.ascontiguousarray(np.rot90(rgb_image, -1))
-            h, w = display.shape[:2]
-            # The undistorted image is square but rotated, so the inscribed axis-aligned
-            # square has side = original_side / sqrt(2) ≈ original_side / 1.4143.
-            crop_size = int(min(w, h) / 1.4143)
-            ox = (w - crop_size) // 2
-            oy = (h - crop_size) // 2
-            display = np.ascontiguousarray(display[oy:oy + crop_size, ox:ox + crop_size])
+            display, ox, oy = crop_fisheye_img(display)
 
             # Shift cx/cy so overlays can use camera_matrix directly in cropped image coordinates.
             display_matrix = self.camera_matrix.copy()

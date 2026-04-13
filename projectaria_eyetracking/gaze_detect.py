@@ -9,6 +9,7 @@ import torch
 from scipy.optimize import minimize_scalar
 
 from utils.common import update_iptables
+from utils.aria_rgb_stream import crop_fisheye_img
 from projectaria_eyetracking.inference.infer import EyeGazeInference
 from projectaria_tools.core.calibration import (
     device_calibration_from_json_string,
@@ -17,8 +18,6 @@ from projectaria_tools.core.calibration import (
 )
 
 
-# Gaze ray origin offset in camera X, must match gaze_rgb_visualizer.py
-GAZE_ORIGIN_X_OFFSET: float = 0.05
 CALIB_MARKER_ID: int = 0
 
 
@@ -77,6 +76,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1408,
         help="Height of undistorted RGB image (must match gaze_rgb_visualizer).",
+    )
+    parser.add_argument(
+        "--homography",
+        type=str,
+        default="test_homography/homography.txt",
+        help="Path to homography matrix file (e.g. test_homography/homography.txt).",
     )
     return parser.parse_args()
 
@@ -152,6 +157,12 @@ def main() -> None:
     )
     aruco, aruco_dict, aruco_params, aruco_detector = _setup_aruco_detector()
 
+    # Optional homography for RGB camera shift correction
+    H_warp = None
+    if args.homography is not None:
+        H_warp = np.loadtxt(args.homography)
+        print(f"Loaded homography from {args.homography}")
+
     streaming_client = aria.StreamingClient()
 
     config = streaming_client.subscription_config
@@ -196,9 +207,13 @@ def main() -> None:
 
     # Calibration state
     c_held = False
+    c_last_seen = 0.0  # timestamp of last key=='c' event
+    C_RELEASE_GRACE = 0.3  # seconds: tolerate key-repeat gaps up to this
     calib_samples: list[tuple[float, float, float, float]] = []  # (marker_col, marker_row, pitch_raw, yaw_raw)
     pitch_offset = 0.0
     yaw_offset = 0.0
+    _crop_ox = 0
+    _crop_oy = 0
 
     # Latest raw gaze (updated each EyeTrack frame, used when pairing with RGB)
     latest_pitch_raw: float = 0.0
@@ -215,22 +230,26 @@ def main() -> None:
             if key == 27 or key == ord("q"):
                 break
 
-            c_down_now = (key == ord("c"))
-            if c_down_now and not c_held:
-                c_held = True
-                calib_samples.clear()
-                print(f"Calibrating: hold C while looking at marker {CALIB_MARKER_ID} center...")
-            elif not c_down_now and c_held:
+            now = time.time()
+            if key == ord("c"):
+                c_last_seen = now
+                if not c_held:
+                    c_held = True
+                    calib_samples.clear()
+                    print(f"Calibrating: hold C while looking at marker {CALIB_MARKER_ID} center...")
+            elif c_held and (now - c_last_seen) > C_RELEASE_GRACE:
+                # Key not seen for longer than grace period → user released C
                 c_held = False
                 if len(calib_samples) >= 2:
                     rows = np.array([s[1] for s in calib_samples])
                     cols = np.array([s[0] for s in calib_samples])
                     pitches = np.array([s[2] for s in calib_samples])
                     yaws = np.array([s[3] for s in calib_samples])
+                    # Use cropped camera_matrix (marker coords are in cropped space)
                     fx = camera_matrix[0, 0]
                     fy = camera_matrix[1, 1]
-                    cx = camera_matrix[0, 2]
-                    cy = camera_matrix[1, 2]
+                    cx = camera_matrix[0, 2] - _crop_ox
+                    cy = camera_matrix[1, 2] - _crop_oy
 
                     # gaze_row = cy - fy * tan(pitch_raw - pitch_offset)  →  match marker_row
                     res_p = minimize_scalar(
@@ -238,11 +257,11 @@ def main() -> None:
                         bounds=(-np.pi, np.pi),
                         method="bounded",
                     )
-                    # gaze_col = cx + fx*(tan(yaw_raw - yaw_offset) + GAZE_ORIGIN_X_OFFSET)  →  match marker_col
+                    # gaze_col = cx + fx * tan(yaw_raw - yaw_offset)  →  match marker_col
                     res_y = minimize_scalar(
                         lambda dy: float(
                             np.sum(
-                                (cols - cx + fx * (np.tan(yaws - dy) + GAZE_ORIGIN_X_OFFSET)) ** 2
+                                (cols - cx - fx * np.tan(yaws - dy)) ** 2
                             )
                         ),
                         bounds=(-np.pi, np.pi),
@@ -264,8 +283,17 @@ def main() -> None:
                 rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
                 if rgb_calib is not None:
                     rgb = distort_by_calibration(rgb, dst_calib, rgb_calib)
+                    
                 # Rotate to match gaze projection display coordinate system
                 display = np.ascontiguousarray(np.rot90(rgb, -1))
+                
+                display, _crop_ox, _crop_oy = crop_fisheye_img(display)
+                
+                # Apply homography warp if available
+                if H_warp is not None:
+                    h_d, w_d = display.shape[:2]
+                    display = cv2.warpPerspective(display, H_warp, (w_d, h_d))
+                    
                 gray = cv2.cvtColor(display, cv2.COLOR_RGB2GRAY)
                 if aruco_detector is not None:
                     corners, ids, _ = aruco_detector.detectMarkers(gray)
