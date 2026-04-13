@@ -20,6 +20,7 @@ class YoloOverlay:
         conf_threshold: float = 0.25,
         device: Optional[str] = None,
         infer_size: int = 640,
+        homography_path: Optional[Path] = None,
     ) -> None:
         import torch
         if device is None:
@@ -30,7 +31,17 @@ class YoloOverlay:
         self.infer_size = infer_size
         self.device = device
 
+        self.H: Optional[np.ndarray] = None
+        if homography_path is not None:
+            self.H = np.loadtxt(homography_path)
+            print(f"Loaded homography from {homography_path}")
+
     def draw(self, display_image: np.ndarray, _camera_matrix: Optional[np.ndarray], _key: int = -1) -> None:
+        if self.H is not None:
+            h, w = display_image.shape[:2]
+            warped = cv2.warpPerspective(display_image, self.H, (w, h))
+            display_image[:] = warped
+
         results = self.model(
             display_image,
             conf=self.conf_threshold,
@@ -50,6 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--conf", type=float, default=0.25)
     parser.add_argument("--device", type=str, default=None, help="Inference device: cuda / cpu / mps (default: auto)")
     parser.add_argument("--infer-size", type=int, default=640, help="YOLO input size (pixels)")
+    parser.add_argument("--homography", type=Path, default="test_homography/homography.txt")
     return parser.parse_args()
 
 
@@ -60,6 +72,7 @@ def main() -> None:
         conf_threshold=args.conf,
         device=args.device,
         infer_size=args.infer_size,
+        homography_path=args.homography,
     )
     stream = AriaRgbStream(
         device_ip=args.device_ip,
