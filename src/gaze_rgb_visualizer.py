@@ -18,12 +18,15 @@ class GazeOverlay:
     def __init__(
         self,
         homography_path: Optional[Path] = None,
+        enable_yolo: bool = False,
+        draw_gaze: bool = False,
+        enable_capture: bool = False,
         model_path: Optional[Path] = None,
         conf_threshold: float = 0.25,
         device: Optional[str] = None,
         crop: bool = False,
         crop_size: int = 480,
-        resize_size: int = 1920,
+        resize_size: int = 1080,
         filter_labels: Optional[list[str]] = None,
     ) -> None:
         self.gaze_pitch: float = 0.0
@@ -41,9 +44,10 @@ class GazeOverlay:
 
         # YOLO model (always loaded if model_path given)
         self.model = None
+        self.enable_yolo = enable_yolo
         self.conf_threshold = conf_threshold
         self.yolo_device = device
-        if model_path is not None:
+        if self.enable_yolo and model_path is not None:
             import torch
             if device is None:
                 self.yolo_device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -54,6 +58,16 @@ class GazeOverlay:
         self.crop = crop
         self.crop_size = crop_size
         self.resize_size = resize_size
+        self.draw_gaze = draw_gaze
+
+        # Capture settings
+        self.enable_capture = enable_capture
+        self.capture_active = False
+        self.capture_dir = Path("saved_images")
+        self.capture_index = 0
+        if self.enable_capture:
+            self.capture_dir.mkdir(parents=True, exist_ok=True)
+            print(f"Capture enabled. Press S to start/stop saving to {self.capture_dir}/")
 
         # Labels to filter out from YOLO results
         self.filter_labels: set[str] = set(l.lower() for l in (filter_labels or []))
@@ -85,6 +99,11 @@ class GazeOverlay:
             raise RuntimeError(f"ROS2 subscriber unavailable: {exc}") from exc
 
     def draw(self, display_image: np.ndarray, camera_matrix: Optional[np.ndarray], key: int = -1) -> None:
+        if self.enable_capture and key in (ord("s"), ord("S")):
+            self.capture_active = not self.capture_active
+            state = "started" if self.capture_active else "stopped"
+            print(f"Capture {state}.")
+
         # Warp RGB to symmetric center if homography is available
         if self.H is not None:
             h, w = display_image.shape[:2]
@@ -109,16 +128,31 @@ class GazeOverlay:
         cross_size = 40
         gaze_valid = 0 <= gx < w and 0 <= gy < h
 
-        # YOLO inference (prerequisite: valid gaze point)
+        # Crop+resize is independent from gaze marker drawing and YOLO enable flag.
+        cs = 0
+        x_start = 0
+        y_start = 0
+        crop_img = None
         gaze_pt = None
-        if self.model is not None and gaze_valid:
-            if self.crop:
-                # Crop square around gaze point, clamped to image bounds
-                cs = min(self.crop_size, w, h)
-                x_start = max(0, min(gx - cs // 2, w - cs))
-                y_start = max(0, min(gy - cs // 2, h - cs))
-                crop_img = display_image[y_start:y_start + cs, x_start:x_start + cs].copy()
+        if self.crop and gaze_valid:
+            # Crop square around gaze point, clamped to image bounds.
+            cs = min(self.crop_size, w, h)
+            x_start = max(0, min(gx - cs // 2, w - cs))
+            y_start = max(0, min(gy - cs // 2, h - cs))
+            crop_img = display_image[y_start:y_start + cs, x_start:x_start + cs].copy()
 
+            # Keep cropped view even when YOLO is disabled.
+            display_image[:] = cv2.resize(crop_img, (w, h), interpolation=cv2.INTER_LINEAR)
+            gaze_pt = (
+                int(round((gx - x_start) * w / cs)),
+                int(round((gy - y_start) * h / cs)),
+            )
+        elif gaze_valid:
+            gaze_pt = (gx, gy)
+
+        # YOLO inference (prerequisite: valid gaze point)
+        if self.model is not None and gaze_valid:
+            if self.crop and crop_img is not None:
                 # Resize for YOLO
                 resized = cv2.resize(crop_img, (self.resize_size, self.resize_size), interpolation=cv2.INTER_LINEAR)
 
@@ -136,20 +170,16 @@ class GazeOverlay:
                 # Resize annotated back to display image size
                 final = cv2.resize(annotated, (w, h), interpolation=cv2.INTER_LINEAR)
                 display_image[:] = final
-
-                # Gaze crosshair in crop-relative coords, scaled to display
-                gaze_pt = (
-                    int(round((gx - x_start) * w / cs)),
-                    int(round((gy - y_start) * h / cs)),
-                )
             else:
                 # No crop: YOLO on full image
                 results = self.model(display_image, conf=self.conf_threshold, device=self.yolo_device, verbose=False)
                 self._filter_results(results[0])
                 np.copyto(display_image, results[0].plot())
-                gaze_pt = (gx, gy)
-        elif gaze_valid:
-            gaze_pt = (gx, gy)
+
+        # Keep a clean frame for saving before drawing viewer-only overlays.
+        capture_frame = None
+        if self.enable_capture and self.capture_active:
+            capture_frame = display_image.copy()
 
         # Draw gaze info overlay
         cv2.putText(
@@ -162,9 +192,29 @@ class GazeOverlay:
             2,
             cv2.LINE_AA,
         )
-        if gaze_pt is not None:
+        if self.draw_gaze and gaze_pt is not None:
             cv2.circle(display_image, gaze_pt, cross_size, color, 2)
             cv2.circle(display_image, gaze_pt, 4, color, -1)
+
+        if self.enable_capture:
+            capture_text = "CAPTURE: ON (press S to stop)" if self.capture_active else "CAPTURE: OFF (press S to start)"
+            capture_color = (0, 255, 0) if self.capture_active else (0, 255, 255)
+            cv2.putText(
+                display_image,
+                capture_text,
+                (10, 60),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                capture_color,
+                2,
+                cv2.LINE_AA,
+            )
+
+            if self.capture_active and capture_frame is not None:
+                timestamp_ms = int(cv2.getTickCount() * 1000 / cv2.getTickFrequency())
+                filename = self.capture_dir / f"frame_{timestamp_ms}_{self.capture_index:06d}.png"
+                cv2.imwrite(str(filename), capture_frame)
+                self.capture_index += 1
 
     def _filter_results(self, result) -> None:
         """Remove detections whose label is in self.filter_labels (in-place)."""
@@ -187,16 +237,22 @@ def run_gaze_rgb_visualizer(
     device_ip: Optional[str] = None,
     update_iptables_rules: bool = False,
     homography_path: Optional[Path] = None,
+    enable_yolo: bool = False,
+    draw_gaze: bool = False,
+    enable_capture: bool = False,
     model_path: Optional[Path] = None,
     conf_threshold: float = 0.25,
     device: Optional[str] = None,
     crop: bool = False,
     crop_size: int = 480,
-    resize_size: int = 1920,
+    resize_size: int = 1080,
     filter_labels: Optional[list[str]] = None,
 ) -> None:
     overlay = GazeOverlay(
         homography_path=homography_path,
+        enable_yolo=enable_yolo,
+        draw_gaze=draw_gaze,
+        enable_capture=enable_capture,
         model_path=model_path,
         conf_threshold=conf_threshold,
         device=device,
@@ -233,15 +289,33 @@ def parse_args() -> argparse.Namespace:
         help="Path to a homography matrix file (e.g. test_homography/homography.txt). "
              "If provided, the RGB image is warped before gaze overlay.",
     )
+    parser.add_argument(
+        "--yolo",
+        default=False,
+        action="store_true",
+        help="Enable YOLO detection. If not set, only gaze overlay is shown.",
+    )
+    parser.add_argument(
+        "--draw-gaze",
+        default=False,
+        action="store_true",
+        help="Draw gaze marker (red circle and red dot) on RGB view.",
+    )
+    parser.add_argument(
+        "--capture",
+        default=False,
+        action="store_true",
+        help="Enable runtime capture toggle. Press S to start/stop continuous saving to saved_images/.",
+    )
     parser.add_argument("--model", type=str, default=str(MODEL_PATH), help="YOLO model path")
     parser.add_argument("--conf", type=float, default=0.25, help="YOLO confidence threshold")
     parser.add_argument("--device", type=str, default=None, help="Inference device: cuda / cpu / mps (default: auto)")
     parser.add_argument(
         "--crop", default=False, action="store_true",
-        help="Enable gaze-centered crop+resize before YOLO inference.",
+        help="Enable gaze-centered crop+resize display (and YOLO input when --yolo is enabled).",
     )
-    parser.add_argument("--crop-size", type=int, default=200, help="Side length of square crop around gaze point (pixels)")
-    parser.add_argument("--resize-size", type=int, default=1920, help="Resize crop to this size before YOLO inference")
+    parser.add_argument("--crop-size", type=int, default=300, help="Side length of square crop around gaze point (pixels)")
+    parser.add_argument("--resize-size", type=int, default=1080, help="Resize crop to this size before YOLO inference")
     parser.add_argument(
         "--filter-label", type=str, nargs="+", default=["beer bottle", "mayonnaise bottle", "oil bottle", "water bottle"],
         help="Labels to exclude from YOLO results (e.g. --filter-label 'beer bottle' 'water bottle').",
@@ -255,7 +329,10 @@ def main() -> None:
         device_ip=args.device_ip,
         update_iptables_rules=args.update_iptables,
         homography_path=args.homography,
-        model_path=Path(args.model),
+        enable_yolo=args.yolo,
+        draw_gaze=args.draw_gaze,
+        enable_capture=args.capture,
+        model_path=Path(args.model) if args.yolo else None,
         conf_threshold=args.conf,
         device=args.device,
         crop=args.crop,
