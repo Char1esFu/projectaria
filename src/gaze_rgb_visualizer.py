@@ -1,5 +1,6 @@
 import argparse
 import threading
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -9,7 +10,7 @@ from ultralytics import YOLO
 
 from utils.aria_rgb_stream import AriaRgbStream
 
-MODEL_PATH = Path(__file__).parent.parent / "yolo_model" / "best.pt"
+MODEL_PATH = Path(__file__).parent.parent / "yolo_model" / "mixed.pt"
 
 
 class GazeOverlay:
@@ -28,6 +29,7 @@ class GazeOverlay:
         crop_size: int = 480,
         resize_size: int = 1080,
         filter_labels: Optional[list[str]] = None,
+        capture_interval: float = 0.0,
     ) -> None:
         self.gaze_pitch: float = 0.0
         self.gaze_yaw: float = 0.0
@@ -65,6 +67,8 @@ class GazeOverlay:
         self.capture_active = False
         self.capture_dir = Path("saved_images")
         self.capture_index = 0
+        self.capture_interval = capture_interval
+        self._last_capture_time: float = 0.0
         if self.enable_capture:
             self.capture_dir.mkdir(parents=True, exist_ok=True)
             print(f"Capture enabled. Press S to start/stop saving to {self.capture_dir}/")
@@ -211,18 +215,38 @@ class GazeOverlay:
             )
 
             if self.capture_active and capture_frame is not None:
-                timestamp_ms = int(cv2.getTickCount() * 1000 / cv2.getTickFrequency())
-                filename = self.capture_dir / f"frame_{timestamp_ms}_{self.capture_index:06d}.png"
-                cv2.imwrite(str(filename), capture_frame)
-                self.capture_index += 1
+                now = time.monotonic()
+                if now - self._last_capture_time >= self.capture_interval:
+                    timestamp_ms = int(cv2.getTickCount() * 1000 / cv2.getTickFrequency())
+                    filename = self.capture_dir / f"frame_{timestamp_ms}_{self.capture_index:06d}.png"
+                    cv2.imwrite(str(filename), capture_frame)
+                    self.capture_index += 1
+                    self._last_capture_time = now
 
     def _filter_results(self, result) -> None:
-        """Remove detections whose label is in self.filter_labels (in-place)."""
-        if not self.filter_labels or result.boxes is None or len(result.boxes) == 0:
+        """Remove detections whose label is in self.filter_labels and keep only
+        the highest-confidence detection per class (in-place)."""
+        if result.boxes is None or len(result.boxes) == 0:
             return
         names = result.names  # {class_id: label_str}
         cls_ids = result.boxes.cls.int().tolist()
-        keep = [i for i, cid in enumerate(cls_ids) if names.get(cid, "").lower() not in self.filter_labels]
+        confs = result.boxes.conf.tolist()
+
+        # 1. Remove detections whose label is in filter_labels
+        if self.filter_labels:
+            keep = [i for i, cid in enumerate(cls_ids) if names.get(cid, "").lower() not in self.filter_labels]
+            result.boxes = result.boxes[keep]
+            if len(result.boxes) == 0:
+                return
+            cls_ids = result.boxes.cls.int().tolist()
+            confs = result.boxes.conf.tolist()
+
+        # 2. Keep only the highest-confidence detection per class
+        best: dict[int, tuple[int, float]] = {}  # class_id -> (index, conf)
+        for i, (cid, conf) in enumerate(zip(cls_ids, confs)):
+            if cid not in best or conf > best[cid][1]:
+                best[cid] = (i, conf)
+        keep = [idx for idx, _ in best.values()]
         result.boxes = result.boxes[keep]
 
     def shutdown(self) -> None:
@@ -247,6 +271,7 @@ def run_gaze_rgb_visualizer(
     crop_size: int = 480,
     resize_size: int = 1080,
     filter_labels: Optional[list[str]] = None,
+    capture_interval: float = 0.0,
 ) -> None:
     overlay = GazeOverlay(
         homography_path=homography_path,
@@ -260,6 +285,7 @@ def run_gaze_rgb_visualizer(
         crop_size=crop_size,
         resize_size=resize_size,
         filter_labels=filter_labels,
+        capture_interval=capture_interval,
     )
     stream = AriaRgbStream(
         device_ip=device_ip,
@@ -314,11 +340,15 @@ def parse_args() -> argparse.Namespace:
         "--crop", default=False, action="store_true",
         help="Enable gaze-centered crop+resize display (and YOLO input when --yolo is enabled).",
     )
-    parser.add_argument("--crop-size", type=int, default=300, help="Side length of square crop around gaze point (pixels)")
+    parser.add_argument("--crop-size", type=int, default=200, help="Side length of square crop around gaze point (pixels)")
     parser.add_argument("--resize-size", type=int, default=1080, help="Resize crop to this size before YOLO inference")
     parser.add_argument(
         "--filter-label", type=str, nargs="+", default=["beer bottle", "mayonnaise bottle", "oil bottle", "water bottle"],
         help="Labels to exclude from YOLO results (e.g. --filter-label 'beer bottle' 'water bottle').",
+    )
+    parser.add_argument(
+        "--capture-interval", type=float, default=0.0,
+        help="Minimum time interval (seconds) between saved frames. 0 = save every frame.",
     )
     return parser.parse_args()
 
@@ -339,6 +369,7 @@ def main() -> None:
         crop_size=args.crop_size,
         resize_size=args.resize_size,
         filter_labels=args.filter_label,
+        capture_interval=args.capture_interval,
     )
 
 
