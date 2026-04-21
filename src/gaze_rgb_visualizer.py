@@ -80,6 +80,7 @@ class GazeOverlay:
         try:
             import rclpy
             from geometry_msgs.msg import Vector3
+            from std_msgs.msg import String
 
             if not rclpy.ok():
                 rclpy.init(args=None)
@@ -93,12 +94,14 @@ class GazeOverlay:
             self._ros_node.create_subscription(
                 Vector3, "/aria/gaze_euler", _gaze_callback, 10
             )
+            self._gaze_label_pub = self._ros_node.create_publisher(String, "/gaze_label", 10)
             # daemon=True so the thread exits automatically when main exits.
             self._ros_thread = threading.Thread(
                 target=rclpy.spin, args=(self._ros_node,), daemon=True
             )
             self._ros_thread.start()
             print("ROS2 subscriber started: /aria/gaze_euler")
+            print("ROS2 publisher started: /gaze_label")
         except Exception as exc:
             raise RuntimeError(f"ROS2 subscriber unavailable: {exc}") from exc
 
@@ -169,6 +172,7 @@ class GazeOverlay:
                 # YOLO inference on enhanced crop
                 results = self.model(resized, conf=self.conf_threshold, device=self.yolo_device, verbose=False)
                 self._filter_results(results[0])
+                self._publish_closest_labels(results[0], self.resize_size, self.resize_size)
                 annotated = results[0].plot()
 
                 # Resize annotated back to display image size
@@ -178,6 +182,7 @@ class GazeOverlay:
                 # No crop: YOLO on full image
                 results = self.model(display_image, conf=self.conf_threshold, device=self.yolo_device, verbose=False)
                 self._filter_results(results[0])
+                self._publish_closest_labels(results[0], w, h)
                 np.copyto(display_image, results[0].plot())
 
         # Keep a clean frame for saving before drawing viewer-only overlays.
@@ -248,6 +253,31 @@ class GazeOverlay:
                 best[cid] = (i, conf)
         keep = [idx for idx, _ in best.values()]
         result.boxes = result.boxes[keep]
+
+    def _publish_closest_labels(self, result, img_w: int, img_h: int) -> None:
+        """Publish the labels of the 2 bounding boxes closest to the image center via /gaze_label."""
+        if result.boxes is None or len(result.boxes) == 0:
+            return
+        from std_msgs.msg import String
+
+        cx, cy = img_w / 2.0, img_h / 2.0
+        names = result.names
+        boxes_xyxy = result.boxes.xyxy.tolist()
+        cls_ids = result.boxes.cls.int().tolist()
+
+        dists = []
+        for xyxy, cid in zip(boxes_xyxy, cls_ids):
+            bx = (xyxy[0] + xyxy[2]) / 2.0
+            by = (xyxy[1] + xyxy[3]) / 2.0
+            dist = ((bx - cx) ** 2 + (by - cy) ** 2) ** 0.5
+            dists.append((dist, names.get(cid, str(cid))))
+
+        dists.sort(key=lambda x: x[0])
+        closest = [label for _, label in dists[:2]]
+
+        msg = String()
+        msg.data = ",".join(closest)
+        self._gaze_label_pub.publish(msg)
 
     def shutdown(self) -> None:
         try:
