@@ -1,9 +1,9 @@
 import argparse
+import select
 import sys
 import termios
 import threading
 import tty
-import wave
 import numpy as np
 import whisper
 import rclpy
@@ -11,7 +11,6 @@ from rclpy.node import Node
 from std_msgs.msg import String
 from scipy.signal import butter, sosfilt, resample_poly
 from math import gcd
-from pynput import keyboard
 
 import aria.sdk as aria
 
@@ -41,12 +40,6 @@ def parse_args() -> argparse.Namespace:
         choices=range(ARIA_NUM_CHANNELS),
         metavar="{0..6}",
         help=f"Microphone channel(s) to mix (0-{ARIA_NUM_CHANNELS - 1}); multiple allowed; default: all 7",
-    )
-    parser.add_argument(
-        "--save-wav",
-        default=None,
-        metavar="PATH",
-        help="Optional path to also save recorded audio as WAV (e.g. output.wav)",
     )
     parser.add_argument(
         "--gain",
@@ -99,7 +92,7 @@ def main():
     streaming_client.subscribe()
 
     print("Loading whisper model...")
-    model = whisper.load_model("base")  # tiny, base, small, medium, large-v3, turbo
+    model = whisper.load_model("small")  # tiny, base, small, medium, large-v3, turbo
 
     rclpy.init()
     node = Node("audio_transcriber")
@@ -110,88 +103,86 @@ def main():
     g = gcd(ARIA_AUDIO_SAMPLE_RATE, WHISPER_SAMPLE_RATE)
     sos = butter(4, [80, 8000], btype="band", fs=ARIA_AUDIO_SAMPLE_RATE, output="sos")
 
-    quit_event = threading.Event()
-    release_event = threading.Event()
+    # Key-repeat-based hold detection.
+    # Linux key repeat: initial delay ~500ms, then repeat every ~33ms.
+    # Use a long timeout for the first press (waiting for repeat to start),
+    # then switch to a short timeout once repeat is confirmed.
+    INITIAL_TIMEOUT = 0.65  # longer than key repeat initial delay
+    RELEASE_TIMEOUT = 0.15  # shorter than key repeat interval gap
+    release_timer = None
+    key_repeating = False
+    release_timer_lock = threading.Lock()
 
-    def on_press(key):
-        try:
-            if key.char == 's' and not observer.recording:
-                observer.recording = True
-                observer.audio_buffer.clear()
-                print("Recording...")
-        except AttributeError:
-            pass
+    def on_key_released():
+        observer.recording = False
+        print("Stopped.")
 
-    def on_release(key):
-        if key == keyboard.Key.esc:
-            quit_event.set()
-            release_event.set()
-            return False
-        try:
-            if key.char == 's' and observer.recording:
-                observer.recording = False
-                print("Stopped.")
-                release_event.set()
-        except AttributeError:
-            pass
+        if not observer.audio_buffer:
+            print("No audio data received.")
+            print("Hold [S] to record again. [Q]/ESC to quit.")
+            return
 
-    print("Hold [S] to record, release to transcribe. ESC to quit.")
+        all_samples = np.concatenate(observer.audio_buffer)
+        remainder = len(all_samples) % ARIA_NUM_CHANNELS
+        if remainder != 0:
+            all_samples = all_samples[:-remainder]
+        frames = all_samples.reshape(-1, ARIA_NUM_CHANNELS)
+
+        channels = args.channel if args.channel is not None else list(range(ARIA_NUM_CHANNELS))
+        channel_data = frames[:, channels].mean(axis=1).astype(np.int32)
+        audio_float = (channel_data >> 16).astype(np.float32) / 32768.0
+
+        audio_float = sosfilt(sos, audio_float).astype(np.float32)
+
+        rms = np.sqrt(np.mean(audio_float ** 2))
+        if rms > 1e-6:
+            audio_float = audio_float / rms * 0.1
+        audio_float = np.clip(audio_float * args.gain, -1.0, 1.0)
+
+        audio_16k = resample_poly(audio_float, WHISPER_SAMPLE_RATE // g, ARIA_AUDIO_SAMPLE_RATE // g).astype(np.float32)
+
+        print("Transcribing...")
+        result = model.transcribe(audio_16k, fp16=False, language=args.language)
+        text = result["text"].strip()
+
+        msg = String()
+        msg.data = text
+        pub.publish(msg)
+
+        print(f"Text: {text}")
+        print("Hold [S] to record again. [Q]/ESC to quit.")
+
+    print("Hold [S] to record, release to transcribe. [Q]/ESC to quit.")
 
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
     try:
         tty.setcbreak(fd)
-        with keyboard.Listener(on_press=on_press, on_release=on_release):
-            while not quit_event.is_set():
-                release_event.wait()
-                release_event.clear()
-
-                if quit_event.is_set():
-                    break
-
-                if not observer.audio_buffer:
-                    print("No audio data received.")
-                    continue
-
-                all_samples = np.concatenate(observer.audio_buffer)
-                remainder = len(all_samples) % ARIA_NUM_CHANNELS
-                if remainder != 0:
-                    all_samples = all_samples[:-remainder]
-                frames = all_samples.reshape(-1, ARIA_NUM_CHANNELS)
-
-                channels = args.channel if args.channel is not None else list(range(ARIA_NUM_CHANNELS))
-                channel_data = frames[:, channels].mean(axis=1).astype(np.int32)
-                audio_float = (channel_data >> 16).astype(np.float32) / 32768.0
-
-                audio_float = sosfilt(sos, audio_float).astype(np.float32)
-
-                rms = np.sqrt(np.mean(audio_float ** 2))
-                if rms > 1e-6:
-                    audio_float = audio_float / rms * 0.1
-                audio_float = np.clip(audio_float * args.gain, -1.0, 1.0)
-
-                channel_16bit = (audio_float * 32767).astype(np.int16)
-
-                if args.save_wav:
-                    with wave.open(args.save_wav, "wb") as wf:
-                        wf.setnchannels(1)
-                        wf.setsampwidth(2)
-                        wf.setframerate(ARIA_AUDIO_SAMPLE_RATE)
-                        wf.writeframes(channel_16bit.tobytes())
-                    print(f"WAV saved to {args.save_wav}")
-
-                audio_16k = resample_poly(audio_float, WHISPER_SAMPLE_RATE // g, ARIA_AUDIO_SAMPLE_RATE // g).astype(np.float32)
-
-                print("Transcribing...")
-                result = model.transcribe(audio_16k, fp16=False, language=args.language)
-                text = result["text"].strip()
-
-                msg = String()
-                msg.data = text
-                pub.publish(msg)
-
-                print(f"Text: {text}")
-                print("Hold [S] to record again. ESC to quit.")
+        while True:
+            r, _, _ = select.select([sys.stdin], [], [], 0.1)
+            if not r:
+                continue
+            ch = sys.stdin.read(1)
+            if ch in ('\x1b', 'q', 'Q'):
+                with release_timer_lock:
+                    if release_timer is not None:
+                        release_timer.cancel()
+                break
+            if ch in ('s', 'S'):
+                with release_timer_lock:
+                    if release_timer is not None:
+                        release_timer.cancel()
+                    if not observer.recording:
+                        observer.recording = True
+                        observer.audio_buffer.clear()
+                        key_repeating = False
+                        print("Recording...")
+                        timeout = INITIAL_TIMEOUT
+                    else:
+                        key_repeating = True
+                        timeout = RELEASE_TIMEOUT
+                    release_timer = threading.Timer(timeout, on_key_released)
+                    release_timer.start()
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
