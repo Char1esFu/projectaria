@@ -100,7 +100,7 @@ class GazeOverlay:
                 target=rclpy.spin, args=(self._ros_node,), daemon=True
             )
             self._ros_thread.start()
-            print("ROS2 subscriber started: /aria/gaze_euler")
+            # print("ROS2 subscriber started: /aria/gaze_euler")
             print("ROS2 publisher started: /gaze_label")
         except Exception as exc:
             raise RuntimeError(f"ROS2 subscriber unavailable: {exc}") from exc
@@ -174,6 +174,7 @@ class GazeOverlay:
                 self._filter_results(results[0])
                 self._publish_closest_labels(results[0], self.resize_size, self.resize_size)
                 annotated = results[0].plot()
+                results[0].boxes = None
 
                 # Resize annotated back to display image size
                 final = cv2.resize(annotated, (w, h), interpolation=cv2.INTER_LINEAR)
@@ -184,6 +185,7 @@ class GazeOverlay:
                 self._filter_results(results[0])
                 self._publish_closest_labels(results[0], w, h)
                 np.copyto(display_image, results[0].plot())
+                results[0].boxes = None
 
         # Keep a clean frame for saving before drawing viewer-only overlays.
         capture_frame = None
@@ -255,10 +257,11 @@ class GazeOverlay:
         result.boxes = result.boxes[keep]
 
     def _publish_closest_labels(self, result, img_w: int, img_h: int) -> None:
-        """Publish the labels of the 2 bounding boxes closest to the image center via /gaze_label."""
-        if result.boxes is None or len(result.boxes) == 0:
-            return
+        """Publish the label of the bounding box closest to the image center via /gaze_label."""
         from std_msgs.msg import String
+        if result.boxes is None or len(result.boxes) == 0:
+            self._gaze_label_pub.publish(String(data=""))
+            return
 
         cx, cy = img_w / 2.0, img_h / 2.0
         names = result.names
@@ -273,10 +276,8 @@ class GazeOverlay:
             dists.append((dist, names.get(cid, str(cid))))
 
         dists.sort(key=lambda x: x[0])
-        closest = [label for _, label in dists[:2]]
-
         msg = String()
-        msg.data = ",".join(closest)
+        msg.data = dists[0][1]
         self._gaze_label_pub.publish(msg)
 
     def shutdown(self) -> None:
@@ -364,7 +365,7 @@ def parse_args() -> argparse.Namespace:
         help="Enable runtime capture toggle. Press S to start/stop continuous saving to saved_images/.",
     )
     parser.add_argument("--model", type=str, default=str(MODEL_PATH), help="YOLO model path")
-    parser.add_argument("--conf", type=float, default=0.25, help="YOLO confidence threshold")
+    parser.add_argument("--conf", type=float, default=0.75, help="YOLO confidence threshold")
     parser.add_argument("--device", type=str, default=None, help="Inference device: cuda / cpu / mps (default: auto)")
     parser.add_argument(
         "--crop", default=False, action="store_true",

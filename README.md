@@ -89,3 +89,12 @@ export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 export ROS_DOMAIN_ID=10
 export CYCLONEDDS_URI=file://$HOME/.ros/cyclonedds.xml
 ```
+
+### new commands
+```bash
+python3 -m projectaria_eyetracking.gaze_detect --device cuda:0
+
+python3 -m src.gaze_rgb_visualizer --yolo --crop --draw-gaze
+
+python3 -m src.audio_record --device-ip 192.168.8.117 --gain 2.0
+```
