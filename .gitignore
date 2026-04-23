@@ -215,3 +215,4 @@ __marimo__/
 # image folder
 test_homography/images/
 test_homography/results/
+saved_images/

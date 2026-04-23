@@ -1,4 +1,5 @@
 import argparse
+import select
 import sys
 import termios
 import threading
@@ -102,9 +103,23 @@ def main():
     g = gcd(ARIA_AUDIO_SAMPLE_RATE, WHISPER_SAMPLE_RATE)
     sos = butter(4, [80, 8000], btype="band", fs=ARIA_AUDIO_SAMPLE_RATE, output="sos")
 
-    def transcribe_and_publish():
+    # Key-repeat-based hold detection.
+    # Linux key repeat: initial delay ~500ms, then repeat every ~33ms.
+    # Use a long timeout for the first press (waiting for repeat to start),
+    # then switch to a short timeout once repeat is confirmed.
+    INITIAL_TIMEOUT = 0.65  # longer than key repeat initial delay
+    RELEASE_TIMEOUT = 0.15  # shorter than key repeat interval gap
+    release_timer = None
+    key_repeating = False
+    release_timer_lock = threading.Lock()
+
+    def on_key_released():
+        observer.recording = False
+        print("Stopped.")
+
         if not observer.audio_buffer:
             print("No audio data received.")
+            print("Hold [S] to record again. [Q]/ESC to quit.")
             return
 
         all_samples = np.concatenate(observer.audio_buffer)
@@ -130,32 +145,44 @@ def main():
         result = model.transcribe(audio_16k, fp16=False, language=args.language)
         text = result["text"].strip()
 
-        if text:
-            msg = String()
-            msg.data = text
-            pub.publish(msg)
+        msg = String()
+        msg.data = text
+        pub.publish(msg)
 
         print(f"Text: {text}")
+        print("Hold [S] to record again. [Q]/ESC to quit.")
 
-    print("Press [S] to start recording, [S] again to stop and transcribe. [Q]/ESC to quit.")
+    print("Hold [S] to record, release to transcribe. [Q]/ESC to quit.")
 
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
     try:
         tty.setcbreak(fd)
         while True:
+            r, _, _ = select.select([sys.stdin], [], [], 0.1)
+            if not r:
+                continue
             ch = sys.stdin.read(1)
-            if ch in ('\x1b', 'q', 'Q', '\x03'):
+            if ch in ('\x1b', 'q', 'Q'):
+                with release_timer_lock:
+                    if release_timer is not None:
+                        release_timer.cancel()
                 break
             if ch in ('s', 'S'):
-                if not observer.recording:
-                    observer.recording = True
-                    observer.audio_buffer.clear()
-                    print("Recording...")
-                else:
-                    observer.recording = False
-                    print("Stopped.")
-                    threading.Thread(target=transcribe_and_publish, daemon=True).start()
+                with release_timer_lock:
+                    if release_timer is not None:
+                        release_timer.cancel()
+                    if not observer.recording:
+                        observer.recording = True
+                        observer.audio_buffer.clear()
+                        key_repeating = False
+                        print("Recording...")
+                        timeout = INITIAL_TIMEOUT
+                    else:
+                        key_repeating = True
+                        timeout = RELEASE_TIMEOUT
+                    release_timer = threading.Timer(timeout, on_key_released)
+                    release_timer.start()
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 

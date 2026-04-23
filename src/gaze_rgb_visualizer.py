@@ -1,4 +1,6 @@
 import argparse
+import json
+import math
 import threading
 import time
 from pathlib import Path
@@ -30,6 +32,7 @@ class GazeOverlay:
         resize_size: int = 1080,
         filter_labels: Optional[list[str]] = None,
         capture_interval: float = 0.0,
+        dist_threshold: float = 200.0,
     ) -> None:
         self.gaze_pitch: float = 0.0
         self.gaze_yaw: float = 0.0
@@ -75,6 +78,9 @@ class GazeOverlay:
 
         # Labels to filter out from YOLO results
         self.filter_labels: set[str] = set(l.lower() for l in (filter_labels or []))
+
+        # Gaze proximity threshold (pixels): boxes beyond this radius are ignored
+        self.dist_threshold = dist_threshold
 
     def _setup_ros_subscriber(self) -> None:
         try:
@@ -257,7 +263,7 @@ class GazeOverlay:
         result.boxes = result.boxes[keep]
 
     def _publish_closest_labels(self, result, img_w: int, img_h: int) -> None:
-        """Publish the label of the bounding box closest to the image center via /gaze_label."""
+        """Publish the label and gaze-proximity probability of the closest bounding box via /gaze_label."""
         from std_msgs.msg import String
         if result.boxes is None or len(result.boxes) == 0:
             self._gaze_label_pub.publish(String(data=""))
@@ -268,16 +274,26 @@ class GazeOverlay:
         boxes_xyxy = result.boxes.xyxy.tolist()
         cls_ids = result.boxes.cls.int().tolist()
 
+        # sigma so that dist_threshold == 3*sigma (3-sigma boundary)
+        sigma = self.dist_threshold / 3.0
+
         dists = []
         for xyxy, cid in zip(boxes_xyxy, cls_ids):
             bx = (xyxy[0] + xyxy[2]) / 2.0
             by = (xyxy[1] + xyxy[3]) / 2.0
             dist = ((bx - cx) ** 2 + (by - cy) ** 2) ** 0.5
-            dists.append((dist, names.get(cid, str(cid))))
+            if dist <= self.dist_threshold:
+                prob = math.exp(-0.5 * (dist / sigma) ** 2)
+                dists.append((dist, names.get(cid, str(cid)), prob))
+
+        if not dists:
+            self._gaze_label_pub.publish(String(data=""))
+            return
 
         dists.sort(key=lambda x: x[0])
         msg = String()
-        msg.data = dists[0][1]
+        msg.data = json.dumps([{"label": d[1], "prob": round(d[2], 4)} for d in dists])
+        # msg.data = json.dumps([{"label": d[1], "distance": round(d[0], 4)} for d in dists])
         self._gaze_label_pub.publish(msg)
 
     def shutdown(self) -> None:
@@ -303,6 +319,7 @@ def run_gaze_rgb_visualizer(
     resize_size: int = 1080,
     filter_labels: Optional[list[str]] = None,
     capture_interval: float = 0.0,
+    dist_threshold: float = 200.0,
 ) -> None:
     overlay = GazeOverlay(
         homography_path=homography_path,
@@ -317,6 +334,7 @@ def run_gaze_rgb_visualizer(
         resize_size=resize_size,
         filter_labels=filter_labels,
         capture_interval=capture_interval,
+        dist_threshold=dist_threshold,
     )
     stream = AriaRgbStream(
         device_ip=device_ip,
@@ -378,8 +396,12 @@ def parse_args() -> argparse.Namespace:
         help="Labels to exclude from YOLO results (e.g. --filter-label 'beer bottle' 'water bottle').",
     )
     parser.add_argument(
-        "--capture-interval", type=float, default=0.0,
+        "--capture-interval", type=float, default=1.0,
         help="Minimum time interval (seconds) between saved frames. 0 = save every frame.",
+    )
+    parser.add_argument(
+        "--dist-threshold", type=float, default=200.0,
+        help="Max pixel distance from gaze center to bounding-box center to consider (3-sigma radius).",
     )
     return parser.parse_args()
 
@@ -401,6 +423,7 @@ def main() -> None:
         resize_size=args.resize_size,
         filter_labels=args.filter_label,
         capture_interval=args.capture_interval,
+        dist_threshold=args.dist_threshold,
     )
 
 

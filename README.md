@@ -98,5 +98,5 @@ python3 -m src.gaze_rgb_visualizer --yolo --crop --draw-gaze
 
 sudo python3 src/indicator_remapping.py
 
-python3 -m src.audio_record --device-ip 192.168.8.117 --gain 2.0
+python3 -m src.audio_record --device-ip 192.168.8.117 --gain 2.0 # press bottom right button
 ```
