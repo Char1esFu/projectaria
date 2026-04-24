@@ -13,6 +13,8 @@ from ultralytics import YOLO
 from utils.aria_rgb_stream import AriaRgbStream
 
 MODEL_PATH = Path(__file__).parent.parent / "yolo_model" / "mixed.pt"
+CROP_SIZE = 200
+RESIZE_SIZE = 1080
 
 
 class GazeOverlay:
@@ -27,12 +29,13 @@ class GazeOverlay:
         model_path: Optional[Path] = None,
         conf_threshold: float = 0.25,
         device: Optional[str] = None,
-        crop: bool = False,
-        crop_size: int = 480,
-        resize_size: int = 1080,
         filter_labels: Optional[list[str]] = None,
         capture_interval: float = 0.0,
         dist_threshold: float = 200.0,
+        show_confidence: bool = False,
+        saccade_threshold: float = 5.0,
+        s_min: float = 0.3,
+        gain: float = 3.0,
     ) -> None:
         self.gaze_pitch: float = 0.0
         self.gaze_yaw: float = 0.0
@@ -59,10 +62,6 @@ class GazeOverlay:
             print(f"Loading YOLO model from {model_path} on device={self.yolo_device}")
             self.model = YOLO(str(model_path))
 
-        # Crop settings
-        self.crop = crop
-        self.crop_size = crop_size
-        self.resize_size = resize_size
         self.draw_gaze = draw_gaze
 
         # Capture settings
@@ -81,6 +80,16 @@ class GazeOverlay:
 
         # Gaze proximity threshold (pixels): boxes beyond this radius are ignored
         self.dist_threshold = dist_threshold
+
+        # Sticky-Glance confidence field (paper Algorithm 1)
+        self.prev_gaze_raw: Optional[tuple[int, int]] = None  # (gx, gy) in display-image coords
+        self._confidence: dict[int, float] = {}       # class_id -> c(t,i) in [0, 1]
+        self._prev_obj_dist: dict[int, float] = {}    # class_id -> d(t-1) in detection coords
+        self._last_frame_time: float = time.monotonic()
+        self.show_confidence: bool = show_confidence
+        self.saccade_threshold: float = saccade_threshold
+        self.s_min: float = s_min
+        self.gain: float = gain
 
     def _setup_ros_subscriber(self) -> None:
         try:
@@ -141,57 +150,68 @@ class GazeOverlay:
         cross_size = 40
         gaze_valid = 0 <= gx < w and 0 <= gy < h
 
-        # Crop+resize is independent from gaze marker drawing and YOLO enable flag.
-        cs = 0
-        x_start = 0
-        y_start = 0
-        crop_img = None
-        gaze_pt = None
-        if self.crop and gaze_valid:
-            # Crop square around gaze point, clamped to image bounds.
-            cs = min(self.crop_size, w, h)
+        now = time.monotonic()
+        delta_t = min(now - self._last_frame_time, 0.1)  # cap at 100 ms
+        self._last_frame_time = now
+
+        # Always crop around gaze for YOLO; CROP_SIZE and RESIZE_SIZE are module constants.
+        gaze_pt: Optional[tuple] = None
+        crop_img: Optional[np.ndarray] = None
+        resized_crop: Optional[np.ndarray] = None
+        x_start = y_start = cs = 0
+        if gaze_valid:
+            cs = min(CROP_SIZE, w, h)
             x_start = max(0, min(gx - cs // 2, w - cs))
             y_start = max(0, min(gy - cs // 2, h - cs))
             crop_img = display_image[y_start:y_start + cs, x_start:x_start + cs].copy()
-
-            # Keep cropped view even when YOLO is disabled.
-            display_image[:] = cv2.resize(crop_img, (w, h), interpolation=cv2.INTER_LINEAR)
-            gaze_pt = (
-                int(round((gx - x_start) * w / cs)),
-                int(round((gy - y_start) * h / cs)),
-            )
-        elif gaze_valid:
             gaze_pt = (gx, gy)
 
-        # YOLO inference (prerequisite: valid gaze point)
-        if self.model is not None and gaze_valid:
-            if self.crop and crop_img is not None:
-                # Resize for YOLO
-                resized = cv2.resize(crop_img, (self.resize_size, self.resize_size), interpolation=cv2.INTER_LINEAR)
+        if self.enable_capture and crop_img is not None:
+            resized_crop = cv2.resize(crop_img, (RESIZE_SIZE, RESIZE_SIZE), interpolation=cv2.INTER_LINEAR)
+            resized_crop = cv2.bilateralFilter(resized_crop, d=5, sigmaColor=15, sigmaSpace=15)
+            blurred = cv2.GaussianBlur(resized_crop, (0, 0), sigmaX=5)
+            resized_crop = cv2.addWeighted(resized_crop, 5, blurred, -4, 0)
 
-                # Denoise: bilateral filter (preserve edges)
-                resized = cv2.bilateralFilter(resized, d=5, sigmaColor=15, sigmaSpace=15)
-                # Sharpen: unsharp mask
-                blurred = cv2.GaussianBlur(resized, (0, 0), sigmaX=5)
-                resized = cv2.addWeighted(resized, 5, blurred, -4, 0)
+        # YOLO inference on the cropped+resized region
+        if self.model is not None and gaze_valid and crop_img is not None:
+            if resized_crop is None:
+                resized_crop = cv2.resize(crop_img, (RESIZE_SIZE, RESIZE_SIZE), interpolation=cv2.INTER_LINEAR)
+                resized_crop = cv2.bilateralFilter(resized_crop, d=5, sigmaColor=15, sigmaSpace=15)
+                blurred = cv2.GaussianBlur(resized_crop, (0, 0), sigmaX=5)
+                resized_crop = cv2.addWeighted(resized_crop, 5, blurred, -4, 0)
 
-                # YOLO inference on enhanced crop
-                results = self.model(resized, conf=self.conf_threshold, device=self.yolo_device, verbose=False)
-                self._filter_results(results[0])
-                self._publish_closest_labels(results[0], self.resize_size, self.resize_size)
-                annotated = results[0].plot()
-                results[0].boxes = None
+            results = self.model(resized_crop, conf=self.conf_threshold, device=self.yolo_device, verbose=False)
+            self._filter_results(results[0])
 
-                # Resize annotated back to display image size
-                final = cv2.resize(annotated, (w, h), interpolation=cv2.INTER_LINEAR)
-                display_image[:] = final
+            scale = RESIZE_SIZE / cs
+            curr_in_resized = ((gx - x_start) * scale, (gy - y_start) * scale)
+            prev_in_resized: Optional[tuple] = None
+            if self.prev_gaze_raw is not None:
+                prev_in_resized = (
+                    (self.prev_gaze_raw[0] - x_start) * scale,
+                    (self.prev_gaze_raw[1] - y_start) * scale,
+                )
+                self._update_confidence(results[0], prev_in_resized, curr_in_resized, delta_t)
+
+            self._publish_closest_labels(results[0])
+
+            if self.enable_capture:
+                # Capture mode: show the enhanced crop so the user sees what is saved.
+                annotated = self._draw_circles(resized_crop, results[0], prev_in_resized, curr_in_resized)
+                display_image[:] = cv2.resize(annotated, (w, h), interpolation=cv2.INTER_LINEAR)
+                gaze_pt = (int((gx - x_start) * w / cs), int((gy - y_start) * h / cs))
             else:
-                # No crop: YOLO on full image
-                results = self.model(display_image, conf=self.conf_threshold, device=self.yolo_device, verbose=False)
-                self._filter_results(results[0])
-                self._publish_closest_labels(results[0], w, h)
-                np.copyto(display_image, results[0].plot())
-                results[0].boxes = None
+                # Normal mode: map detections back to original display image.
+                annotated = self._draw_circles(
+                    display_image, results[0],
+                    self.prev_gaze_raw, (gx, gy),
+                    crop_transform=(x_start, y_start, scale),
+                )
+                np.copyto(display_image, annotated)
+            results[0].boxes = None
+        elif self.enable_capture and resized_crop is not None:
+            display_image[:] = cv2.resize(resized_crop, (w, h), interpolation=cv2.INTER_LINEAR)
+            gaze_pt = (int((gx - x_start) * w / cs), int((gy - y_start) * h / cs))
 
         # Keep a clean frame for saving before drawing viewer-only overlays.
         capture_frame = None
@@ -236,6 +256,171 @@ class GazeOverlay:
                     self.capture_index += 1
                     self._last_capture_time = now
 
+        # Persist gaze position for next-frame affinity computation.
+        if gaze_valid:
+            self.prev_gaze_raw = (gx, gy)
+
+    # ------------------------------------------------------------------
+    # Gaze-trajectory affinity helpers
+    # ------------------------------------------------------------------
+
+    def _tangent_info(
+        self, px: float, py: float, cx: float, cy: float, r: float
+    ) -> Optional[tuple]:
+        """Return (t1_vec, t2_vec, touch1, touch2) for tangent lines from point P=(px,py)
+        to circle (cx,cy,r), or None when P is inside the circle.
+        t1/t2 are unit direction vectors; touch points are pixel coords on the circle."""
+        dx, dy = cx - px, cy - py
+        d = math.sqrt(dx * dx + dy * dy)
+        if d <= r:
+            return None
+        tan_len = math.sqrt(d * d - r * r)
+        ux, uy = dx / d, dy / d          # unit vec P → C
+        sin_a, cos_a = r / d, tan_len / d
+        # Rotate ux,uy by +alpha and -alpha
+        t1 = (ux * cos_a - uy * sin_a, ux * sin_a + uy * cos_a)
+        t2 = (ux * cos_a + uy * sin_a, -ux * sin_a + uy * cos_a)
+        touch1 = (int(round(px + t1[0] * tan_len)), int(round(py + t1[1] * tan_len)))
+        touch2 = (int(round(px + t2[0] * tan_len)), int(round(py + t2[1] * tan_len)))
+        return t1, t2, touch1, touch2
+
+    def _intersections_with_circle(
+        self, p: tuple, q: tuple, cx: float, cy: float, r: float
+    ) -> int:
+        """Count intersections of segment PQ with circle (cx,cy,r). Returns 0, 1, or 2."""
+        dx, dy = q[0] - p[0], q[1] - p[1]
+        fx, fy = p[0] - cx, p[1] - cy
+        a = dx * dx + dy * dy
+        if a < 1e-9:
+            return 0
+        b = 2.0 * (fx * dx + fy * dy)
+        c = fx * fx + fy * fy - r * r
+        disc = b * b - 4.0 * a * c
+        if disc < 0:
+            return 0
+        sq = math.sqrt(disc)
+        return sum(1 for t in ((-b - sq) / (2 * a), (-b + sq) / (2 * a)) if 0.0 <= t <= 1.0)
+
+    def _update_confidence(
+        self,
+        result,
+        prev_pt: tuple[float, float],
+        curr_pt: tuple[float, float],
+        delta_t: float,
+    ) -> None:
+        """Sticky-Glance Algorithm 1: update per-object confidence c(t,i) in [0,1].
+
+        Inside bounding circle: Gaussian e_dist (σ=r/2) instead of flat 1,
+        so overlapping circles don't give equal evidence from both objects.
+        Outside: paper Eq.1 (r/d)*σ_trend. Direction evidence: paper Eq.2."""
+        vx = curr_pt[0] - prev_pt[0]
+        vy = curr_pt[1] - prev_pt[1]
+        delta_g = math.sqrt(vx * vx + vy * vy)
+
+        detected_cids: set[int] = set()
+
+        if result.boxes is not None and len(result.boxes) > 0:
+            for xyxy, cid in zip(result.boxes.xyxy.tolist(), result.boxes.cls.int().tolist()):
+                x1, y1, x2, y2 = xyxy
+                ocx, ocy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+                r = math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2) / 2.0
+                detected_cids.add(cid)
+
+                d_curr = math.sqrt((curr_pt[0] - ocx) ** 2 + (curr_pt[1] - ocy) ** 2)
+                d_prev = self._prev_obj_dist.get(cid, d_curr)
+                sigma_trend = 1.0 if d_prev > d_curr else (-1.0 if d_prev < d_curr else 1.0)
+
+                # --- Distance evidence (e_dist) ---
+                if d_curr <= r:
+                    # Gaussian with σ=r/3: value at edge ≈ exp(-4.5) ≈ 0.011,
+                    # at 0.7r ≈ 0.11 — tighter than r/2 to reduce overlap bleed
+                    sigma_g = r / 3.0
+                    e_dist = math.exp(-d_curr ** 2 / (2.0 * sigma_g ** 2))
+                else:
+                    e_dist = (r / d_curr) * sigma_trend  # Eq.1, in [-1, 1]
+
+                # --- Directional evidence (e_dir) ---
+                e_dir = 0.0
+                if d_prev > r and delta_g > self.saccade_threshold:
+                    # Case 1: prev outside, saccade → Eq.2
+                    n = self._intersections_with_circle(prev_pt, curr_pt, ocx, ocy, r)
+                    if n == 2:
+                        e_dir = -1.0  # gaze already passed through object
+                    else:
+                        cos_theta = math.sqrt(max(0.0, 1.0 - (r / d_prev) ** 2))
+                        if delta_g > 0 and d_curr > 0:
+                            obj_dx, obj_dy = ocx - curr_pt[0], ocy - curr_pt[1]
+                            cos_phi = (vx * obj_dx + vy * obj_dy) / (delta_g * d_curr)
+                            cos_phi = max(-1.0, min(1.0, cos_phi))
+                        else:
+                            cos_phi = 0.0
+                        delta_dir = 1.0 if cos_phi >= cos_theta else -1.0
+                        denom = 1.0 - delta_dir * cos_theta
+                        if abs(denom) > 1e-6:
+                            e_dir = max(-1.0, min(1.0, (cos_phi - cos_theta) / denom))
+                elif d_prev <= r and d_curr > r:
+                    # Case 2b: gaze just exited circle → strong repulsion
+                    e_dir = -1.0
+                # Case 2a (fixation inside): e_dir = 0, Gaussian e_dist carries the signal
+
+                e_i = e_dist + e_dir
+                # Gate: only allow positive evidence within r + dist_threshold of the object
+                # center, so each object's zone scales with its own bounding circle size.
+                if d_curr > r + self.dist_threshold:
+                    e_i = min(e_i, 0.0)
+                c_prev = self._confidence.get(cid, 0.0)
+                self._confidence[cid] = max(0.0, min(1.0, c_prev + self.gain * delta_t * e_i))
+                self._prev_obj_dist[cid] = d_curr
+
+        # Decay confidence for objects not detected this frame
+        for cid in list(self._confidence.keys()):
+            if cid not in detected_cids:
+                self._confidence[cid] = max(0.0, self._confidence[cid] - 0.05 * delta_t)
+
+    def _draw_circles(
+        self, img: np.ndarray, result,
+        prev_gaze_pt: Optional[tuple] = None,
+        gaze_pt: Optional[tuple] = None,
+        crop_transform: Optional[tuple] = None,
+    ) -> np.ndarray:
+        """Draw a circle per detection on img.
+
+        crop_transform=(x_start, y_start, scale): when provided, box coordinates are in
+        resized-crop space and are mapped back to display-image space before drawing.
+        prev_gaze_pt and gaze_pt must already be in the same space as img (display coords)."""
+        out = img.copy()
+        if result.boxes is None or len(result.boxes) == 0:
+            return out
+        names = result.names
+        for xyxy, cid, conf in zip(
+            result.boxes.xyxy.tolist(),
+            result.boxes.cls.int().tolist(),
+            result.boxes.conf.tolist(),
+        ):
+            x1, y1, x2, y2 = xyxy
+            if crop_transform is not None:
+                xs, ys, sc = crop_transform
+                cx = int(xs + (x1 + x2) / 2 / sc)
+                cy = int(ys + (y1 + y2) / 2 / sc)
+                radius = int(math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2) / 2 / sc)
+            else:
+                cx = int((x1 + x2) / 2)
+                cy = int((y1 + y2) / 2)
+                radius = int(math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2) / 2)
+            score = self._compute_score(cid)
+            label = f"{names.get(cid, str(cid))} s={score:.2f}"
+            cv2.circle(out, (cx, cy), radius, (0, 255, 0), 2, cv2.LINE_AA)
+            cv2.putText(out, label, (cx - radius, max(cy - radius - 6, 12)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1, cv2.LINE_AA)
+            if self.show_confidence and prev_gaze_pt is not None:
+                pg = (int(round(prev_gaze_pt[0])), int(round(prev_gaze_pt[1])))
+                tg = self._tangent_info(pg[0], pg[1], cx, cy, radius)
+                if tg is not None:
+                    _, _, touch1, touch2 = tg
+                    cv2.line(out, pg, touch1, (0, 255, 255), 1, cv2.LINE_AA)
+                    cv2.line(out, pg, touch2, (0, 255, 255), 1, cv2.LINE_AA)
+        return out
+
     def _filter_results(self, result) -> None:
         """Remove detections whose label is in self.filter_labels and keep only
         the highest-confidence detection per class (in-place)."""
@@ -262,38 +447,32 @@ class GazeOverlay:
         keep = [idx for idx, _ in best.values()]
         result.boxes = result.boxes[keep]
 
-    def _publish_closest_labels(self, result, img_w: int, img_h: int) -> None:
-        """Publish the label and gaze-proximity probability of the closest bounding box via /gaze_label."""
+    def _compute_score(self, cid: int) -> float:
+        return self._confidence.get(cid, 0.0)
+
+    def _publish_closest_labels(self, result) -> None:
+        """Publish {"label", "score"} for every detection sorted by confidence descending."""
         from std_msgs.msg import String
         if result.boxes is None or len(result.boxes) == 0:
             self._gaze_label_pub.publish(String(data=""))
             return
 
-        cx, cy = img_w / 2.0, img_h / 2.0
         names = result.names
-        boxes_xyxy = result.boxes.xyxy.tolist()
-        cls_ids = result.boxes.cls.int().tolist()
+        entries: list[dict] = []
 
-        # sigma so that dist_threshold == 3*sigma (3-sigma boundary)
-        sigma = self.dist_threshold / 3.0
+        for cid in result.boxes.cls.int().tolist():
+            score = self._compute_score(cid)
+            if score < self.s_min:
+                continue
+            entries.append({"label": names.get(cid, str(cid)), "score": round(score, 4)})
 
-        dists = []
-        for xyxy, cid in zip(boxes_xyxy, cls_ids):
-            bx = (xyxy[0] + xyxy[2]) / 2.0
-            by = (xyxy[1] + xyxy[3]) / 2.0
-            dist = ((bx - cx) ** 2 + (by - cy) ** 2) ** 0.5
-            if dist <= self.dist_threshold:
-                prob = math.exp(-0.5 * (dist / sigma) ** 2)
-                dists.append((dist, names.get(cid, str(cid)), prob))
-
-        if not dists:
+        if not entries:
             self._gaze_label_pub.publish(String(data=""))
             return
 
-        dists.sort(key=lambda x: x[0])
+        entries.sort(key=lambda x: -x["score"])
         msg = String()
-        msg.data = json.dumps([{"label": d[1], "prob": round(d[2], 4)} for d in dists])
-        # msg.data = json.dumps([{"label": d[1], "distance": round(d[0], 4)} for d in dists])
+        msg.data = json.dumps(entries)
         self._gaze_label_pub.publish(msg)
 
     def shutdown(self) -> None:
@@ -314,12 +493,13 @@ def run_gaze_rgb_visualizer(
     model_path: Optional[Path] = None,
     conf_threshold: float = 0.25,
     device: Optional[str] = None,
-    crop: bool = False,
-    crop_size: int = 480,
-    resize_size: int = 1080,
     filter_labels: Optional[list[str]] = None,
     capture_interval: float = 0.0,
     dist_threshold: float = 200.0,
+    show_confidence: bool = False,
+    saccade_threshold: float = 5.0,
+    s_min: float = 0.3,
+    gain: float = 3.0,
 ) -> None:
     overlay = GazeOverlay(
         homography_path=homography_path,
@@ -329,12 +509,13 @@ def run_gaze_rgb_visualizer(
         model_path=model_path,
         conf_threshold=conf_threshold,
         device=device,
-        crop=crop,
-        crop_size=crop_size,
-        resize_size=resize_size,
         filter_labels=filter_labels,
         capture_interval=capture_interval,
         dist_threshold=dist_threshold,
+        show_confidence=show_confidence,
+        saccade_threshold=saccade_threshold,
+        s_min=s_min,
+        gain=gain,
     )
     stream = AriaRgbStream(
         device_ip=device_ip,
@@ -383,14 +564,8 @@ def parse_args() -> argparse.Namespace:
         help="Enable runtime capture toggle. Press S to start/stop continuous saving to saved_images/.",
     )
     parser.add_argument("--model", type=str, default=str(MODEL_PATH), help="YOLO model path")
-    parser.add_argument("--conf", type=float, default=0.75, help="YOLO confidence threshold")
+    parser.add_argument("--yolo-conf", type=float, default=0.75, help="YOLO confidence threshold")
     parser.add_argument("--device", type=str, default=None, help="Inference device: cuda / cpu / mps (default: auto)")
-    parser.add_argument(
-        "--crop", default=False, action="store_true",
-        help="Enable gaze-centered crop+resize display (and YOLO input when --yolo is enabled).",
-    )
-    parser.add_argument("--crop-size", type=int, default=200, help="Side length of square crop around gaze point (pixels)")
-    parser.add_argument("--resize-size", type=int, default=1080, help="Resize crop to this size before YOLO inference")
     parser.add_argument(
         "--filter-label", type=str, nargs="+", default=["beer bottle", "mayonnaise bottle", "oil bottle", "water bottle"],
         help="Labels to exclude from YOLO results (e.g. --filter-label 'beer bottle' 'water bottle').",
@@ -400,8 +575,27 @@ def parse_args() -> argparse.Namespace:
         help="Minimum time interval (seconds) between saved frames. 0 = save every frame.",
     )
     parser.add_argument(
-        "--dist-threshold", type=float, default=200.0,
-        help="Max pixel distance from gaze center to bounding-box center to consider (3-sigma radius).",
+        "--dist-threshold", type=float, default=100.0,
+        help="Extra pixel margin beyond each object's bounding circle radius within which "
+             "positive evidence is allowed (gate = r + dist_threshold). Default: 100.",
+    )
+    parser.add_argument(
+        "--show-confidence",
+        default=False,
+        action="store_true",
+        help="Visualize gaze-trajectory confidence: draw line from g_{t-1} to each detection center.",
+    )
+    parser.add_argument(
+        "--saccade-threshold", type=float, default=20.0,
+        help="Min gaze displacement (pixels) to treat as a saccade and compute e_dir (default: 5).",
+    )
+    parser.add_argument(
+        "--s-min", "--c-min", type=float, default=0.2, dest="s_min",
+        help="Minimum score threshold for publishing /gaze_label entries (default: 0.2).",
+    )
+    parser.add_argument(
+        "--gain", type=float, default=2.0,
+        help="Evidence gain multiplier. Higher values make confidence respond more strongly to each frame's evidence (default: 2.0).",
     )
     return parser.parse_args()
 
@@ -416,14 +610,15 @@ def main() -> None:
         draw_gaze=args.draw_gaze,
         enable_capture=args.capture,
         model_path=Path(args.model) if args.yolo else None,
-        conf_threshold=args.conf,
+        conf_threshold=args.yolo_conf,
         device=args.device,
-        crop=args.crop,
-        crop_size=args.crop_size,
-        resize_size=args.resize_size,
         filter_labels=args.filter_label,
         capture_interval=args.capture_interval,
         dist_threshold=args.dist_threshold,
+        show_confidence=args.show_confidence,
+        saccade_threshold=args.saccade_threshold,
+        s_min=args.s_min,
+        gain=args.gain,
     )
 
 

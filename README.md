@@ -94,9 +94,12 @@ export CYCLONEDDS_URI=file://$HOME/.ros/cyclonedds.xml
 ```bash
 python3 -m projectaria_eyetracking.gaze_detect --device cuda:0
 
-python3 -m src.gaze_rgb_visualizer --yolo --crop --draw-gaze
+python3 -m src.gaze_rgb_visualizer --yolo --draw-gaze --show-confidence
 
 sudo python3 src/indicator_remapping.py
 
 python3 -m src.audio_record --device-ip 192.168.8.117 --gain 2.0 # press bottom right button
+
+# capture data for training
+python3 -m src.gaze_rgb_visualizer --capture
 ```
