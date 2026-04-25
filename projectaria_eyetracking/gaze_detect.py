@@ -83,15 +83,25 @@ def parse_args() -> argparse.Namespace:
         default="test_homography/homography.txt",
         help="Path to homography matrix file (e.g. test_homography/homography.txt).",
     )
+    parser.add_argument(
+        "--device-ip",
+        type=str,
+        default=None,
+        help="IP address of the Aria device (e.g. 192.168.8.117).",
+    )
     return parser.parse_args()
 
 
-def _load_camera_matrix(undistort_width: int, undistort_height: int):
+def _load_camera_matrix(undistort_width: int, undistort_height: int, device_ip: str | None = None):
     """Load RGB calibration from device and return (rgb_calib, dst_calib, camera_matrix).
     Falls back to a reasonable default if the device connection fails."""
     rgb_calib = None
 
     device_client = aria.DeviceClient()
+    client_config = aria.DeviceClientConfig()
+    if device_ip:
+        client_config.ip_v4_address = device_ip
+    device_client.set_client_config(client_config)
     device = device_client.connect()
     sensors_calib_json = device.streaming_manager.sensors_calibration()
     sensors_calib = device_calibration_from_json_string(sensors_calib_json)
@@ -151,7 +161,7 @@ def main() -> None:
 
     # Load RGB calibration for ArUco-based calibration
     rgb_calib, dst_calib, camera_matrix = _load_camera_matrix(
-        args.undistort_width, args.undistort_height
+        args.undistort_width, args.undistort_height, args.device_ip
     )
     aruco, aruco_dict, aruco_params, aruco_detector = _setup_aruco_detector()
 

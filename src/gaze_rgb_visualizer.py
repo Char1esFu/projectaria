@@ -83,6 +83,7 @@ class GazeOverlay:
 
         # Sticky-Glance confidence field (paper Algorithm 1)
         self.prev_gaze_raw: Optional[tuple[int, int]] = None  # (gx, gy) in display-image coords
+        self._last_det_summary: list[tuple[str, float, float]] = []
         self._confidence: dict[int, float] = {}       # class_id -> c(t,i) in [0, 1]
         self._prev_obj_dist: dict[int, float] = {}    # class_id -> d(t-1) in detection coords
         self._last_frame_time: float = time.monotonic()
@@ -208,6 +209,12 @@ class GazeOverlay:
                     crop_transform=(x_start, y_start, scale),
                 )
                 np.copyto(display_image, annotated)
+            det_summary = []
+            if results[0].boxes is not None:
+                names_map = results[0].names
+                for cid, conf in zip(results[0].boxes.cls.int().tolist(), results[0].boxes.conf.tolist()):
+                    det_summary.append((names_map.get(cid, str(cid)), conf, self._compute_score(cid)))
+            self._last_det_summary = sorted(det_summary, key=lambda x: x[2], reverse=True)
             results[0].boxes = None
         elif self.enable_capture and resized_crop is not None:
             display_image[:] = cv2.resize(resized_crop, (w, h), interpolation=cv2.INTER_LINEAR)
@@ -229,6 +236,21 @@ class GazeOverlay:
             2,
             cv2.LINE_AA,
         )
+        if self._last_det_summary:
+            det_y = 60
+            for det_label, det_conf, det_score in self._last_det_summary:
+                cv2.putText(
+                    display_image,
+                    f"{det_label}  conf={det_conf:.2f}  s={det_score:.2f}",
+                    (10, det_y),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (0, 255, 0),
+                    1,
+                    cv2.LINE_AA,
+                )
+                det_y += 22
+
         if self.draw_gaze and gaze_pt is not None:
             cv2.circle(display_image, gaze_pt, cross_size, color, 2)
             cv2.circle(display_image, gaze_pt, 4, color, -1)
@@ -236,10 +258,11 @@ class GazeOverlay:
         if self.enable_capture:
             capture_text = "CAPTURE: ON (press S to stop)" if self.capture_active else "CAPTURE: OFF (press S to start)"
             capture_color = (0, 255, 0) if self.capture_active else (0, 255, 255)
+            cap_y = 60 + 22 * len(self._last_det_summary)
             cv2.putText(
                 display_image,
                 capture_text,
-                (10, 60),
+                (10, cap_y),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
                 capture_color,
@@ -407,8 +430,7 @@ class GazeOverlay:
                 cx = int((x1 + x2) / 2)
                 cy = int((y1 + y2) / 2)
                 radius = int(math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2) / 2)
-            score = self._compute_score(cid)
-            label = f"{names.get(cid, str(cid))} s={score:.2f}"
+            label = names.get(cid, str(cid))
             cv2.circle(out, (cx, cy), radius, (0, 255, 0), 2, cv2.LINE_AA)
             cv2.putText(out, label, (cx - radius, max(cy - radius - 6, 12)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1, cv2.LINE_AA)
@@ -564,7 +586,7 @@ def parse_args() -> argparse.Namespace:
         help="Enable runtime capture toggle. Press S to start/stop continuous saving to saved_images/.",
     )
     parser.add_argument("--model", type=str, default=str(MODEL_PATH), help="YOLO model path")
-    parser.add_argument("--yolo-conf", type=float, default=0.75, help="YOLO confidence threshold")
+    parser.add_argument("--yolo-conf", type=float, default=0.8, help="YOLO confidence threshold")
     parser.add_argument("--device", type=str, default=None, help="Inference device: cuda / cpu / mps (default: auto)")
     parser.add_argument(
         "--filter-label", type=str, nargs="+", default=["beer bottle", "mayonnaise bottle", "oil bottle", "water bottle"],
