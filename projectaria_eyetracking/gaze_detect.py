@@ -56,13 +56,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--pitch-ema-alpha",
         type=float,
-        default=0.9,
+        default=0.5,
         help="EMA smoothing factor for pitch (0 < alpha <= 1, lower = smoother).",
     )
     parser.add_argument(
         "--yaw-ema-alpha",
         type=float,
-        default=0.9,
+        default=0.5,
         help="EMA smoothing factor for yaw (0 < alpha <= 1, lower = smoother).",
     )
     parser.add_argument(
