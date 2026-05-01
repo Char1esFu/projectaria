@@ -12,7 +12,7 @@ from ultralytics import YOLO
 
 from utils.aria_rgb_stream import AriaRgbStream
 
-MODEL_PATH = Path(__file__).parent.parent / "yolo_model" / "mixed.pt"
+MODEL_PATH = Path(__file__).parent.parent / "yolo_model" / "best_aria.pt"
 CROP_SIZE = 200
 RESIZE_SIZE = 1080
 
@@ -141,6 +141,7 @@ class GazeOverlay:
         gaze_pt: Optional[tuple] = None
         crop_img: Optional[np.ndarray] = None
         resized_crop: Optional[np.ndarray] = None
+        crop_vis: Optional[np.ndarray] = None
         x_start = y_start = cs = 0
         if gaze_valid:
             cs = min(CROP_SIZE, w, h)
@@ -162,6 +163,9 @@ class GazeOverlay:
                 resized_crop = cv2.bilateralFilter(resized_crop, d=5, sigmaColor=15, sigmaSpace=15)
                 blurred = cv2.GaussianBlur(resized_crop, (0, 0), sigmaX=5)
                 resized_crop = cv2.addWeighted(resized_crop, 5, blurred, -4, 0)
+                resized_crop = cv2.convertScaleAbs(resized_crop, alpha=1.2, beta=30)
+                
+
 
             results = self.model(resized_crop, conf=self.conf_threshold, device=self.yolo_device, verbose=False)
             self._filter_results(results[0])
@@ -197,6 +201,12 @@ class GazeOverlay:
                     det_summary.append((names_map.get(cid, str(cid)), conf, score))
 
             self._last_det_summary = sorted(det_summary, key=lambda x: x[2], reverse=True)
+            crop_vis = self._draw_circles(resized_crop, results[0])
+            vis_y = 18
+            for det_label, det_conf, det_score in self._last_det_summary:
+                cv2.putText(crop_vis, f"{det_label}  conf={det_conf:.2f}  s={det_score:.2f}",
+                            (6, vis_y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1, cv2.LINE_AA)
+                vis_y += 18
             self._publish_labels(det_summary)
             results[0].boxes = None
         elif self.enable_capture and resized_crop is not None:
@@ -233,6 +243,9 @@ class GazeOverlay:
                     cv2.LINE_AA,
                 )
                 det_y += 22
+
+        if crop_vis is not None:
+            cv2.imshow("YOLO Crop", crop_vis)
 
         if self.draw_gaze and gaze_pt is not None:
             cv2.circle(display_image, gaze_pt, cross_size, color, 2)
@@ -442,7 +455,7 @@ def parse_args() -> argparse.Namespace:
              "Score = 0 when d >= r + dist_threshold. Default: 100.",
     )
     parser.add_argument(
-        "--s-min", type=float, default=0.2, dest="s_min",
+        "--s-min", type=float, default=0.0, dest="s_min",
         help="Minimum score threshold for publishing /gaze_label entries (default: 0.2).",
     )
     return parser.parse_args()
