@@ -31,7 +31,8 @@ class GazeOverlay:
         device: Optional[str] = None,
         filter_labels: Optional[list[str]] = None,
         capture_interval: float = 0.0,
-        dist_threshold: float = 200.0,
+        dist_threshold: float = 1080.0,
+        std_dist: float = 200.0,
         s_min: float = 0.3,
     ) -> None:
         self.gaze_pitch: float = 0.0
@@ -75,8 +76,9 @@ class GazeOverlay:
         # Labels to filter out from YOLO results
         self.filter_labels: set[str] = set(l.lower() for l in (filter_labels or []))
 
-        # Score = 0 when gaze distance >= r + dist_threshold
+        # Score = 0 when gaze distance from bbox center >= dist_threshold
         self.dist_threshold = dist_threshold
+        self.std_dist: float = std_dist
         self.s_min: float = s_min
         self._last_det_summary: list[tuple[str, float, float]] = []
 
@@ -195,16 +197,15 @@ class GazeOverlay:
                     x1, y1, x2, y2 = xyxy
                     ocx = (x1 + x2) / 2.0
                     ocy = (y1 + y2) / 2.0
-                    r = math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2) / 2.0
                     d = math.sqrt((gaze_in_crop[0] - ocx) ** 2 + (gaze_in_crop[1] - ocy) ** 2)
-                    score = self._compute_score(d, r)
+                    score = self._compute_score(d)
                     det_summary.append((names_map.get(cid, str(cid)), conf, score))
 
             self._last_det_summary = sorted(det_summary, key=lambda x: x[2], reverse=True)
             crop_vis = self._draw_circles(resized_crop, results[0])
             vis_y = 18
-            for det_label, det_conf, det_score in self._last_det_summary:
-                cv2.putText(crop_vis, f"{det_label}  conf={det_conf:.2f}  s={det_score:.2f}",
+            for det_label, _, det_score in self._last_det_summary:
+                cv2.putText(crop_vis, f"{det_label}  score={det_score:.2f}",
                             (6, vis_y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1, cv2.LINE_AA)
                 vis_y += 18
             self._publish_labels(det_summary)
@@ -231,10 +232,10 @@ class GazeOverlay:
         )
         if self._last_det_summary:
             det_y = 60
-            for det_label, det_conf, det_score in self._last_det_summary:
+            for det_label, _, det_score in self._last_det_summary:
                 cv2.putText(
                     display_image,
-                    f"{det_label}  conf={det_conf:.2f}  s={det_score:.2f}",
+                    f"{det_label}  score={det_score:.2f}",
                     (10, det_y),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.55,
@@ -279,12 +280,11 @@ class GazeOverlay:
     # Score and publish helpers
     # ------------------------------------------------------------------
 
-    def _compute_score(self, d: float, r: float) -> float:
-        """Distance-based score: 1.0 at bbox center, 0.0 at r + dist_threshold, linear."""
-        effective_radius = r + self.dist_threshold
-        if d >= effective_radius:
+    def _compute_score(self, d: float) -> float:
+        """Gaussian score based on distance from bbox center; 0.0 when d >= dist_threshold."""
+        if d >= self.dist_threshold:
             return 0.0
-        return 1.0 - d / effective_radius
+        return math.exp(-(d ** 2) / (2 * self.std_dist ** 2))
 
     def _publish_labels(self, det_summary: list[tuple[str, float, float]]) -> None:
         """Publish {"label", "score"} for detections with score >= s_min, sorted descending."""
@@ -376,7 +376,8 @@ def run_gaze_rgb_visualizer(
     device: Optional[str] = None,
     filter_labels: Optional[list[str]] = None,
     capture_interval: float = 0.0,
-    dist_threshold: float = 200.0,
+    dist_threshold: float = 1080.0,
+    std_dist: float = 200.0,
     s_min: float = 0.3,
 ) -> None:
     overlay = GazeOverlay(
@@ -390,6 +391,7 @@ def run_gaze_rgb_visualizer(
         filter_labels=filter_labels,
         capture_interval=capture_interval,
         dist_threshold=dist_threshold,
+        std_dist=std_dist,
         s_min=s_min,
     )
     stream = AriaRgbStream(
@@ -450,9 +452,12 @@ def parse_args() -> argparse.Namespace:
         help="Minimum time interval (seconds) between saved frames. 0 = save every frame.",
     )
     parser.add_argument(
-        "--dist-threshold", type=float, default=100.0,
-        help="Pixel margin beyond each object's bounding circle radius. "
-             "Score = 0 when d >= r + dist_threshold. Default: 100.",
+        "--dist-threshold", type=float, default=1080.0,
+        help="Max distance (pixels) from bbox center to gaze point. Score = 0 when d >= dist_threshold. Default: 200.",
+    )
+    parser.add_argument(
+        "--std-dist", type=float, default=200.0, dest="std_dist",
+        help="Gaussian std (pixels) for score falloff within dist_threshold. Default: 80.",
     )
     parser.add_argument(
         "--s-min", type=float, default=0.0, dest="s_min",
@@ -476,6 +481,7 @@ def main() -> None:
         filter_labels=args.filter_label,
         capture_interval=args.capture_interval,
         dist_threshold=args.dist_threshold,
+        std_dist=args.std_dist,
         s_min=args.s_min,
     )
 

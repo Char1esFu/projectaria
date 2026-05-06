@@ -4,7 +4,7 @@ uv venv .venv -p 3.10
 source .venv/bin/activate
 
 uv pip install --upgrade pip
-uv pip install setuptools
+uv pip install setuptools wheel
 uv pip install -r requirements.txt --no-build-isolation
 uv pip install projectaria_client_sdk==1.1.0 --no-cache-dir --prerelease=allow
 uv pip install "ultralytics>=8.3"
@@ -102,4 +102,18 @@ python3 -m src.audio_record --device-ip 192.168.8.117 --gain 2.0 # press bottom 
 
 # capture data for training
 python3 -m src.gaze_rgb_visualizer --capture
+
+# test sam3
+uv venv ~/venv/sam3_env -p 3.10
+source ~/venv/sam3_env/bin/activate
+
+uv pip install --upgrade pip
+uv pip install setuptools wheel
+uv pip install -r requirements_sam.txt
+uv pip install torch==2.5.0+cu124 torchvision==0.20.0+cu124 \
+  --index-url https://download.pytorch.org/whl/cu124
+uv pip install projectaria_client_sdk==1.1.0 --no-cache-dir --prerelease=allow
+uv pip install "ultralytics>=8.3"
+
+python3 -m src.yolo_sam3_stream
 ```
