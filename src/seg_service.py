@@ -7,7 +7,7 @@ YOLO + SAM3 on the latest RGB frame and publish a masked point cloud on
 Requirements:
   ultralytics >= 8.3.237   (pip install -U ultralytics)
   sam3.pt checkpoint downloaded from https://huggingface.co/facebook/sam3
-    and placed at yolo_model/sam3.pt  (or set --sam-model)
+    and placed at yolo_model/sam3.pt
 
 Service:
   /seg/infer  (std_srvs/srv/Trigger)  – start inference; returns immediately
@@ -21,9 +21,7 @@ Publications:
   /seg/point_cloud  (sensor_msgs/PointCloud2)
 
 CLI arguments:
-  --visualize        show SAM3 mask overlay
-  --use-text-prompt  skip YOLO, use SAM3 text prompt directly
-  --sam-model PATH   path to sam3.pt  (default: yolo_model/sam3.pt)
+  --visualize  show SAM3 mask overlay
 
 ROS parameters:
   target_label – object label to segment   (set before calling /seg/infer)
@@ -115,11 +113,10 @@ def _make_overlay(bgr: np.ndarray, mask: np.ndarray,
 
 
 class SegServiceNode(Node):
-    def __init__(self, visualize: bool, text_only: bool, sam_model: str) -> None:
+    def __init__(self, visualize: bool) -> None:
         super().__init__("seg_service")
 
         self._visualize = visualize
-        self._text_only = text_only
 
         self.declare_parameter("target_label", "")
         self.declare_parameter("yolo_model",  YOLO_MODEL_DEFAULT)
@@ -133,31 +130,18 @@ class SegServiceNode(Node):
         import torch
         self._device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        if not self._text_only:
-            self.get_logger().info(f"Loading YOLO: {yolo_path}")
-            from ultralytics import YOLO
-            self._yolo = YOLO(yolo_path)
-        else:
-            self._yolo = None
+        self.get_logger().info(f"Loading YOLO: {yolo_path}")
+        from ultralytics import YOLO
+        self._yolo = YOLO(yolo_path)
 
-        self.get_logger().info(f"Loading SAM3: {sam_model}")
-        if self._text_only:
-            from ultralytics.models.sam import SAM3SemanticPredictor
-            self._sam3 = SAM3SemanticPredictor(
-                overrides={"model": sam_model, "verbose": False}
-            )
-        else:
-            from ultralytics import SAM
-            self._sam3 = SAM(sam_model)
+        self.get_logger().info(f"Loading SAM3: {SAM3_MODEL_DEFAULT}")
+        from ultralytics import SAM
+        self._sam3 = SAM(SAM3_MODEL_DEFAULT)
 
         self.get_logger().info("Warming up models (first CUDA init)...")
         _dummy = np.zeros((644, 644, 3), dtype=np.uint8)
-        if self._yolo is not None:
-            self._yolo(_dummy, conf=self._conf, verbose=False, device=self._device)
-        if self._text_only:
-            self._sam3.set_image(_dummy)
-        else:
-            self._sam3(_dummy, bboxes=[[0, 0, 100, 100]], verbose=False)
+        self._yolo(_dummy, conf=self._conf, verbose=False, device=self._device)
+        self._sam3(_dummy, bboxes=[[0, 0, 100, 100]], verbose=False)
         self.get_logger().info("Models ready.")
 
         self._bridge    = CvBridge()
@@ -178,8 +162,7 @@ class SegServiceNode(Node):
 
         self._pc_pub = self.create_publisher(PointCloud2, "/seg/point_cloud", 10)
 
-        mode = ("text-prompt" if self._text_only else "YOLO+SAM3-box") + \
-               (" +visualize" if self._visualize else "")
+        mode = "YOLO+SAM3-box" + (" +visualize" if self._visualize else "")
         self.get_logger().info(f"SegService ready [{mode}] – call /seg/infer to trigger")
 
     # ------------------------------------------------------------------ #
@@ -264,53 +247,40 @@ class SegServiceNode(Node):
             best_box = None  # kept for visualisation
 
             # ---- segmentation -----------------------------------------
-            if self._text_only:
-                self._sam3.set_image(bgr)
-                results = self._sam3(text=[label])
-                if not results or results[0].masks is None:
-                    self.get_logger().warn(f"SAM3 text prompt found nothing for '{label}'")
-                    return
-                masks_data = results[0].masks.data.cpu().numpy()  # (N, H, W)
-                mask = masks_data.any(axis=0).astype(bool)        # union of instances
-                self.get_logger().info(
-                    f"SAM3 text-prompt: {len(masks_data)} instance(s) for '{label}'"
+            results = self._yolo(bgr, conf=self._conf, verbose=False, device=self._device)
+            best_conf = 0.0
+            label_lc  = label.lower()
+            for r in results:
+                if r.boxes is None:
+                    continue
+                for i, cls_id in enumerate(r.boxes.cls.int().tolist()):
+                    cls_name = self._yolo.names[cls_id].lower()
+                    if label_lc in cls_name or cls_name in label_lc:
+                        c = float(r.boxes.conf[i])
+                        if c > best_conf:
+                            best_conf = c
+                            best_box  = r.boxes.xyxy[i].cpu().tolist()
+
+            if best_box is None:
+                self.get_logger().warn(
+                    f"YOLO found nothing for '{label}' "
+                    f"(known: {list(self._yolo.names.values())})"
                 )
+                return
+            self.get_logger().info(
+                f"YOLO: '{label}'  conf={best_conf:.2f}  "
+                f"box=[{', '.join(f'{v:.0f}' for v in best_box)}]"
+            )
 
-            else:
-                results = self._yolo(bgr, conf=self._conf, verbose=False, device=self._device)
-                best_conf = 0.0
-                label_lc  = label.lower()
-                for r in results:
-                    if r.boxes is None:
-                        continue
-                    for i, cls_id in enumerate(r.boxes.cls.int().tolist()):
-                        cls_name = self._yolo.names[cls_id].lower()
-                        if label_lc in cls_name or cls_name in label_lc:
-                            c = float(r.boxes.conf[i])
-                            if c > best_conf:
-                                best_conf = c
-                                best_box  = r.boxes.xyxy[i].cpu().tolist()
-
-                if best_box is None:
-                    self.get_logger().warn(
-                        f"YOLO found nothing for '{label}' "
-                        f"(known: {list(self._yolo.names.values())})"
-                    )
-                    return
-                self.get_logger().info(
-                    f"YOLO: '{label}'  conf={best_conf:.2f}  "
-                    f"box=[{', '.join(f'{v:.0f}' for v in best_box)}]"
-                )
-
-                results = self._sam3(bgr, bboxes=[best_box])
-                if not results or results[0].masks is None:
-                    self.get_logger().warn("SAM3 returned no mask for the bbox.")
-                    return
-                masks_data = results[0].masks.data.cpu().numpy()  # (N, H, W)
-                # pick highest-score mask when multiple are returned
-                scores = results[0].boxes.conf if results[0].boxes is not None else None
-                best_idx = int(scores.cpu().argmax()) if scores is not None else 0
-                mask = masks_data[best_idx].astype(bool)
+            results = self._sam3(bgr, bboxes=[best_box])
+            if not results or results[0].masks is None:
+                self.get_logger().warn("SAM3 returned no mask for the bbox.")
+                return
+            masks_data = results[0].masks.data.cpu().numpy()  # (N, H, W)
+            # pick highest-score mask when multiple are returned
+            scores = results[0].boxes.conf if results[0].boxes is not None else None
+            best_idx = int(scores.cpu().argmax()) if scores is not None else 0
+            mask = masks_data[best_idx].astype(bool)
 
             # ---- depth back-projection ---------------------------------
             K  = np.array(cam_info.k).reshape(3, 3)
@@ -369,20 +339,12 @@ class SegServiceNode(Node):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="SegService: YOLO+SAM3 → PointCloud2")
-    parser.add_argument("--visualize",       action="store_true",
+    parser.add_argument("--visualize", action="store_true",
                         help="show SAM3 mask overlay; publish after window is closed")
-    parser.add_argument("--use-text-prompt", action="store_true",
-                        help="use SAM3 text prompt directly instead of YOLO bbox")
-    parser.add_argument("--sam-model",       default=SAM3_MODEL_DEFAULT,
-                        help=f"path to sam3.pt (default: {SAM3_MODEL_DEFAULT})")
     args, _ = parser.parse_known_args()   # leave --ros-args untouched
 
     rclpy.init()
-    node = SegServiceNode(
-        visualize=args.visualize,
-        text_only=args.use_text_prompt,
-        sam_model=args.sam_model,
-    )
+    node = SegServiceNode(visualize=args.visualize)
     executor = MultiThreadedExecutor()
     executor.add_node(node)
     try:
