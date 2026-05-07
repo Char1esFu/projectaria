@@ -76,6 +76,9 @@ def _run_visualizer(viz_queue: "queue.Queue") -> None:
     opt.background_color = np.array([0.1, 0.1, 0.1])
     opt.point_size = 2.0
 
+    axes = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1, origin=[0, 0, 0])
+    vis.add_geometry(axes)
+
     pcd = o3d.geometry.PointCloud()
     geometry_added = False
 
