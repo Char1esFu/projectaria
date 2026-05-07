@@ -15,7 +15,6 @@ Service:
 Subscriptions:
   /zedr/zed_node/rgb/image_rect_color      (sensor_msgs/Image)
   /zedr/zed_node/depth/depth_registered    (sensor_msgs/Image)
-  /zedr/zed_node/rgb/camera_info           (sensor_msgs/CameraInfo)
 
 Publications:
   /seg/point_cloud  (sensor_msgs/PointCloud2)
@@ -46,7 +45,7 @@ import rclpy
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from cv_bridge import CvBridge
-from sensor_msgs.msg import CameraInfo, Image, PointCloud2, PointField
+from sensor_msgs.msg import Image, PointCloud2, PointField
 from std_srvs.srv import Trigger
 
 YOLO_MODEL_DEFAULT = str(Path(__file__).parent.parent / "yolo_model" / "mixed.pt")
@@ -55,6 +54,12 @@ _VIZ_WIN = "SAM3 – mask preview  (close or press ESC to publish)"
 
 # Labels that use the ZED camera; everything else uses RealSense
 ZED_LABELS = {"tomato", "banana"}
+
+# Hardcoded camera intrinsics (fx, fy, cx, cy)
+# RealSense color camera – 640×480
+_RS_INTR  = (603.6532592773438, 602.72119140625, 326.14337158203125, 242.20367431640625)
+# ZED left RGB camera – 1920×1080
+_ZED_INTR = (1058.777587890625, 1058.777587890625, 963.07470703125, 522.35302734375)
 
 
 def _build_pointcloud2(header, points_xyz: np.ndarray,
@@ -121,14 +126,18 @@ class SegServiceNode(Node):
 
         self._visualize = visualize
 
-        self.declare_parameter("target_label", "")
-        self.declare_parameter("yolo_model",  YOLO_MODEL_DEFAULT)
-        self.declare_parameter("yolo_conf",   0.25)
-        self.declare_parameter("depth_scale", 1000.0)
+        self.declare_parameter("target_label",   "")
+        self.declare_parameter("yolo_model",     YOLO_MODEL_DEFAULT)
+        self.declare_parameter("yolo_conf",      0.25)
+        self.declare_parameter("depth_scale",    1000.0)
+        self.declare_parameter("downsample_rs",  0.5)   # fraction of points to keep (RealSense)
+        self.declare_parameter("downsample_zed", 0.05)   # fraction of points to keep (ZED)
 
-        yolo_path    = self.get_parameter("yolo_model").get_parameter_value().string_value
-        self._conf   = self.get_parameter("yolo_conf").get_parameter_value().double_value
-        self._dscale = self.get_parameter("depth_scale").get_parameter_value().double_value
+        yolo_path         = self.get_parameter("yolo_model").get_parameter_value().string_value
+        self._conf        = self.get_parameter("yolo_conf").get_parameter_value().double_value
+        self._dscale      = self.get_parameter("depth_scale").get_parameter_value().double_value
+        self._ds_rs       = self.get_parameter("downsample_rs").get_parameter_value().double_value
+        self._ds_zed      = self.get_parameter("downsample_zed").get_parameter_value().double_value
 
         import torch
         self._device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -150,14 +159,12 @@ class SegServiceNode(Node):
         self._bridge = CvBridge()
 
         # RealSense frames
-        self._rgb_msg_rs:   Image      | None = None
-        self._depth_msg_rs: Image      | None = None
-        self._cam_info_rs:  CameraInfo | None = None
+        self._rgb_msg_rs:   Image | None = None
+        self._depth_msg_rs: Image | None = None
 
         # ZED frames
-        self._rgb_msg_zed:   Image      | None = None
-        self._depth_msg_zed: Image      | None = None
-        self._cam_info_zed:  CameraInfo | None = None
+        self._rgb_msg_zed:   Image | None = None
+        self._depth_msg_zed: Image | None = None
 
         self._lock = threading.Lock()
         self._busy = False
@@ -166,20 +173,16 @@ class SegServiceNode(Node):
         self.create_service(Trigger, "/seg/infer", self._handle_infer)
 
         # RealSense subscriptions
-        self.create_subscription(Image,      "/camera/camera/color/image_raw",
+        self.create_subscription(Image, "/camera/camera/color/image_raw",
                                  self._on_rgb_rs, 10)
-        self.create_subscription(Image,      "/camera/camera/aligned_depth_to_color/image_raw",
+        self.create_subscription(Image, "/camera/camera/aligned_depth_to_color/image_raw",
                                  self._on_depth_rs, 10)
-        self.create_subscription(CameraInfo, "/camera/camera/color/camera_info",
-                                 self._on_cam_info_rs, 10)
 
-        # ZED subscriptions (topic names TBD – update after verification)
-        self.create_subscription(Image,      "/zed/zed_node/rgb/image_rect_color",
+        # ZED subscriptions
+        self.create_subscription(Image, "/zedr/zed_node/rgb/image_rect_color",
                                  self._on_rgb_zed, 10)
-        self.create_subscription(Image,      "/zed/zed_node/depth/depth_registered",
+        self.create_subscription(Image, "/zedr/zed_node/depth/depth_registered",
                                  self._on_depth_zed, 10)
-        self.create_subscription(CameraInfo, "/zed/zed_node/rgb/camera_info",
-                                 self._on_cam_info_zed, 10)
 
         self._pc_pub = self.create_publisher(PointCloud2, "/seg/point_cloud", 10)
 
@@ -201,10 +204,6 @@ class SegServiceNode(Node):
         with self._lock:
             self._depth_msg_rs = msg
 
-    def _on_cam_info_rs(self, msg: CameraInfo) -> None:
-        with self._lock:
-            self._cam_info_rs = msg
-
     def _on_rgb_zed(self, msg: Image) -> None:
         with self._lock:
             self._rgb_msg_zed = msg
@@ -212,10 +211,6 @@ class SegServiceNode(Node):
     def _on_depth_zed(self, msg: Image) -> None:
         with self._lock:
             self._depth_msg_zed = msg
-
-    def _on_cam_info_zed(self, msg: CameraInfo) -> None:
-        with self._lock:
-            self._cam_info_zed = msg
 
     # ------------------------------------------------------------------ #
     #  Service handler                                                     #
@@ -242,11 +237,9 @@ class SegServiceNode(Node):
             if use_zed:
                 rgb_msg   = self._rgb_msg_zed
                 depth_msg = self._depth_msg_zed
-                cam_info  = self._cam_info_zed
             else:
                 rgb_msg   = self._rgb_msg_rs
                 depth_msg = self._depth_msg_rs
-                cam_info  = self._cam_info_rs
 
         if rgb_msg is None:
             response.success = False
@@ -256,15 +249,11 @@ class SegServiceNode(Node):
             response.success = False
             response.message = f"Depth image not yet received ({cam_name})"
             return response
-        if cam_info is None:
-            response.success = False
-            response.message = f"CameraInfo not yet received ({cam_name})"
-            return response
 
         self._busy = True
         threading.Thread(
             target=self._infer,
-            args=(label, rgb_msg, depth_msg, cam_info),
+            args=(label, rgb_msg, depth_msg, use_zed),
             daemon=True,
         ).start()
 
@@ -285,7 +274,7 @@ class SegServiceNode(Node):
         label:     str,
         rgb_msg:   Image,
         depth_msg: Image,
-        cam_info:  CameraInfo,
+        use_zed:   bool,
     ) -> None:
         released = False
         try:
@@ -330,9 +319,7 @@ class SegServiceNode(Node):
             mask = masks_data[best_idx].astype(bool)
 
             # ---- depth back-projection ---------------------------------
-            K  = np.array(cam_info.k).reshape(3, 3)
-            fx, fy = K[0, 0], K[1, 1]
-            cx, cy = K[0, 2], K[1, 2]
+            fx, fy, cx, cy = _ZED_INTR if use_zed else _RS_INTR
 
             if depth_msg.encoding == "32FC1":
                 depth_f = depth.astype(np.float32)
@@ -347,6 +334,12 @@ class SegServiceNode(Node):
             if len(xs) == 0:
                 self.get_logger().warn("Mask obtained but all depth values are invalid.")
                 return
+
+            ds_ratio = self._ds_zed if use_zed else self._ds_rs
+            if ds_ratio < 1.0 and len(xs) > 1:
+                keep = max(1, int(len(xs) * ds_ratio))
+                idx  = np.random.choice(len(xs), keep, replace=False)
+                xs, ys, d_vals = xs[idx], ys[idx], d_vals[idx]
 
             pts = np.column_stack([
                 (xs - cx) * d_vals / fx,
