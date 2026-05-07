@@ -70,7 +70,7 @@ class PCVizNode(Node):
 def _run_visualizer(viz_queue: "queue.Queue") -> None:
     """Main thread: Open3D render loop. Open3D GUI must run on the main thread."""
     vis = o3d.visualization.Visualizer()
-    vis.create_window("Point Cloud – /seg/point_cloud", width=1280, height=720)
+    vis.create_window("Point Cloud – /seg/point_cloud", width=720, height=480)
 
     opt = vis.get_render_option()
     opt.background_color = np.array([0.1, 0.1, 0.1])

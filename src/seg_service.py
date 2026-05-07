@@ -53,6 +53,9 @@ YOLO_MODEL_DEFAULT = str(Path(__file__).parent.parent / "yolo_model" / "mixed.pt
 SAM3_MODEL_DEFAULT = str(Path(__file__).parent.parent / "yolo_model" / "sam3.pt")
 _VIZ_WIN = "SAM3 – mask preview  (close or press ESC to publish)"
 
+# Labels that use the ZED camera; everything else uses RealSense
+ZED_LABELS = {"tomato", "banana"}
+
 
 def _build_pointcloud2(header, points_xyz: np.ndarray,
                        rgb_packed: np.ndarray | None = None) -> PointCloud2:
@@ -144,42 +147,75 @@ class SegServiceNode(Node):
         self._sam3(_dummy, bboxes=[[0, 0, 100, 100]], verbose=False)
         self.get_logger().info("Models ready.")
 
-        self._bridge    = CvBridge()
-        self._rgb_msg:   Image      | None = None
-        self._depth_msg: Image      | None = None
-        self._cam_info:  CameraInfo | None = None
+        self._bridge = CvBridge()
+
+        # RealSense frames
+        self._rgb_msg_rs:   Image      | None = None
+        self._depth_msg_rs: Image      | None = None
+        self._cam_info_rs:  CameraInfo | None = None
+
+        # ZED frames
+        self._rgb_msg_zed:   Image      | None = None
+        self._depth_msg_zed: Image      | None = None
+        self._cam_info_zed:  CameraInfo | None = None
+
         self._lock = threading.Lock()
         self._busy = False
         self._viz_queue: queue.Queue = queue.Queue()
 
         self.create_service(Trigger, "/seg/infer", self._handle_infer)
+
+        # RealSense subscriptions
         self.create_subscription(Image,      "/camera/camera/color/image_raw",
-                                 self._on_rgb, 10)
+                                 self._on_rgb_rs, 10)
         self.create_subscription(Image,      "/camera/camera/aligned_depth_to_color/image_raw",
-                                 self._on_depth, 10)
+                                 self._on_depth_rs, 10)
         self.create_subscription(CameraInfo, "/camera/camera/color/camera_info",
-                                 self._on_cam_info, 10)
+                                 self._on_cam_info_rs, 10)
+
+        # ZED subscriptions (topic names TBD – update after verification)
+        self.create_subscription(Image,      "/zed/zed_node/rgb/image_rect_color",
+                                 self._on_rgb_zed, 10)
+        self.create_subscription(Image,      "/zed/zed_node/depth/depth_registered",
+                                 self._on_depth_zed, 10)
+        self.create_subscription(CameraInfo, "/zed/zed_node/rgb/camera_info",
+                                 self._on_cam_info_zed, 10)
 
         self._pc_pub = self.create_publisher(PointCloud2, "/seg/point_cloud", 10)
 
         mode = "YOLO+SAM3-box" + (" +visualize" if self._visualize else "")
-        self.get_logger().info(f"SegService ready [{mode}] – call /seg/infer to trigger")
+        self.get_logger().info(
+            f"SegService ready [{mode}] – call /seg/infer to trigger  "
+            f"(ZED labels: {ZED_LABELS})"
+        )
 
     # ------------------------------------------------------------------ #
     #  Image / info callbacks                                              #
     # ------------------------------------------------------------------ #
 
-    def _on_rgb(self, msg: Image) -> None:
+    def _on_rgb_rs(self, msg: Image) -> None:
         with self._lock:
-            self._rgb_msg = msg
+            self._rgb_msg_rs = msg
 
-    def _on_depth(self, msg: Image) -> None:
+    def _on_depth_rs(self, msg: Image) -> None:
         with self._lock:
-            self._depth_msg = msg
+            self._depth_msg_rs = msg
 
-    def _on_cam_info(self, msg: CameraInfo) -> None:
+    def _on_cam_info_rs(self, msg: CameraInfo) -> None:
         with self._lock:
-            self._cam_info = msg
+            self._cam_info_rs = msg
+
+    def _on_rgb_zed(self, msg: Image) -> None:
+        with self._lock:
+            self._rgb_msg_zed = msg
+
+    def _on_depth_zed(self, msg: Image) -> None:
+        with self._lock:
+            self._depth_msg_zed = msg
+
+    def _on_cam_info_zed(self, msg: CameraInfo) -> None:
+        with self._lock:
+            self._cam_info_zed = msg
 
     # ------------------------------------------------------------------ #
     #  Service handler                                                     #
@@ -199,22 +235,30 @@ class SegServiceNode(Node):
             response.message = "Previous inference still running"
             return response
 
+        use_zed = label.lower() in ZED_LABELS
+        cam_name = "ZED" if use_zed else "RealSense"
+
         with self._lock:
-            rgb_msg   = self._rgb_msg
-            depth_msg = self._depth_msg
-            cam_info  = self._cam_info
+            if use_zed:
+                rgb_msg   = self._rgb_msg_zed
+                depth_msg = self._depth_msg_zed
+                cam_info  = self._cam_info_zed
+            else:
+                rgb_msg   = self._rgb_msg_rs
+                depth_msg = self._depth_msg_rs
+                cam_info  = self._cam_info_rs
 
         if rgb_msg is None:
             response.success = False
-            response.message = "RGB image not yet received"
+            response.message = f"RGB image not yet received ({cam_name})"
             return response
         if depth_msg is None:
             response.success = False
-            response.message = "Depth image not yet received"
+            response.message = f"Depth image not yet received ({cam_name})"
             return response
         if cam_info is None:
             response.success = False
-            response.message = "CameraInfo not yet received"
+            response.message = f"CameraInfo not yet received ({cam_name})"
             return response
 
         self._busy = True
@@ -225,8 +269,11 @@ class SegServiceNode(Node):
         ).start()
 
         response.success = True
-        response.message = f"Inference started for '{label}'"
-        self.get_logger().info(f"_handle_infer returned in {(time.monotonic()-t0)*1000:.1f} ms")
+        response.message = f"Inference started for '{label}' via {cam_name}"
+        self.get_logger().info(
+            f"_handle_infer returned in {(time.monotonic()-t0)*1000:.1f} ms  "
+            f"[camera={cam_name}]"
+        )
         return response
 
     # ------------------------------------------------------------------ #
