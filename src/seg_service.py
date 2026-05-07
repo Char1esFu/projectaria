@@ -44,8 +44,8 @@ import numpy as np
 import rclpy
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from cv_bridge import CvBridge
-from sensor_msgs.msg import Image, PointCloud2, PointField
+from sensor_msgs.msg import PointCloud2, PointField
+from std_msgs.msg import Header
 from std_srvs.srv import Trigger
 
 YOLO_MODEL_DEFAULT = str(Path(__file__).parent.parent / "yolo_model" / "mixed.pt")
@@ -59,7 +59,24 @@ ZED_LABELS = {"tomato", "banana"}
 # RealSense color camera – 640×480
 _RS_INTR  = (603.6532592773438, 602.72119140625, 326.14337158203125, 242.20367431640625)
 # ZED left RGB camera – 1920×1080
-_ZED_INTR = (1058.777587890625, 1058.777587890625, 963.07470703125, 522.35302734375)
+_ZED_INTR = (1059.9764404296875, 1059.9764404296875, 963.07568359375, 522.3530883789062)
+
+
+def _quat_to_rot(x: float, y: float, z: float, w: float) -> np.ndarray:
+    """Quaternion [x,y,z,w] → 3×3 rotation matrix."""
+    return np.array([
+        [1-2*(y*y+z*z),   2*(x*y-w*z),   2*(x*z+w*y)],
+        [  2*(x*y+w*z), 1-2*(x*x+z*z),   2*(y*z-w*x)],
+        [  2*(x*z-w*y),   2*(y*z+w*x), 1-2*(x*x+y*y)],
+    ], dtype=np.float64)
+
+
+# Camera extrinsics: R_wc (camera→world rotation), t_wc (camera→world translation)
+_RS_R_WC  = _quat_to_rot(0.305,  0.936, -0.106, -0.141)
+_RS_T_WC  = np.array([0.939, 0.364, 0.967], dtype=np.float64)
+
+_ZED_R_WC = _quat_to_rot(0.212,  0.882, -0.373, -0.196)
+_ZED_T_WC = np.array([0.836, 0.477, 0.328], dtype=np.float64)
 
 
 def _build_pointcloud2(header, points_xyz: np.ndarray,
@@ -126,18 +143,22 @@ class SegServiceNode(Node):
 
         self._visualize = visualize
 
-        self.declare_parameter("target_label",   "")
+        self.declare_parameter("target_label",     "")
         self.declare_parameter("yolo_model",     YOLO_MODEL_DEFAULT)
-        self.declare_parameter("yolo_conf",      0.25)
+        self.declare_parameter("yolo_conf",      0.75)
         self.declare_parameter("depth_scale",    1000.0)
-        self.declare_parameter("downsample_rs",  0.5)   # fraction of points to keep (RealSense)
-        self.declare_parameter("downsample_zed", 0.05)   # fraction of points to keep (ZED)
+        # Both cameras read from files on mosaic via SCP (avoids ROS topic bandwidth on LAN)
+        self.declare_parameter("remote_host",         "mosaic")
+        self.declare_parameter("rs_rgb_file",         "~/mosaic/manipulation_ws/saved_images/rs_rgb.png")
+        self.declare_parameter("rs_depth_file",       "~/mosaic/manipulation_ws/saved_images/rs_depth.npy")
+        self.declare_parameter("rs_depth_encoding",   "16UC1")  # RealSense depth is in millimeters
+        self.declare_parameter("zed_rgb_file",        "~/mosaic/manipulation_ws/saved_images/r_rgb.png")
+        self.declare_parameter("zed_depth_file",      "~/mosaic/manipulation_ws/saved_images/r_depth.npy")
+        self.declare_parameter("zed_depth_encoding",  "16UC1")  # PNG = uint16 mm
 
         yolo_path         = self.get_parameter("yolo_model").get_parameter_value().string_value
         self._conf        = self.get_parameter("yolo_conf").get_parameter_value().double_value
         self._dscale      = self.get_parameter("depth_scale").get_parameter_value().double_value
-        self._ds_rs       = self.get_parameter("downsample_rs").get_parameter_value().double_value
-        self._ds_zed      = self.get_parameter("downsample_zed").get_parameter_value().double_value
 
         import torch
         self._device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -156,33 +177,10 @@ class SegServiceNode(Node):
         self._sam3(_dummy, bboxes=[[0, 0, 100, 100]], verbose=False)
         self.get_logger().info("Models ready.")
 
-        self._bridge = CvBridge()
-
-        # RealSense frames
-        self._rgb_msg_rs:   Image | None = None
-        self._depth_msg_rs: Image | None = None
-
-        # ZED frames
-        self._rgb_msg_zed:   Image | None = None
-        self._depth_msg_zed: Image | None = None
-
-        self._lock = threading.Lock()
         self._busy = False
         self._viz_queue: queue.Queue = queue.Queue()
 
         self.create_service(Trigger, "/seg/infer", self._handle_infer)
-
-        # RealSense subscriptions
-        self.create_subscription(Image, "/camera/camera/color/image_raw",
-                                 self._on_rgb_rs, 10)
-        self.create_subscription(Image, "/camera/camera/aligned_depth_to_color/image_raw",
-                                 self._on_depth_rs, 10)
-
-        # ZED subscriptions
-        self.create_subscription(Image, "/zedr/zed_node/rgb/image_rect_color",
-                                 self._on_rgb_zed, 10)
-        self.create_subscription(Image, "/zedr/zed_node/depth/depth_registered",
-                                 self._on_depth_zed, 10)
 
         self._pc_pub = self.create_publisher(PointCloud2, "/seg/point_cloud", 10)
 
@@ -193,24 +191,58 @@ class SegServiceNode(Node):
         )
 
     # ------------------------------------------------------------------ #
-    #  Image / info callbacks                                              #
+    #  File-based image loading (both cameras read from mosaic via SCP)   #
     # ------------------------------------------------------------------ #
 
-    def _on_rgb_rs(self, msg: Image) -> None:
-        with self._lock:
-            self._rgb_msg_rs = msg
+    def _load_from_files(self, use_zed: bool) -> tuple[np.ndarray, np.ndarray] | None:
+        """Return (bgr, depth_f_metres) loaded from mosaic, or None on error."""
+        import subprocess
 
-    def _on_depth_rs(self, msg: Image) -> None:
-        with self._lock:
-            self._depth_msg_rs = msg
+        prefix     = "zed" if use_zed else "rs"
+        rgb_path   = self.get_parameter(f"{prefix}_rgb_file").get_parameter_value().string_value.strip()
+        depth_path = self.get_parameter(f"{prefix}_depth_file").get_parameter_value().string_value.strip()
+        enc_param  = f"{prefix}_depth_encoding"
+        remote     = self.get_parameter("remote_host").get_parameter_value().string_value.strip()
+        cam_name   = "ZED" if use_zed else "RealSense"
 
-    def _on_rgb_zed(self, msg: Image) -> None:
-        with self._lock:
-            self._rgb_msg_zed = msg
+        if not rgb_path or not depth_path:
+            self.get_logger().error(f"{cam_name}: rgb/depth file path not set")
+            return None
 
-    def _on_depth_zed(self, msg: Image) -> None:
-        with self._lock:
-            self._depth_msg_zed = msg
+        if remote:
+            tmp_dir = Path(f"/tmp/seg_service_{prefix}")
+            tmp_dir.mkdir(exist_ok=True)
+            local_rgb   = tmp_dir / Path(rgb_path).name
+            local_depth = tmp_dir / Path(depth_path).name
+            for src, dst in [(rgb_path, local_rgb), (depth_path, local_depth)]:
+                r = subprocess.run(
+                    ["scp", "-o", "StrictHostKeyChecking=no",
+                     "-o", "ConnectTimeout=5",
+                     f"{remote}:{src}", str(dst)],
+                    capture_output=True, text=True,
+                )
+                if r.returncode != 0:
+                    self.get_logger().error(f"SCP failed ({src}): {r.stderr.strip()}")
+                    return None
+            rgb_path, depth_path = str(local_rgb), str(local_depth)
+
+        bgr = cv2.imread(rgb_path, cv2.IMREAD_COLOR)
+        if bgr is None:
+            self.get_logger().error(f"Cannot read RGB file: {rgb_path}")
+            return None
+
+        if depth_path.endswith(".npy"):
+            depth_f = np.load(depth_path).astype(np.float32)
+        else:
+            depth_raw = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
+            if depth_raw is None:
+                self.get_logger().error(f"Cannot read depth file: {depth_path}")
+                return None
+            enc = self.get_parameter(enc_param).get_parameter_value().string_value
+            depth_f = depth_raw.astype(np.float32) if enc == "32FC1" \
+                      else depth_raw.astype(np.float32) / self._dscale
+
+        return bgr, depth_f
 
     # ------------------------------------------------------------------ #
     #  Service handler                                                     #
@@ -230,30 +262,19 @@ class SegServiceNode(Node):
             response.message = "Previous inference still running"
             return response
 
-        use_zed = label.lower() in ZED_LABELS
+        use_zed  = label.lower() in ZED_LABELS
         cam_name = "ZED" if use_zed else "RealSense"
 
-        with self._lock:
-            if use_zed:
-                rgb_msg   = self._rgb_msg_zed
-                depth_msg = self._depth_msg_zed
-            else:
-                rgb_msg   = self._rgb_msg_rs
-                depth_msg = self._depth_msg_rs
-
-        if rgb_msg is None:
+        result = self._load_from_files(use_zed)
+        if result is None:
             response.success = False
-            response.message = f"RGB image not yet received ({cam_name})"
+            response.message = f"Failed to load {cam_name} files (check logs)"
             return response
-        if depth_msg is None:
-            response.success = False
-            response.message = f"Depth image not yet received ({cam_name})"
-            return response
-
+        bgr, depth_f = result
         self._busy = True
         threading.Thread(
-            target=self._infer,
-            args=(label, rgb_msg, depth_msg, use_zed),
+            target=self._infer_arrays,
+            args=(label, bgr, depth_f, use_zed),
             daemon=True,
         ).start()
 
@@ -269,17 +290,15 @@ class SegServiceNode(Node):
     #  Inference (background thread)                                       #
     # ------------------------------------------------------------------ #
 
-    def _infer(
+    def _infer_arrays(
         self,
-        label:     str,
-        rgb_msg:   Image,
-        depth_msg: Image,
-        use_zed:   bool,
+        label:   str,
+        bgr:     np.ndarray,
+        depth_f: np.ndarray,
+        use_zed: bool,
     ) -> None:
         released = False
         try:
-            bgr   = self._bridge.imgmsg_to_cv2(rgb_msg, "bgr8")
-            depth = self._bridge.imgmsg_to_cv2(depth_msg, desired_encoding="passthrough")
             best_box = None  # kept for visualisation
 
             # ---- segmentation -----------------------------------------
@@ -321,11 +340,6 @@ class SegServiceNode(Node):
             # ---- depth back-projection ---------------------------------
             fx, fy, cx, cy = _ZED_INTR if use_zed else _RS_INTR
 
-            if depth_msg.encoding == "32FC1":
-                depth_f = depth.astype(np.float32)
-            else:                               # 16UC1 – RealSense default (mm)
-                depth_f = depth.astype(np.float32) / self._dscale
-
             ys, xs = np.where(mask)
             d_vals = depth_f[ys, xs]
             valid  = (d_vals > 0.05) & np.isfinite(d_vals)
@@ -335,17 +349,16 @@ class SegServiceNode(Node):
                 self.get_logger().warn("Mask obtained but all depth values are invalid.")
                 return
 
-            ds_ratio = self._ds_zed if use_zed else self._ds_rs
-            if ds_ratio < 1.0 and len(xs) > 1:
-                keep = max(1, int(len(xs) * ds_ratio))
-                idx  = np.random.choice(len(xs), keep, replace=False)
-                xs, ys, d_vals = xs[idx], ys[idx], d_vals[idx]
-
             pts = np.column_stack([
                 (xs - cx) * d_vals / fx,
                 (ys - cy) * d_vals / fy,
                 d_vals,
-            ]).astype(np.float32)
+            ])  # camera frame, float64
+
+            # Transform to world frame: p_w = R_wc @ p_c + t_wc
+            R_wc = _ZED_R_WC if use_zed else _RS_R_WC
+            t_wc = _ZED_T_WC if use_zed else _RS_T_WC
+            pts = (pts @ R_wc.T + t_wc).astype(np.float32)
 
             # Extract RGB colors from the original image (OpenCV is BGR)
             bgr_vals = bgr[ys, xs]                           # (N, 3)  B G R
@@ -355,10 +368,15 @@ class SegServiceNode(Node):
                 bgr_vals[:, 0].astype(np.uint32)              # B
             )
 
-            pc_msg = _build_pointcloud2(depth_msg.header, pts, rgb_packed)
+            hdr = Header()
+            hdr.stamp    = self.get_clock().now().to_msg()
+            hdr.frame_id = "world"
+            pc_msg = _build_pointcloud2(hdr, pts, rgb_packed)
             self._pc_pub.publish(pc_msg)
+            cx_m, cy_m, cz_m = pts.mean(axis=0)
             self.get_logger().info(
-                f"Published {len(pts)} points on /seg/point_cloud  (label='{label}')"
+                f"[{label}] centroid: x={cx_m:.3f}  y={cy_m:.3f}  z={cz_m:.3f} m  "
+                f"({len(pts)} pts)"
             )
 
             # release before viz so new triggers are accepted while window is open
