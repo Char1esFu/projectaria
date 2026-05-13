@@ -44,6 +44,7 @@ def crop_fisheye_img(image: np.ndarray):
     """
     h, w = image.shape[:2]
     crop_size = int(min(w, h) / 1.5)
+    crop_size += crop_size % 2  # ensure even for codec compatibility
     ox = (w - crop_size) // 2
     oy = (h - crop_size) // 2
     cropped = np.ascontiguousarray(image[oy:oy + crop_size, ox:ox + crop_size])
@@ -73,9 +74,13 @@ class AriaRgbStream:
         self.observer = None
 
         self._overlays: list = []
+        self._frame_callback = None
 
     def add_overlay(self, overlay) -> None:
         self._overlays.append(overlay)
+
+    def set_frame_callback(self, fn) -> None:
+        self._frame_callback = fn
 
     def run(self) -> None:
         if self.update_iptables_rules and sys.platform.startswith("linux"):
@@ -132,6 +137,9 @@ class AriaRgbStream:
 
             for overlay in self._overlays:
                 overlay.draw(display, display_matrix, frame_key)
+
+            if self._frame_callback is not None:
+                self._frame_callback(display)
 
             cv2.imshow(self.window_name, display)
 

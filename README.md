@@ -39,26 +39,26 @@ python3 utils/device_stream.py --interface wifi --device-ip 192.168.8.117 --upda
 # subscribe first(needed in all scenarios)
 aria streaming start --interface wifi --device-ip 192.168.8.117 --use-ephemeral-certs --profile profile18
 
+# stop streaming
+aria streaming stop --device-ip 192.168.8.117
+
 # gaze detection, with mouse focus on gaze image output window, keep pressing C to calibrate while focusing on center of marker 
 python3 -m projectaria_eyetracking.gaze_detect --device-ip 192.168.8.117 --device cuda:0 # or cpu
 
 # gaze projection on egocentric image with yolo detection and gaze score calculation
-python3 -m src.gaze_rgb_visualizer --device-ip 192.168.8.117 --yolo --draw-gaze
+python3 -m src.gaze_rgb_visualizer --device-ip 192.168.8.117 --yolo --draw-gaze --participant AB12
 
 # record audio, press bottom right button
 python3 -m src.audio_record --device-ip 192.168.8.117 --gain 2.0
 
-# stop streaming
-aria streaming stop --device-ip 192.168.8.117
 
 # capture data for training
 python3 -m src.gaze_rgb_visualizer --capture
+
+# ros bag
+python3 src/bag_record.py --participant AB12
 ```
-In host:
-```bash
-# keymapping for indicator
-sudo python3 src/indicator_remapping.py
-```
+
 In ~/venv/sam3_env:
 ```bash
 # YOLO+SAM3 service

@@ -1,11 +1,12 @@
 import argparse
 import sys
 import threading
+from pathlib import Path
 import numpy as np
 import whisper
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import String
+from std_msgs.msg import Empty, String
 from scipy.signal import butter, sosfilt, resample_poly
 from math import gcd
 
@@ -30,7 +31,7 @@ def parse_args() -> argparse.Namespace:
         help="Update iptables to enable receiving the data stream, only for Linux.",
     )
     parser.add_argument(
-        "--device-ip", help="IP address to connect to the device over wifi"
+        "--device-ip", default="192.168.8.117", help="IP address to connect to the device over wifi"
     )
     parser.add_argument(
         "--channel",
@@ -51,6 +52,10 @@ def parse_args() -> argparse.Namespace:
         "--language",
         default="en",
         help="Language for whisper transcription (default: en)",
+    )
+    parser.add_argument(
+        "--participant", default="",
+        help="Participant ID (e.g. AB12). When set, creates the session subfolder on B press.",
     )
     return parser.parse_args()
 
@@ -97,6 +102,7 @@ def main():
     rclpy.init()
     node = Node("audio_transcriber")
     pub = node.create_publisher(String, "/transcription", 10)
+    start_pub = node.create_publisher(Empty, "/recording/start", 10)
     threading.Thread(target=rclpy.spin, args=(node,), daemon=True).start()
 
     WHISPER_SAMPLE_RATE = 16000
@@ -153,6 +159,13 @@ def main():
             if event.value == 1:
                 observer.recording = True
                 observer.audio_buffer.clear()
+                if args.participant:
+                    base = Path("recordings") / args.participant
+                    base.mkdir(parents=True, exist_ok=True)
+                    existing = [int(p.name) for p in base.iterdir() if p.is_dir() and p.name.isdigit()]
+                    idx = max(existing, default=0) + 1
+                    (base / f"{idx:02d}").mkdir()
+                start_pub.publish(Empty())
                 print("Recording...")
             elif event.value == 0:
                 threading.Thread(target=on_key_released, daemon=True).start()

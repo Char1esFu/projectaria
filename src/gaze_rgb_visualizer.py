@@ -6,6 +6,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
+FPS_WARMUP_FRAMES = 10  # frames used to estimate actual stream fps before opening VideoWriter
+
 import cv2
 import numpy as np
 from ultralytics import YOLO
@@ -34,12 +36,22 @@ class GazeOverlay:
         dist_threshold: float = 1080.0,
         std_dist: float = 200.0,
         s_min: float = 0.3,
+        participant: str = "",
     ) -> None:
         self.gaze_pitch: float = 0.0
         self.gaze_yaw: float = 0.0
         self._rclpy = None
         self._ros_node = None
         self._ros_thread = None
+
+        # Video recording state
+        self._participant = participant
+        self._video_writer: Optional[cv2.VideoWriter] = None
+        self._writer_lock = threading.Lock()
+        self._pending_record = False
+        self._pending_path: Optional[Path] = None
+        self._warmup_buf: Optional[list] = None  # list of (frame, timestamp) during fps estimation
+
         self._setup_ros_subscriber()
 
         # Optional homography to shift RGB view to the symmetric center
@@ -86,7 +98,7 @@ class GazeOverlay:
         try:
             import rclpy
             from geometry_msgs.msg import Vector3
-            from std_msgs.msg import String
+            from std_msgs.msg import Empty, String
 
             if not rclpy.ok():
                 rclpy.init(args=None)
@@ -100,6 +112,12 @@ class GazeOverlay:
             self._ros_node.create_subscription(
                 Vector3, "/aria/gaze_euler", _gaze_callback, 10
             )
+            self._ros_node.create_subscription(
+                Empty, "/recording/start", lambda _: self._on_recording_start(), 10
+            )
+            self._ros_node.create_subscription(
+                String, "/transcription", lambda _: self._stop_recording(), 10
+            )
             self._gaze_label_pub = self._ros_node.create_publisher(String, "/gaze_label", 10)
             self._ros_thread = threading.Thread(
                 target=rclpy.spin, args=(self._ros_node,), daemon=True
@@ -108,6 +126,70 @@ class GazeOverlay:
             print("ROS2 publisher started: /gaze_label")
         except Exception as exc:
             raise RuntimeError(f"ROS2 subscriber unavailable: {exc}") from exc
+
+    def _on_recording_start(self) -> None:
+        if not self._participant:
+            return
+        base = Path("recordings") / self._participant
+        base.mkdir(parents=True, exist_ok=True)
+        existing = sorted([int(p.name) for p in base.iterdir() if p.is_dir() and p.name.isdigit()])
+        if existing:
+            session_dir = base / f"{existing[-1]:02d}"
+        else:
+            session_dir = base / "01"
+            session_dir.mkdir()
+        with self._writer_lock:
+            self._pending_path = session_dir / "gaze_overlay.mp4"
+            self._pending_record = True
+
+    def record_frame(self, frame: np.ndarray) -> None:
+        now = time.monotonic()
+
+        with self._writer_lock:
+            # START signal received: reset state and begin fps warmup
+            if self._pending_record:
+                self._pending_record = False
+                if self._video_writer is not None:
+                    self._video_writer.release()
+                    self._video_writer = None
+                self._warmup_buf = [(frame, now)]
+                return
+
+            # Warmup: collect frames until we have enough to estimate fps
+            if self._warmup_buf is not None:
+                self._warmup_buf.append((frame, now))
+                if len(self._warmup_buf) < FPS_WARMUP_FRAMES:
+                    return
+                # Estimate fps from the warmup window and open VideoWriter
+                t0, t1 = self._warmup_buf[0][1], self._warmup_buf[-1][1]
+                fps = (len(self._warmup_buf) - 1) / (t1 - t0)
+                h, w = frame.shape[:2]
+                # Codecs require even dimensions; trim 1px if odd (visually imperceptible)
+                self._rec_h = h - h % 2
+                self._rec_w = w - w % 2
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                self._video_writer = cv2.VideoWriter(
+                    str(self._pending_path), fourcc, fps, (self._rec_w, self._rec_h)
+                )
+                for f, _ in self._warmup_buf:
+                    self._video_writer.write(f[:self._rec_h, :self._rec_w])
+                print(f"Video recording started (fps≈{fps:.1f}) → {self._pending_path}")
+                self._warmup_buf = None
+                self._pending_path = None
+                return
+
+            if self._video_writer is not None:
+                self._video_writer.write(frame[:self._rec_h, :self._rec_w])
+
+    def _stop_recording(self) -> None:
+        with self._writer_lock:
+            self._warmup_buf = None
+            self._pending_path = None
+            if self._video_writer is None:
+                return
+            self._video_writer.release()
+            self._video_writer = None
+            print("Video recording stopped.")
 
     def draw(self, display_image: np.ndarray, camera_matrix: Optional[np.ndarray], key: int = -1) -> None:
         if self.enable_capture and key in (ord("s"), ord("S")):
@@ -357,6 +439,7 @@ class GazeOverlay:
         result.boxes = result.boxes[keep]
 
     def shutdown(self) -> None:
+        self._stop_recording()
         try:
             self._ros_node.destroy_node()
             self._rclpy.shutdown()
@@ -379,6 +462,7 @@ def run_gaze_rgb_visualizer(
     dist_threshold: float = 1080.0,
     std_dist: float = 200.0,
     s_min: float = 0.3,
+    participant: str = "",
 ) -> None:
     overlay = GazeOverlay(
         homography_path=homography_path,
@@ -393,6 +477,7 @@ def run_gaze_rgb_visualizer(
         dist_threshold=dist_threshold,
         std_dist=std_dist,
         s_min=s_min,
+        participant=participant,
     )
     stream = AriaRgbStream(
         device_ip=device_ip,
@@ -400,6 +485,7 @@ def run_gaze_rgb_visualizer(
         window_name="Aria RGB Gaze",
     )
     stream.add_overlay(overlay)
+    stream.set_frame_callback(overlay.record_frame)
     try:
         stream.run()
     finally:
@@ -463,6 +549,10 @@ def parse_args() -> argparse.Namespace:
         "--s-min", type=float, default=0.0, dest="s_min",
         help="Minimum score threshold for publishing /gaze_label entries (default: 0.2).",
     )
+    parser.add_argument(
+        "--participant", type=str, default="",
+        help="Participant ID (e.g. AB12). Required for video recording to recordings/<participant>/NN/.",
+    )
     return parser.parse_args()
 
 
@@ -483,6 +573,7 @@ def main() -> None:
         dist_threshold=args.dist_threshold,
         std_dist=args.std_dist,
         s_min=args.s_min,
+        participant=args.participant,
     )
 
 
