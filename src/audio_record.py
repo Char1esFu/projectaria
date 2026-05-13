@@ -1,9 +1,6 @@
 import argparse
-import select
 import sys
-import termios
 import threading
-import tty
 import numpy as np
 import whisper
 import rclpy
@@ -12,6 +9,8 @@ from std_msgs.msg import String
 from scipy.signal import butter, sosfilt, resample_poly
 from math import gcd
 
+from evdev import InputDevice, ecodes
+
 import aria.sdk as aria
 
 from projectaria_tools.core.sensor_data import AudioData, AudioDataRecord
@@ -19,6 +18,7 @@ from utils.common import update_iptables
 
 ARIA_AUDIO_SAMPLE_RATE = 48000
 ARIA_NUM_CHANNELS = 7
+DEVICE = "/dev/input/by-id/usb-Wireless_Present_Wireless_Present-event-kbd"
 
 
 def parse_args() -> argparse.Namespace:
@@ -103,23 +103,13 @@ def main():
     g = gcd(ARIA_AUDIO_SAMPLE_RATE, WHISPER_SAMPLE_RATE)
     sos = butter(4, [80, 8000], btype="band", fs=ARIA_AUDIO_SAMPLE_RATE, output="sos")
 
-    # Key-repeat-based hold detection.
-    # Linux key repeat: initial delay ~500ms, then repeat every ~33ms.
-    # Use a long timeout for the first press (waiting for repeat to start),
-    # then switch to a short timeout once repeat is confirmed.
-    INITIAL_TIMEOUT = 0.65  # longer than key repeat initial delay
-    RELEASE_TIMEOUT = 0.15  # shorter than key repeat interval gap
-    release_timer = None
-    key_repeating = False
-    release_timer_lock = threading.Lock()
-
     def on_key_released():
         observer.recording = False
         print("Stopped.")
 
         if not observer.audio_buffer:
             print("No audio data received.")
-            print("Hold [S] to record again. [Q]/ESC to quit.")
+            print("Hold [B] to record again. Ctrl+C to quit.")
             return
 
         all_samples = np.concatenate(observer.audio_buffer)
@@ -150,41 +140,26 @@ def main():
         pub.publish(msg)
 
         print(f"Text: {text}")
-        print("Hold [S] to record again. [Q]/ESC to quit.")
+        print("Hold [B] to record again. Ctrl+C to quit.")
 
-    print("Hold [S] to record, release to transcribe. [Q]/ESC to quit.")
+    print("Hold [B] to record, release to transcribe. Ctrl+C to quit.")
 
-    fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
+    device = InputDevice(DEVICE)
+    device.grab()
     try:
-        tty.setcbreak(fd)
-        while True:
-            r, _, _ = select.select([sys.stdin], [], [], 0.1)
-            if not r:
+        for event in device.read_loop():
+            if event.type != ecodes.EV_KEY or event.code != ecodes.KEY_B:
                 continue
-            ch = sys.stdin.read(1)
-            if ch in ('\x1b', 'q', 'Q'):
-                with release_timer_lock:
-                    if release_timer is not None:
-                        release_timer.cancel()
-                break
-            if ch in ('s', 'S'):
-                with release_timer_lock:
-                    if release_timer is not None:
-                        release_timer.cancel()
-                    if not observer.recording:
-                        observer.recording = True
-                        observer.audio_buffer.clear()
-                        key_repeating = False
-                        print("Recording...")
-                        timeout = INITIAL_TIMEOUT
-                    else:
-                        key_repeating = True
-                        timeout = RELEASE_TIMEOUT
-                    release_timer = threading.Timer(timeout, on_key_released)
-                    release_timer.start()
+            if event.value == 1:
+                observer.recording = True
+                observer.audio_buffer.clear()
+                print("Recording...")
+            elif event.value == 0:
+                threading.Thread(target=on_key_released, daemon=True).start()
+    except KeyboardInterrupt:
+        pass
     finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        device.ungrab()
 
     streaming_client.unsubscribe()
     node.destroy_node()
