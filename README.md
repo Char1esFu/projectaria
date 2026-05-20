@@ -31,27 +31,35 @@ aria streaming install-certs
 ```
 
 ## Usage
-In .venv with aria glass sdk:
+Start streaming with aria glass sdk:
 ```bash
-# streaming demo with glfw window. Run this first to give sudo access, otherwise streaming will fail later.
-python3 utils/device_stream.py --interface wifi --device-ip 192.168.8.117 --update_iptables
-
 # subscribe first(needed in all scenarios)
-aria streaming start --interface wifi --device-ip 192.168.8.117 --use-ephemeral-certs --profile profile18
+python3 utils/streaming_start.py --interface wifi
 
 # stop streaming
 aria streaming stop --device-ip 192.168.8.117
+```
+In .venv:
+```bash
+# indicator key mapping, PAGEUP & B grabbed by evdev
+python3 src/key_manager.py
 
-# gaze detection, with mouse focus on gaze image output window, keep pressing C to calibrate while focusing on center of marker 
-python3 -m projectaria_eyetracking.gaze_detect --device-ip 192.168.8.117 --device cuda:0 # or cpu
+# gaze detection, with mouse focus on gaze image output window, press top left button on the indicator to start collecting calibration data while focusing on center of marker, press once more to stop.
+python3 -m projectaria_eyetracking.gaze_detect
 
 # gaze projection on egocentric image with yolo detection and gaze score calculation
-python3 -m src.gaze_rgb_visualizer --device-ip 192.168.8.117 --yolo --draw-gaze --participant AB12
+python3 -m src.gaze_rgb_visualizer --yolo --draw-gaze --participant AB12
 
-# record audio, press bottom right button
-python3 -m src.audio_record --device-ip 192.168.8.117 --gain 2.0
-
-
+# record audio, long press bottom right button
+python3 -m src.audio_record --device-ip 192.168.8.117 --participant AB12
+```
+In ~/venv/sam3_env:
+```bash
+# YOLO+SAM3 service
+python3 src/seg_service.py --visualize # argument for realsense segmentation image
+```
+Data collection and debug:
+```bash
 # capture data for training
 python3 -m src.gaze_rgb_visualizer --capture
 
@@ -62,15 +70,15 @@ python3 src/bag_record.py --participant AB12
 python3 src/clip_from_frames.py --participant AB12 --trial 04 --timestamp 1779296845648620199 --window 10
 ```
 
-In ~/venv/sam3_env:
+## Misc
 ```bash
-# YOLO+SAM3 service
-python3 src/seg_service.py --visualize # argument for realsense segmentation image
+# streaming demo with glfw window visualization, in .venv
+python3 utils/device_stream.py --interface wifi --device-ip 192.168.8.117 --update_iptables
 
-# visualize point cloud
+# visualize point cloud to be sent, in sam3_env
 python3 utils/pc_viz.py 
 
-# test command, TODO: integrate into element_action
+# test command
 ros2 param set /seg_service target_label 'tomato'
 ros2 service call /seg/infer std_srvs/srv/Trigger '{}'
 ```

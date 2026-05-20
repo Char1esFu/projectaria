@@ -1,5 +1,6 @@
 import argparse
 import sys
+import threading
 import time
 
 import aria.sdk as aria
@@ -44,7 +45,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--device",
         type=str,
-        default="cpu",
+        default="cuda:0",
         help="Device to run inference on (cpu or cuda:0)",
     )
     parser.add_argument(
@@ -86,7 +87,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--device-ip",
         type=str,
-        default=None,
+        default="192.168.8.117",
         help="IP address of the Aria device (e.g. 192.168.8.117).",
     )
     return parser.parse_args()
@@ -146,6 +147,7 @@ def main() -> None:
     try:
         import rclpy
         from geometry_msgs.msg import Vector3
+        from std_msgs.msg import Empty
 
         rclpy.init(args=None)
         ros_node = rclpy.create_node("eye_gaze_publisher")
@@ -214,22 +216,36 @@ def main() -> None:
     yaw_ema: float | None = None
 
     # Calibration state
-    c_held = False
-    c_last_seen = 0.0  # timestamp of last key=='c' event
-    C_RELEASE_GRACE = 0.3  # seconds: tolerate key-repeat gaps up to this
+    calibrating = False
+    compute_calib = False
     calib_samples: list[tuple[float, float, float, float]] = []  # (marker_col, marker_row, pitch_raw, yaw_raw)
     pitch_offset = 0.0
     yaw_offset = 0.0
     _crop_ox = 0
     _crop_oy = 0
+    _calib_lock = threading.Lock()
+
+    def _on_calib_toggle(_msg):
+        nonlocal calibrating, compute_calib
+        with _calib_lock:
+            if not calibrating:
+                calib_samples.clear()
+                calibrating = True
+                print(f"Calibrating: look at marker {CALIB_MARKER_ID} center and move your head; press PageUp again to finish...")
+            else:
+                calibrating = False
+                compute_calib = True
+
+    ros_node.create_subscription(Empty, "/key/pageup", _on_calib_toggle, 10)
+    threading.Thread(target=rclpy.spin, args=(ros_node,), daemon=True).start()
 
     # Latest raw gaze (updated each EyeTrack frame, used when pairing with RGB)
     latest_pitch_raw: float = 0.0
     latest_yaw_raw: float = 0.0
 
     print(
-        f"Hold 'C' while looking at ArUco marker {CALIB_MARKER_ID} center and moving your head; "
-        "release to compute pitch/yaw offset. 'q'/ESC to quit."
+        f"Press PageUp to start calibration (look at ArUco marker {CALIB_MARKER_ID}), press PageUp again to finish. "
+        "'q'/ESC to quit."
     )
 
     try:
@@ -238,34 +254,25 @@ def main() -> None:
             if key == 27 or key == ord("q"):
                 break
 
-            now = time.time()
-            if key == ord("c"):
-                c_last_seen = now
-                if not c_held:
-                    c_held = True
-                    calib_samples.clear()
-                    print(f"Calibrating: hold C while looking at marker {CALIB_MARKER_ID} center...")
-            elif c_held and (now - c_last_seen) > C_RELEASE_GRACE:
-                # Key not seen for longer than grace period → user released C
-                c_held = False
-                if len(calib_samples) >= 2:
-                    rows = np.array([s[1] for s in calib_samples])
-                    cols = np.array([s[0] for s in calib_samples])
-                    pitches = np.array([s[2] for s in calib_samples])
-                    yaws = np.array([s[3] for s in calib_samples])
-                    # Use cropped camera_matrix (marker coords are in cropped space)
+            if compute_calib:
+                with _calib_lock:
+                    compute_calib = False
+                    samples_snapshot = list(calib_samples)
+                if len(samples_snapshot) >= 2:
+                    rows = np.array([s[1] for s in samples_snapshot])
+                    cols = np.array([s[0] for s in samples_snapshot])
+                    pitches = np.array([s[2] for s in samples_snapshot])
+                    yaws = np.array([s[3] for s in samples_snapshot])
                     fx = camera_matrix[0, 0]
                     fy = camera_matrix[1, 1]
                     cx = camera_matrix[0, 2] - _crop_ox
                     cy = camera_matrix[1, 2] - _crop_oy
 
-                    # gaze_row = cy - fy * tan(pitch_raw - pitch_offset)  →  match marker_row
                     res_p = minimize_scalar(
                         lambda dp: float(np.sum((rows - cy + fy * np.tan(pitches - dp)) ** 2)),
                         bounds=(-np.pi, np.pi),
                         method="bounded",
                     )
-                    # gaze_col = cx + fx * tan(yaw_raw - yaw_offset)  →  match marker_col
                     res_y = minimize_scalar(
                         lambda dy: float(
                             np.sum(
@@ -278,14 +285,14 @@ def main() -> None:
                     pitch_offset = float(res_p.x)
                     yaw_offset = float(res_y.x)
                     print(
-                        f"Calibration done ({len(calib_samples)} samples). "
+                        f"Calibration done ({len(samples_snapshot)} samples). "
                         f"pitch_offset={pitch_offset:.4f}, yaw_offset={yaw_offset:.4f}"
                     )
                 else:
                     print("Not enough samples for calibration (need >= 2).")
 
             # Process RGB frame for ArUco detection during calibration
-            if c_held and observer.rgb_image is not None:
+            if calibrating and observer.rgb_image is not None:
                 bgr = observer.rgb_image
                 observer.rgb_image = None
                 rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
@@ -348,7 +355,7 @@ def main() -> None:
 
                 print(
                     f"pitch={pitch:.4f}, yaw={yaw:.4f}"
-                    + (" [calibrating]" if c_held else "")
+                    + (" [calibrating]" if calibrating else "")
                 )
 
                 gaze_msg = Vector3()

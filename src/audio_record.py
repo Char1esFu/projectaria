@@ -10,8 +10,6 @@ from std_msgs.msg import Empty, String
 from scipy.signal import butter, sosfilt, resample_poly
 from math import gcd
 
-from evdev import InputDevice, ecodes
-
 import aria.sdk as aria
 
 from projectaria_tools.core.sensor_data import AudioData, AudioDataRecord
@@ -19,7 +17,6 @@ from utils.common import update_iptables
 
 ARIA_AUDIO_SAMPLE_RATE = 48000
 ARIA_NUM_CHANNELS = 7
-DEVICE = "/dev/input/by-id/usb-Wireless_Present_Wireless_Present-event-kbd"
 
 
 def parse_args() -> argparse.Namespace:
@@ -31,7 +28,9 @@ def parse_args() -> argparse.Namespace:
         help="Update iptables to enable receiving the data stream, only for Linux.",
     )
     parser.add_argument(
-        "--device-ip", default="192.168.8.117", help="IP address to connect to the device over wifi"
+        "--device-ip", 
+        default="192.168.8.117", 
+        help="IP address to connect to the device over wifi"
     )
     parser.add_argument(
         "--channel",
@@ -103,19 +102,34 @@ def main():
     node = Node("audio_transcriber")
     pub = node.create_publisher(String, "/transcription", 10)
     start_pub = node.create_publisher(Empty, "/recording/start", 10)
-    threading.Thread(target=rclpy.spin, args=(node,), daemon=True).start()
 
     WHISPER_SAMPLE_RATE = 16000
     g = gcd(ARIA_AUDIO_SAMPLE_RATE, WHISPER_SAMPLE_RATE)
     sos = butter(4, [80, 8000], btype="band", fs=ARIA_AUDIO_SAMPLE_RATE, output="sos")
 
-    def on_key_released():
+    participant_base = None
+    if args.participant:
+        participant_base = Path("recordings") / args.participant
+        participant_base.mkdir(parents=True, exist_ok=True)
+        print(f"Session folder: {participant_base}")
+
+    def on_b_press(_msg):
+        observer.recording = True
+        observer.audio_buffer.clear()
+        if participant_base is not None:
+            existing = [int(p.name) for p in participant_base.iterdir() if p.is_dir() and p.name.isdigit()]
+            idx = max(existing, default=0) + 1
+            (participant_base / f"{idx:02d}").mkdir()
+        start_pub.publish(Empty())
+        print("Recording...")
+
+    def _do_transcribe():
         observer.recording = False
         print("Stopped.")
 
         if not observer.audio_buffer:
             print("No audio data received.")
-            print("Hold [B] to record again. Ctrl+C to quit.")
+            print("Press [B] to record again. Ctrl+C to quit.")
             return
 
         all_samples = np.concatenate(observer.audio_buffer)
@@ -146,37 +160,20 @@ def main():
         pub.publish(msg)
 
         print(f"Text: {text}")
-        print("Hold [B] to record again. Ctrl+C to quit.")
+        print("Press [B] to record again. Ctrl+C to quit.")
 
-    participant_base = None
-    if args.participant:
-        participant_base = Path("recordings") / args.participant
-        participant_base.mkdir(parents=True, exist_ok=True)
-        print(f"Session folder: {participant_base}")
+    def on_b_release(_msg):
+        threading.Thread(target=_do_transcribe, daemon=True).start()
 
-    print("Hold [B] to record, release to transcribe. Ctrl+C to quit.")
+    node.create_subscription(Empty, "/key/b/press", on_b_press, 10)
+    node.create_subscription(Empty, "/key/b/release", on_b_release, 10)
 
-    device = InputDevice(DEVICE)
-    device.grab()
+    print("Press [B] to record, release to transcribe. Ctrl+C to quit.")
+
     try:
-        for event in device.read_loop():
-            if event.type != ecodes.EV_KEY or event.code != ecodes.KEY_B:
-                continue
-            if event.value == 1:
-                observer.recording = True
-                observer.audio_buffer.clear()
-                if participant_base is not None:
-                    existing = [int(p.name) for p in participant_base.iterdir() if p.is_dir() and p.name.isdigit()]
-                    idx = max(existing, default=0) + 1
-                    (participant_base / f"{idx:02d}").mkdir()
-                start_pub.publish(Empty())
-                print("Recording...")
-            elif event.value == 0:
-                threading.Thread(target=on_key_released, daemon=True).start()
+        rclpy.spin(node)
     except KeyboardInterrupt:
         pass
-    finally:
-        device.ungrab()
 
     streaming_client.unsubscribe()
     node.destroy_node()

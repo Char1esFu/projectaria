@@ -511,10 +511,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Visualize gaze direction on Aria RGB stream with optional YOLO detection."
     )
-    parser.add_argument("--device-ip", help="IP address of the Aria device")
+    parser.add_argument(
+        "--device-ip", 
+        default="192.168.8.117",
+        help="IP address of the Aria device"
+    )
     parser.add_argument(
         "--update_iptables",
-        default=False,
+        default=True,
         action="store_true",
         help="Update iptables for DDS UDP stream (Linux only).",
     )

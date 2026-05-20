@@ -53,7 +53,7 @@ SAM3_MODEL_DEFAULT = str(Path(__file__).parent.parent / "yolo_model" / "sam3.pt"
 _VIZ_WIN = "SAM3 – mask preview  (close or press ESC to publish)"
 
 # Labels that use the ZED camera; everything else uses RealSense
-ZED_LABELS = {"tomato", "cucumber", "banana", "sponge", "juice"}
+ZED_LABELS = {"tomato", "cucumber", "banana", "sponge"}
 
 # Hardcoded camera intrinsics (fx, fy, cx, cy)
 # RealSense color camera – 640×480
