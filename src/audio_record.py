@@ -148,6 +148,12 @@ def main():
         print(f"Text: {text}")
         print("Hold [B] to record again. Ctrl+C to quit.")
 
+    participant_base = None
+    if args.participant:
+        participant_base = Path("recordings") / args.participant
+        participant_base.mkdir(parents=True, exist_ok=True)
+        print(f"Session folder: {participant_base}")
+
     print("Hold [B] to record, release to transcribe. Ctrl+C to quit.")
 
     device = InputDevice(DEVICE)
@@ -159,12 +165,10 @@ def main():
             if event.value == 1:
                 observer.recording = True
                 observer.audio_buffer.clear()
-                if args.participant:
-                    base = Path("recordings") / args.participant
-                    base.mkdir(parents=True, exist_ok=True)
-                    existing = [int(p.name) for p in base.iterdir() if p.is_dir() and p.name.isdigit()]
+                if participant_base is not None:
+                    existing = [int(p.name) for p in participant_base.iterdir() if p.is_dir() and p.name.isdigit()]
                     idx = max(existing, default=0) + 1
-                    (base / f"{idx:02d}").mkdir()
+                    (participant_base / f"{idx:02d}").mkdir()
                 start_pub.publish(Empty())
                 print("Recording...")
             elif event.value == 0:

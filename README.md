@@ -57,6 +57,9 @@ python3 -m src.gaze_rgb_visualizer --capture
 
 # ros bag
 python3 src/bag_record.py --participant AB12
+
+# generate short video for aria rgb camera based on specific timestamp for arbitrary participant and trial
+python3 src/clip_from_frames.py --participant AB12 --trial 04 --timestamp 1779296845648620199 --window 10
 ```
 
 In ~/venv/sam3_env:

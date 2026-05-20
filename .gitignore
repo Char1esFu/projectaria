@@ -216,5 +216,12 @@ __marimo__/
 test_homography/images/
 test_homography/results/
 saved_images/
+recordings/
 
+# model weights
 sam3.pt
+
+# ros2
+build/
+install/
+log/

@@ -6,8 +6,6 @@ import time
 from pathlib import Path
 from typing import Optional
 
-FPS_WARMUP_FRAMES = 10  # frames used to estimate actual stream fps before opening VideoWriter
-
 import cv2
 import numpy as np
 from ultralytics import YOLO
@@ -44,13 +42,15 @@ class GazeOverlay:
         self._ros_node = None
         self._ros_thread = None
 
-        # Video recording state
+        # Image sequence recording state
         self._participant = participant
-        self._video_writer: Optional[cv2.VideoWriter] = None
         self._writer_lock = threading.Lock()
-        self._pending_record = False
-        self._pending_path: Optional[Path] = None
-        self._warmup_buf: Optional[list] = None  # list of (frame, timestamp) during fps estimation
+        self._rec_active: bool = False
+        self._rec_dir: Optional[Path] = None
+        self._rec_timestamps: list[int] = []
+
+        # Latest camera_info stamp from manipulation workstation (nanoseconds, rosbag time)
+        self._latest_manip_stamp_ns: Optional[int] = None
 
         self._setup_ros_subscriber()
 
@@ -98,6 +98,7 @@ class GazeOverlay:
         try:
             import rclpy
             from geometry_msgs.msg import Vector3
+            from sensor_msgs.msg import CameraInfo
             from std_msgs.msg import Empty, String
 
             if not rclpy.ok():
@@ -109,6 +110,9 @@ class GazeOverlay:
                 self.gaze_pitch = float(msg.x)
                 self.gaze_yaw = float(msg.y)
 
+            def _camera_info_callback(msg: CameraInfo) -> None:
+                self._latest_manip_stamp_ns = msg.header.stamp.sec * 10**9 + msg.header.stamp.nanosec
+
             self._ros_node.create_subscription(
                 Vector3, "/aria/gaze_euler", _gaze_callback, 10
             )
@@ -117,6 +121,12 @@ class GazeOverlay:
             )
             self._ros_node.create_subscription(
                 String, "/transcription", lambda _: self._stop_recording(), 10
+            )
+            self._ros_node.create_subscription(
+                CameraInfo,
+                "/static_camera/zed_right_node/rgb/camera_info",
+                _camera_info_callback,
+                10,
             )
             self._gaze_label_pub = self._ros_node.create_publisher(String, "/gaze_label", 10)
             self._ros_thread = threading.Thread(
@@ -133,63 +143,68 @@ class GazeOverlay:
         base = Path("recordings") / self._participant
         base.mkdir(parents=True, exist_ok=True)
         existing = sorted([int(p.name) for p in base.iterdir() if p.is_dir() and p.name.isdigit()])
-        if existing:
-            session_dir = base / f"{existing[-1]:02d}"
-        else:
-            session_dir = base / "01"
-            session_dir.mkdir()
+        if not existing:
+            return
+        session_dir = base / f"{existing[-1]:02d}"
+        if self._latest_manip_stamp_ns is not None:
+            meta = {"rosbag_start_time_ns": self._latest_manip_stamp_ns}
+            (session_dir / "sync.json").write_text(json.dumps(meta, indent=2))
         with self._writer_lock:
-            self._pending_path = session_dir / "gaze_overlay.mp4"
-            self._pending_record = True
+            frames_dir = session_dir / "frames"
+            frames_dir.mkdir(parents=True, exist_ok=True)
+            self._rec_dir = frames_dir
+            self._rec_active = True
+            self._rec_timestamps = []
+            print(f"Image recording started → {frames_dir}")
 
     def record_frame(self, frame: np.ndarray) -> None:
-        now = time.monotonic()
-
         with self._writer_lock:
-            # START signal received: reset state and begin fps warmup
-            if self._pending_record:
-                self._pending_record = False
-                if self._video_writer is not None:
-                    self._video_writer.release()
-                    self._video_writer = None
-                self._warmup_buf = [(frame, now)]
+            if not self._rec_active or self._rec_dir is None:
                 return
-
-            # Warmup: collect frames until we have enough to estimate fps
-            if self._warmup_buf is not None:
-                self._warmup_buf.append((frame, now))
-                if len(self._warmup_buf) < FPS_WARMUP_FRAMES:
-                    return
-                # Estimate fps from the warmup window and open VideoWriter
-                t0, t1 = self._warmup_buf[0][1], self._warmup_buf[-1][1]
-                fps = (len(self._warmup_buf) - 1) / (t1 - t0)
-                h, w = frame.shape[:2]
-                # Codecs require even dimensions; trim 1px if odd (visually imperceptible)
-                self._rec_h = h - h % 2
-                self._rec_w = w - w % 2
-                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                self._video_writer = cv2.VideoWriter(
-                    str(self._pending_path), fourcc, fps, (self._rec_w, self._rec_h)
-                )
-                for f, _ in self._warmup_buf:
-                    self._video_writer.write(f[:self._rec_h, :self._rec_w])
-                print(f"Video recording started (fps≈{fps:.1f}) → {self._pending_path}")
-                self._warmup_buf = None
-                self._pending_path = None
-                return
-
-            if self._video_writer is not None:
-                self._video_writer.write(frame[:self._rec_h, :self._rec_w])
+            ts = self._latest_manip_stamp_ns if self._latest_manip_stamp_ns is not None else 0
+            cv2.imwrite(str(self._rec_dir / f"{ts}.png"), frame)
+            self._rec_timestamps.append(ts)
 
     def _stop_recording(self) -> None:
         with self._writer_lock:
-            self._warmup_buf = None
-            self._pending_path = None
-            if self._video_writer is None:
+            if not self._rec_active:
                 return
-            self._video_writer.release()
-            self._video_writer = None
-            print("Video recording stopped.")
+            self._rec_active = False
+            rec_dir = self._rec_dir
+            timestamps = list(self._rec_timestamps)
+            self._rec_dir = None
+            self._rec_timestamps = []
+
+        if rec_dir is None or not timestamps:
+            return
+        print(f"Saved {len(timestamps)} frames to {rec_dir}")
+        threading.Thread(target=self._encode_video, args=(rec_dir, timestamps), daemon=True).start()
+
+    def _encode_video(self, frames_dir: Path, timestamps: list[int]) -> None:
+        import subprocess
+        session_dir = frames_dir.parent
+        concat_path = session_dir / "ffconcat.txt"
+
+        lines = ["ffconcat version 1.0"]
+        for i, ts in enumerate(timestamps):
+            dur = (timestamps[i + 1] - ts) / 1e9 if i + 1 < len(timestamps) else (timestamps[-1] - timestamps[-2]) / 1e9
+            lines.append(f"file 'frames/{ts}.png'")
+            lines.append(f"duration {dur:.9f}")
+        concat_path.write_text("\n".join(lines) + "\n")
+
+        out_path = session_dir / "gaze_overlay.mp4"
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", str(concat_path),
+            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            str(out_path),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            print(f"Video encoded → {out_path}")
+        else:
+            print(f"ffmpeg encoding failed:\n{result.stderr[-800:]}")
 
     def draw(self, display_image: np.ndarray, camera_matrix: Optional[np.ndarray], key: int = -1) -> None:
         if self.enable_capture and key in (ord("s"), ord("S")):
