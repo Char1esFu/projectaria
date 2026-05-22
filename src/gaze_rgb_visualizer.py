@@ -12,7 +12,7 @@ from ultralytics import YOLO
 
 from utils.aria_rgb_stream import AriaRgbStream
 
-MODEL_PATH = Path(__file__).parent.parent / "yolo_model" / "best_aria.pt"
+MODEL_PATH = Path(__file__).parent.parent / "yolo_model" / "last_aria_4.pt"
 CROP_SIZE = 200
 RESIZE_SIZE = 1080
 

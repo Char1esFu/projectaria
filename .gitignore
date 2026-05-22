@@ -219,7 +219,7 @@ saved_images/
 recordings/
 
 # model weights
-sam3.pt
+yolo_model/
 
 # ros2
 build/

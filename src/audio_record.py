@@ -23,7 +23,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Record audio from Aria glass microphones and transcribe")
     parser.add_argument(
         "--update_iptables",
-        default=False,
+        default=True,
         action="store_true",
         help="Update iptables to enable receiving the data stream, only for Linux.",
     )

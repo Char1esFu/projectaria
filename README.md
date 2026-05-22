@@ -51,7 +51,7 @@ python3 -m projectaria_eyetracking.gaze_detect
 python3 -m src.gaze_rgb_visualizer --yolo --draw-gaze --participant AB12
 
 # record audio, long press bottom right button
-python3 -m src.audio_record --device-ip 192.168.8.117 --participant AB12
+python3 -m src.audio_record --participant AB12
 ```
 In ~/venv/sam3_env:
 ```bash
