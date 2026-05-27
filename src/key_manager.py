@@ -6,26 +6,15 @@ from std_msgs.msg import Empty
 
 from evdev import InputDevice, ecodes
 
-DEVICE = "/dev/input/by-id/usb-Wireless_Present_Wireless_Present-event-kbd"
+PRESENTER_DEVICE = "/dev/input/by-id/usb-Wireless_Present_Wireless_Present-event-kbd"
+KEYBOARD_DEVICE = "/dev/input/by-id/usb-_HP_310_Wired_Keyboard-event-kbd"
 
 
-def main():
-    rclpy.init()
-    node = Node("key_manager")
-    b_press_pub = node.create_publisher(Empty, "/key/b/press", 10)
-    b_release_pub = node.create_publisher(Empty, "/key/b/release", 10)
-    pageup_pub = node.create_publisher(Empty, "/key/pageup", 10)
-
-    threading.Thread(target=rclpy.spin, args=(node,), daemon=True).start()
-
-    device = InputDevice(DEVICE)
-    device.grab()
-    print(f"key_manager: grabbed {DEVICE}")
-    print("  B press/release → /key/b/press, /key/b/release")
-    print("  PageUp press    → /key/pageup")
-
+def _watch_presenter(device, b_press_pub, b_release_pub, stop_event):
     try:
         for event in device.read_loop():
+            if stop_event.is_set():
+                break
             if event.type != ecodes.EV_KEY:
                 continue
             if event.code == ecodes.KEY_B:
@@ -33,12 +22,55 @@ def main():
                     b_press_pub.publish(Empty())
                 elif event.value == 0:
                     b_release_pub.publish(Empty())
-            elif event.code == ecodes.KEY_PAGEUP and event.value == 1:
-                pageup_pub.publish(Empty())
-    except KeyboardInterrupt:
+    except Exception:
         pass
+
+
+def _watch_keyboard(device, c_pub, stop_event):
+    try:
+        for event in device.read_loop():
+            if stop_event.is_set():
+                break
+            if event.type != ecodes.EV_KEY:
+                continue
+            if event.code == ecodes.KEY_C and event.value == 1:
+                c_pub.publish(Empty())
+    except Exception:
+        pass
+
+
+def main():
+    rclpy.init()
+    node = Node("key_manager")
+    b_press_pub = node.create_publisher(Empty, "/key/b/press", 10)
+    b_release_pub = node.create_publisher(Empty, "/key/b/release", 10)
+    c_pub = node.create_publisher(Empty, "/key/c", 10)
+
+    threading.Thread(target=rclpy.spin, args=(node,), daemon=True).start()
+
+    presenter = InputDevice(PRESENTER_DEVICE)
+    keyboard = InputDevice(KEYBOARD_DEVICE)
+    presenter.grab()
+    # keyboard.grab()
+    print(f"key_manager: grabbed {PRESENTER_DEVICE}")
+    print(f"key_manager: grabbed {KEYBOARD_DEVICE}")
+    print("  B press/release → /key/b/press, /key/b/release")
+    print("  C press         → /key/c  (starts calibration; auto-stops after --calib-duration seconds)")
+
+    stop_event = threading.Event()
+    t1 = threading.Thread(target=_watch_presenter, args=(presenter, b_press_pub, b_release_pub, stop_event), daemon=True)
+    t2 = threading.Thread(target=_watch_keyboard, args=(keyboard, c_pub, stop_event), daemon=True)
+    t1.start()
+    t2.start()
+
+    try:
+        t1.join()
+        t2.join()
+    except KeyboardInterrupt:
+        stop_event.set()
     finally:
-        device.ungrab()
+        presenter.ungrab()
+        keyboard.ungrab()
 
     node.destroy_node()
     rclpy.shutdown()
