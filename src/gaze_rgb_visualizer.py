@@ -35,12 +35,18 @@ class GazeOverlay:
         std_dist: float = 200.0,
         s_min: float = 0.3,
         participant: str = "",
+        label_hold_duration: float = 2.0,
     ) -> None:
         self.gaze_pitch: float = 0.0
         self.gaze_yaw: float = 0.0
         self._rclpy = None
         self._ros_node = None
         self._ros_thread = None
+
+        # Label hold state: carry the last non-empty result for up to label_hold_duration seconds
+        self.label_hold_duration: float = label_hold_duration
+        self._held_entries: list[dict] = []
+        self._held_since: float = 0.0
 
         # Image sequence recording state
         self._participant = participant
@@ -124,7 +130,7 @@ class GazeOverlay:
             )
             self._ros_node.create_subscription(
                 CameraInfo,
-                "/static_camera/zed_right_node/rgb/camera_info",
+                "/zedr/zed_node/rgb/camera_info",
                 _camera_info_callback,
                 10,
             )
@@ -384,7 +390,10 @@ class GazeOverlay:
         return math.exp(-(d ** 2) / (2 * self.std_dist ** 2))
 
     def _publish_labels(self, det_summary: list[tuple[str, float, float]]) -> None:
-        """Publish {"label", "score"} for detections with score >= s_min, sorted descending."""
+        """Publish {"label", "score"} for detections with score >= s_min, sorted descending.
+
+        When entries are empty, the last non-empty result is held and re-published for up to
+        label_hold_duration seconds. A new non-empty result resets the hold window."""
         from std_msgs.msg import String
         entries = [
             {"label": label, "score": round(score, 4)}
@@ -392,6 +401,19 @@ class GazeOverlay:
             if score >= self.s_min
         ]
         entries.sort(key=lambda x: -x["score"])
+
+        now = time.monotonic()
+        if entries:
+            # New non-empty result: reset hold window
+            self._held_entries = entries
+            self._held_since = now
+        elif self._held_entries and (now - self._held_since) <= self.label_hold_duration:
+            # Within hold window: re-use last non-empty result
+            entries = self._held_entries
+        else:
+            # Hold expired or never had a result
+            self._held_entries = []
+
         msg = String()
         msg.data = json.dumps(entries) if entries else ""
         self._gaze_label_pub.publish(msg)
@@ -478,6 +500,7 @@ def run_gaze_rgb_visualizer(
     std_dist: float = 200.0,
     s_min: float = 0.3,
     participant: str = "",
+    label_hold_duration: float = 2.0,
 ) -> None:
     overlay = GazeOverlay(
         homography_path=homography_path,
@@ -493,6 +516,7 @@ def run_gaze_rgb_visualizer(
         std_dist=std_dist,
         s_min=s_min,
         participant=participant,
+        label_hold_duration=label_hold_duration,
     )
     stream = AriaRgbStream(
         device_ip=device_ip,
@@ -572,6 +596,10 @@ def parse_args() -> argparse.Namespace:
         "--participant", type=str, default="",
         help="Participant ID (e.g. AB12). Required for video recording to recordings/<participant>/NN/.",
     )
+    parser.add_argument(
+        "--label-hold", type=float, default=2.0, dest="label_hold",
+        help="Seconds to hold and re-publish the last non-empty gaze label when detection is lost (default: 2.0).",
+    )
     return parser.parse_args()
 
 
@@ -593,6 +621,7 @@ def main() -> None:
         std_dist=args.std_dist,
         s_min=args.s_min,
         participant=args.participant,
+        label_hold_duration=args.label_hold,
     )
 
 
