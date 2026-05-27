@@ -217,7 +217,7 @@ class SegServiceNode(Node):
             for src, dst in [(rgb_path, local_rgb), (depth_path, local_depth)]:
                 r = subprocess.run(
                     ["scp", "-o", "StrictHostKeyChecking=no",
-                     "-o", "ConnectTimeout=10",
+                     "-o", "ConnectTimeout=15",
                      f"{remote}:{src}", str(dst)],
                     capture_output=True, text=True,
                 )
