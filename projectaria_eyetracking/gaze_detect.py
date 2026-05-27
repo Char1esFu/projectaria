@@ -90,6 +90,12 @@ def parse_args() -> argparse.Namespace:
         default="192.168.8.117",
         help="IP address of the Aria device (e.g. 192.168.8.117).",
     )
+    parser.add_argument(
+        "--calib-duration",
+        type=float,
+        default=30.0,
+        help="Seconds to collect calibration samples after pressing C (default: 30).",
+    )
     return parser.parse_args()
 
 
@@ -224,19 +230,43 @@ def main() -> None:
     _crop_ox = 0
     _crop_oy = 0
     _calib_lock = threading.Lock()
+    _calib_timer: threading.Timer | None = None
+    calib_duration: float = args.calib_duration
 
-    def _on_calib_toggle(_msg):
-        nonlocal calibrating, compute_calib
+    def _stop_calib() -> None:
+        nonlocal calibrating, compute_calib, _calib_timer
         with _calib_lock:
             if not calibrating:
-                calib_samples.clear()
-                calibrating = True
-                print(f"Calibrating: look at marker {CALIB_MARKER_ID} center and move your head; press PageUp again to finish...")
-            else:
+                return
+            calibrating = False
+            compute_calib = True
+            _calib_timer = None
+        print(f"Calibration auto-stopped after {calib_duration:.0f}s.")
+
+    def _on_calib_start(_msg) -> None:
+        nonlocal calibrating, compute_calib, _calib_timer
+        with _calib_lock:
+            if calibrating:
+                # second press within calibration window — stop early
+                if _calib_timer is not None:
+                    _calib_timer.cancel()
+                    _calib_timer = None
                 calibrating = False
                 compute_calib = True
+                print("Calibration manually stopped.")
+                return
+            calib_samples.clear()
+            calibrating = True
+        print(
+            f"Calibrating: look at marker {CALIB_MARKER_ID} center and move your head; "
+            f"auto-stops in {calib_duration:.0f}s, or press C again to stop early..."
+        )
+        t = threading.Timer(calib_duration, _stop_calib)
+        t.daemon = True
+        t.start()
+        _calib_timer = t
 
-    ros_node.create_subscription(Empty, "/key/pageup", _on_calib_toggle, 10)
+    ros_node.create_subscription(Empty, "/key/c", _on_calib_start, 10)
     threading.Thread(target=rclpy.spin, args=(ros_node,), daemon=True).start()
 
     # Latest raw gaze (updated each EyeTrack frame, used when pairing with RGB)
@@ -244,8 +274,8 @@ def main() -> None:
     latest_yaw_raw: float = 0.0
 
     print(
-        f"Press PageUp to start calibration (look at ArUco marker {CALIB_MARKER_ID}), press PageUp again to finish. "
-        "'q'/ESC to quit."
+        f"Press C to start calibration (look at ArUco marker {CALIB_MARKER_ID}); "
+        f"auto-stops after {calib_duration:.0f}s. 'q'/ESC to quit."
     )
 
     try:
