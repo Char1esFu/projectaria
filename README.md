@@ -103,6 +103,31 @@ For both workstation and laptop:
   </Domain>
 </CycloneDDS>
 ```
+Local network time alignment across devices:
+```bash
+# install on both server and client computer
+sudo apt install chrony
+
+# edit config file
+sudo nano /etc/chrony/chrony.conf
+
+# on main workstation, add following to the conf
+allow 192.168.8.x/24
+local stratum 10
+
+sudo systemctl restart chrony.service
+
+# on external computer, add following to the corresponding conf
+# pool ntp.ubuntu.com iburst # comment out this line
+server 192.168.8.xxx iburst
+
+sudo systemctl restart chrony.service
+sudo chronyc makestep # skip timesteps and align immediately
+
+# verify
+chronyc tracking
+chronyc source -v
+```
 
 #### Setup DDS config on workstation and laptop
 ```bash
