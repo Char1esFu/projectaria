@@ -7,6 +7,7 @@ import whisper
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Empty, String
+from scipy.io import wavfile
 from scipy.signal import butter, sosfilt, resample_poly
 from math import gcd
 
@@ -55,6 +56,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--participant", default="",
         help="Participant ID (e.g. AB12). When set, creates the session subfolder on B press.",
+    )
+    parser.add_argument(
+        "--lowcut",
+        type=float,
+        default=100.0,
+        help="Bandpass lower cutoff frequency in Hz (default: 100)",
+    )
+    parser.add_argument(
+        "--highcut",
+        type=float,
+        default=4000.0,
+        help="Bandpass upper cutoff frequency in Hz (default: 4000)",
+    )
+    parser.add_argument(
+        "--filter-order",
+        type=int,
+        default=6,
+        help="Butterworth filter order (default: 6)",
     )
     return parser.parse_args()
 
@@ -105,7 +124,8 @@ def main():
 
     WHISPER_SAMPLE_RATE = 16000
     g = gcd(ARIA_AUDIO_SAMPLE_RATE, WHISPER_SAMPLE_RATE)
-    sos = butter(4, [80, 8000], btype="band", fs=ARIA_AUDIO_SAMPLE_RATE, output="sos")
+    sos = butter(args.filter_order, [args.lowcut, args.highcut], btype="band", fs=ARIA_AUDIO_SAMPLE_RATE, output="sos")
+    print(f"Bandpass filter: {args.lowcut}–{args.highcut} Hz, order {args.filter_order}")
 
     participant_base = None
     if args.participant:
@@ -113,13 +133,17 @@ def main():
         participant_base.mkdir(parents=True, exist_ok=True)
         print(f"Session folder: {participant_base}")
 
+    current_session_dir = [None]
+
     def on_b_press(_msg):
         observer.recording = True
         observer.audio_buffer.clear()
         if participant_base is not None:
             existing = [int(p.name) for p in participant_base.iterdir() if p.is_dir() and p.name.isdigit()]
             idx = max(existing, default=0) + 1
-            (participant_base / f"{idx:02d}").mkdir()
+            session_dir = participant_base / f"{idx:02d}"
+            session_dir.mkdir()
+            current_session_dir[0] = session_dir
         start_pub.publish(Empty())
         print("Recording...")
 
@@ -150,6 +174,11 @@ def main():
         audio_float = np.clip(audio_float * args.gain, -1.0, 1.0)
 
         audio_16k = resample_poly(audio_float, WHISPER_SAMPLE_RATE // g, ARIA_AUDIO_SAMPLE_RATE // g).astype(np.float32)
+
+        if current_session_dir[0] is not None:
+            wav_path = current_session_dir[0] / "audio.wav"
+            wavfile.write(wav_path, WHISPER_SAMPLE_RATE, audio_16k)
+            print(f"Saved: {wav_path}")
 
         print("Transcribing...")
         result = model.transcribe(audio_16k, fp16=False, language=args.language)
