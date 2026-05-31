@@ -135,8 +135,14 @@ class GazeOverlay:
                 10,
             )
             self._gaze_label_pub = self._ros_node.create_publisher(String, "/gaze_label", 10)
+            # Dedicated executor so multiple modules can spin their own nodes
+            # in parallel under main_entry.py without contending for the
+            # rclpy global executor.
+            from rclpy.executors import SingleThreadedExecutor
+            self._ros_executor = SingleThreadedExecutor()
+            self._ros_executor.add_node(self._ros_node)
             self._ros_thread = threading.Thread(
-                target=rclpy.spin, args=(self._ros_node,), daemon=True
+                target=self._ros_executor.spin, daemon=True
             )
             self._ros_thread.start()
             print("ROS2 publisher started: /gaze_label")
@@ -478,6 +484,10 @@ class GazeOverlay:
     def shutdown(self) -> None:
         self._stop_recording()
         try:
+            self._ros_executor.shutdown()
+        except Exception:
+            pass
+        try:
             self._ros_node.destroy_node()
             self._rclpy.shutdown()
         except Exception:
@@ -542,7 +552,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--update_iptables",
-        default=True,
+        default=False,
         action="store_true",
         help="Update iptables for DDS UDP stream (Linux only).",
     )
