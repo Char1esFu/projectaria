@@ -34,8 +34,7 @@ aria streaming install-certs
 Start streaming with aria glass sdk:
 ```bash
 # subscribe first(needed in all scenarios)
-python3 utils/streaming_start.py --interface wifi
-
+aria streaming start --interface wifi --device-ip 192.168.8.117 --use-ephemeral-certs --profile profile18
 # stop streaming
 aria streaming stop --device-ip 192.168.8.117
 ```
@@ -76,7 +75,7 @@ python3 src/clip_from_frames.py --participant AB12 --trial 04 --timestamp 177929
 python3 utils/device_stream.py --interface wifi --device-ip 192.168.8.117 --update_iptables
 
 # visualize point cloud to be sent, in sam3_env
-python3 utils/pc_viz.py 
+python3 utils/pcd_viz.py 
 
 # test command
 ros2 param set /seg_service target_label 'tomato'
