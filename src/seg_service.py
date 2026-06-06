@@ -48,7 +48,7 @@ from sensor_msgs.msg import PointCloud2, PointField
 from std_msgs.msg import Header
 from std_srvs.srv import Trigger
 
-YOLO_MODEL_DEFAULT = str(Path(__file__).parent.parent / "yolo_model" / "mixed.pt")
+YOLO_MODEL_DEFAULT = str(Path(__file__).parent.parent / "yolo_model" / "mixed_zed_realsense.pt")
 SAM3_MODEL_DEFAULT = str(Path(__file__).parent.parent / "yolo_model" / "sam3.pt")
 _VIZ_WIN = "SAM3 – mask preview  (close or press ESC to publish)"
 
@@ -118,6 +118,14 @@ def _make_overlay(bgr: np.ndarray, mask: np.ndarray,
                   label: str, best_box) -> np.ndarray:
     """Render mask + bbox + label onto bgr and return the overlay image."""
     overlay = bgr.copy()
+
+    # excluded triangular region (matches the ys > 1.4*xs + 80 mask used for YOLO)
+    h, w = overlay.shape[:2]
+    grid_ys, grid_xs = np.mgrid[0:h, 0:w]
+    tri_mask = grid_ys > 1.4 * grid_xs + 80.0
+    red = np.zeros_like(bgr)
+    red[tri_mask] = (0, 0, 220)
+    overlay = cv2.addWeighted(overlay, 0.7, red, 0.3, 0)
 
     green = np.zeros_like(bgr)
     green[mask] = (0, 220, 80)
@@ -301,8 +309,15 @@ class SegServiceNode(Node):
         try:
             best_box = None  # kept for visualisation
 
+            # ---- mask out triangular region before YOLO ---------------
+            img_for_yolo = bgr.copy()
+            h, w = img_for_yolo.shape[:2]
+            grid_ys, grid_xs = np.mgrid[0:h, 0:w]
+            tri_mask = grid_ys > 1.4 * grid_xs + 80.0
+            img_for_yolo[tri_mask] = 0
+
             # ---- segmentation -----------------------------------------
-            results = self._yolo(bgr, conf=self._conf, verbose=False, device=self._device)
+            results = self._yolo(img_for_yolo, conf=self._conf, verbose=False, device=self._device)
             best_conf = 0.0
             label_lc  = label.lower()
             for r in results:
