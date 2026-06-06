@@ -2,6 +2,7 @@ import argparse
 import sys
 import threading
 import time
+from collections import deque
 
 import aria.sdk as aria
 import cv2
@@ -55,16 +56,10 @@ def parse_args() -> argparse.Namespace:
         help="Update iptables to enable receiving the data stream, only for Linux.",
     )
     parser.add_argument(
-        "--pitch-ema-alpha",
+        "--smooth-window",
         type=float,
         default=0.5,
-        help="EMA smoothing factor for pitch (0 < alpha <= 1, lower = smoother).",
-    )
-    parser.add_argument(
-        "--yaw-ema-alpha",
-        type=float,
-        default=0.5,
-        help="EMA smoothing factor for yaw (0 < alpha <= 1, lower = smoother).",
+        help="Sliding-window duration (seconds) to average pitch/yaw before publishing.",
     )
     parser.add_argument(
         "--undistort-width",
@@ -217,9 +212,10 @@ def main() -> None:
     cv2.setWindowProperty(eyetrack_window, cv2.WND_PROP_TOPMOST, 1)
     cv2.moveWindow(eyetrack_window, 50, 800)
 
-    # EMA state
-    pitch_ema: float | None = None
-    yaw_ema: float | None = None
+    # Sliding-window state: keep (timestamp, pitch_cal, yaw_cal) for the past
+    # `smooth_window` seconds and publish their average.
+    smooth_window: float = args.smooth_window
+    gaze_history: deque[tuple[float, float, float]] = deque()
 
     # Calibration state
     calibrating = False
@@ -378,10 +374,14 @@ def main() -> None:
                 pitch_cal = pitch_raw - pitch_offset
                 yaw_cal = yaw_raw - yaw_offset
 
-                pitch_ema = pitch_cal if pitch_ema is None else args.pitch_ema_alpha * pitch_cal + (1 - args.pitch_ema_alpha) * pitch_ema
-                yaw_ema = yaw_cal if yaw_ema is None else args.yaw_ema_alpha * yaw_cal + (1 - args.yaw_ema_alpha) * yaw_ema
-                pitch = pitch_ema
-                yaw = yaw_ema
+                # Sliding window: average over the past `smooth_window` seconds.
+                now = time.monotonic()
+                gaze_history.append((now, pitch_cal, yaw_cal))
+                cutoff = now - smooth_window
+                while gaze_history and gaze_history[0][0] < cutoff:
+                    gaze_history.popleft()
+                pitch = sum(s[1] for s in gaze_history) / len(gaze_history)
+                yaw = sum(s[2] for s in gaze_history) / len(gaze_history)
 
                 print(
                     f"pitch={pitch:.4f}, yaw={yaw:.4f}"
