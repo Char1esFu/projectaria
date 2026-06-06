@@ -53,7 +53,7 @@ class GazeOverlay:
         self._writer_lock = threading.Lock()
         self._rec_active: bool = False
         self._rec_dir: Optional[Path] = None
-        self._rec_timestamps: list[int] = []
+        self._rec_frames: list[tuple[int, np.ndarray]] = []
 
         # Latest camera_info stamp from manipulation workstation (nanoseconds, rosbag time)
         self._latest_manip_stamp_ns: Optional[int] = None
@@ -162,20 +162,22 @@ class GazeOverlay:
             meta = {"rosbag_start_time_ns": self._latest_manip_stamp_ns}
             (session_dir / "sync.json").write_text(json.dumps(meta, indent=2))
         with self._writer_lock:
-            frames_dir = session_dir / "frames"
-            frames_dir.mkdir(parents=True, exist_ok=True)
-            self._rec_dir = frames_dir
+            # Defer mkdir to _stop_recording — during recording we touch the
+            # disk for nothing, only buffering frames in memory.
+            self._rec_dir = session_dir / "frames"
             self._rec_active = True
-            self._rec_timestamps = []
-            print(f"Image recording started → {frames_dir}")
+            self._rec_frames = []
+            print(f"Image recording started → {self._rec_dir}")
 
     def record_frame(self, frame: np.ndarray) -> None:
         with self._writer_lock:
             if not self._rec_active or self._rec_dir is None:
                 return
             ts = self._latest_manip_stamp_ns if self._latest_manip_stamp_ns is not None else 0
-            cv2.imwrite(str(self._rec_dir / f"{ts}.png"), frame)
-            self._rec_timestamps.append(ts)
+            # Buffer only — no disk I/O while recording. `frame` (the loop's
+            # `display`) is a fresh array each iteration, so we can keep the
+            # reference without copying.
+            self._rec_frames.append((ts, frame))
 
     def _stop_recording(self) -> None:
         with self._writer_lock:
@@ -183,14 +185,24 @@ class GazeOverlay:
                 return
             self._rec_active = False
             rec_dir = self._rec_dir
-            timestamps = list(self._rec_timestamps)
+            frames = self._rec_frames
             self._rec_dir = None
-            self._rec_timestamps = []
+            self._rec_frames = []
 
-        if rec_dir is None or not timestamps:
+        if rec_dir is None or not frames:
             return
-        print(f"Saved {len(timestamps)} frames to {rec_dir}")
-        threading.Thread(target=self._encode_video, args=(rec_dir, timestamps), daemon=True).start()
+        # Flush the whole batch to disk and encode off the main thread; lag here
+        # is fine since recording has already stopped.
+        threading.Thread(target=self._flush_and_encode, args=(rec_dir, frames), daemon=True).start()
+
+    def _flush_and_encode(self, frames_dir: Path, frames: list[tuple[int, np.ndarray]]) -> None:
+        frames_dir.mkdir(parents=True, exist_ok=True)
+        timestamps: list[int] = []
+        for ts, frame in frames:
+            cv2.imwrite(str(frames_dir / f"{ts}.png"), frame)
+            timestamps.append(ts)
+        print(f"Saved {len(timestamps)} frames to {frames_dir}")
+        self._encode_video(frames_dir, timestamps)
 
     def _encode_video(self, frames_dir: Path, timestamps: list[int]) -> None:
         import subprocess
