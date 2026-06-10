@@ -35,7 +35,6 @@ class GazeOverlay:
         std_dist: float = 200.0,
         s_min: float = 0.3,
         participant: str = "",
-        label_hold_duration: float = 2.0,
     ) -> None:
         self.gaze_pitch: float = 0.0
         self.gaze_yaw: float = 0.0
@@ -43,17 +42,26 @@ class GazeOverlay:
         self._ros_node = None
         self._ros_thread = None
 
-        # Label hold state: carry the last non-empty result for up to label_hold_duration seconds
-        self.label_hold_duration: float = label_hold_duration
-        self._held_entries: list[dict] = []
-        self._held_since: float = 0.0
-
         # Image sequence recording state
         self._participant = participant
         self._writer_lock = threading.Lock()
         self._rec_active: bool = False
         self._rec_dir: Optional[Path] = None
         self._rec_frames: list[tuple[int, np.ndarray]] = []
+
+        # /gaze_label (recording-gated) state.
+        # Rolling window: average each label's score over a short window. The average
+        # divides by the number of frames the label *appeared* in (not the window's
+        # total frame count). After recording stops, the last averaged result is
+        # re-published for label_tail_duration seconds.
+        self._label_window_duration: float = 0.5
+        self._label_buffer: list[tuple[float, list[dict]]] = []
+        self._label_tail_duration: float = 2.0
+        self._last_entries: list[dict] = []
+        # Latest /gaze_label content (window-averaged, recording-gated) for the
+        # top-left overlay drawn onto the recorded frames.
+        self._gaze_label_display: list[dict] = []
+        self._rec_stop_time: float = 0.0
 
         # Latest camera_info stamp from manipulation workstation (nanoseconds, rosbag time)
         self._latest_manip_stamp_ns: Optional[int] = None
@@ -126,7 +134,7 @@ class GazeOverlay:
                 Empty, "/recording/start", lambda _: self._on_recording_start(), 10
             )
             self._ros_node.create_subscription(
-                String, "/transcription", lambda _: self._stop_recording(), 10
+                Empty, "/key/b/release", lambda _: self._stop_recording(), 10
             )
             self._ros_node.create_subscription(
                 CameraInfo,
@@ -134,6 +142,9 @@ class GazeOverlay:
                 _camera_info_callback,
                 10,
             )
+            # /gaze_label_raw: unconditional backup stream (always published).
+            self._gaze_label_raw_pub = self._ros_node.create_publisher(String, "/gaze_label_raw", 10)
+            # /gaze_label: same format, but only carries content while recording (+2s tail).
             self._gaze_label_pub = self._ros_node.create_publisher(String, "/gaze_label", 10)
             # Dedicated executor so multiple modules can spin their own nodes
             # in parallel under main_entry.py without contending for the
@@ -145,7 +156,7 @@ class GazeOverlay:
                 target=self._ros_executor.spin, daemon=True
             )
             self._ros_thread.start()
-            print("ROS2 publisher started: /gaze_label")
+            print("ROS2 publishers started: /gaze_label_raw, /gaze_label")
         except Exception as exc:
             raise RuntimeError(f"ROS2 subscriber unavailable: {exc}") from exc
 
@@ -184,6 +195,8 @@ class GazeOverlay:
             if not self._rec_active:
                 return
             self._rec_active = False
+            # Start the 2s tail during which /gaze_label keeps re-publishing the last frame.
+            self._rec_stop_time = time.monotonic()
             rec_dir = self._rec_dir
             frames = self._rec_frames
             self._rec_dir = None
@@ -351,12 +364,14 @@ class GazeOverlay:
             2,
             cv2.LINE_AA,
         )
-        if self._last_det_summary:
+        # Top-left detection text mirrors /gaze_label (window-averaged, recording-gated),
+        # not /gaze_label_raw, so the recorded video shows the published labels.
+        if self._gaze_label_display:
             det_y = 60
-            for det_label, _, det_score in self._last_det_summary:
+            for entry in self._gaze_label_display:
                 cv2.putText(
                     display_image,
-                    f"{det_label}  score={det_score:.2f}",
+                    f"{entry['label']}  score={entry['score']:.2f}",
                     (10, det_y),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.55,
@@ -366,8 +381,8 @@ class GazeOverlay:
                 )
                 det_y += 22
 
-        if crop_vis is not None:
-            cv2.imshow("YOLO Crop", crop_vis)
+        # if crop_vis is not None:
+        #     cv2.imshow("YOLO Crop", crop_vis)
 
         if self.draw_gaze and gaze_pt is not None:
             cv2.circle(display_image, gaze_pt, cross_size, color, 2)
@@ -376,7 +391,7 @@ class GazeOverlay:
         if self.enable_capture:
             capture_text = "CAPTURE: ON (press S to stop)" if self.capture_active else "CAPTURE: OFF (press S to start)"
             capture_color = (0, 255, 0) if self.capture_active else (0, 255, 255)
-            cap_y = 60 + 22 * len(self._last_det_summary)
+            cap_y = 60 + 22 * len(self._gaze_label_display)
             cv2.putText(
                 display_image,
                 capture_text,
@@ -410,8 +425,9 @@ class GazeOverlay:
     def _publish_labels(self, det_summary: list[tuple[str, float, float]]) -> None:
         """Publish {"label", "score"} for detections with score >= s_min, sorted descending.
 
-        When entries are empty, the last non-empty result is held and re-published for up to
-        label_hold_duration seconds. A new non-empty result resets the hold window."""
+        /gaze_label_raw always carries the current frame's detections (backup stream).
+        /gaze_label carries a window-averaged result only while recording; after recording
+        stops it keeps re-publishing the last averaged result for label_tail_duration seconds."""
         from std_msgs.msg import String
         entries = [
             {"label": label, "score": round(score, 4)}
@@ -420,21 +436,50 @@ class GazeOverlay:
         ]
         entries.sort(key=lambda x: -x["score"])
 
-        now = time.monotonic()
-        if entries:
-            # New non-empty result: reset hold window
-            self._held_entries = entries
-            self._held_since = now
-        elif self._held_entries and (now - self._held_since) <= self.label_hold_duration:
-            # Within hold window: re-use last non-empty result
-            entries = self._held_entries
-        else:
-            # Hold expired or never had a result
-            self._held_entries = []
+        raw_data = json.dumps(entries) if entries else ""
+        raw_msg = String()
+        raw_msg.data = raw_data
+        self._gaze_label_raw_pub.publish(raw_msg)
 
-        msg = String()
-        msg.data = json.dumps(entries) if entries else ""
-        self._gaze_label_pub.publish(msg)
+        now = time.monotonic()
+
+        # Rolling window: keep the last _label_window_duration seconds of per-frame entries.
+        self._label_buffer.append((now, entries))
+        cutoff = now - self._label_window_duration
+        self._label_buffer = [(t, e) for (t, e) in self._label_buffer if t >= cutoff]
+
+        # Average each label's score over the frames it appeared in (divide by appearances,
+        # not by the window's total frame count), then sort descending.
+        sums: dict[str, float] = {}
+        counts: dict[str, int] = {}
+        for _, frame_entries in self._label_buffer:
+            for item in frame_entries:
+                lbl = item["label"]
+                sums[lbl] = sums.get(lbl, 0.0) + item["score"]
+                counts[lbl] = counts.get(lbl, 0) + 1
+        avg_entries = [
+            {"label": lbl, "score": round(sums[lbl] / counts[lbl], 4)} for lbl in sums
+        ]
+        avg_entries.sort(key=lambda x: -x["score"])
+
+        if self._rec_active:
+            # During recording: publish the window-averaged result and remember it for the tail.
+            self._last_entries = avg_entries
+            self._gaze_label_display = avg_entries
+            gated_data = json.dumps(avg_entries) if avg_entries else ""
+        elif self._last_entries and (now - self._rec_stop_time) <= self._label_tail_duration:
+            # 2s tail after stop: keep emitting the last averaged result.
+            self._gaze_label_display = self._last_entries
+            gated_data = json.dumps(self._last_entries)
+        else:
+            # Not recording (or tail expired): emit nothing.
+            self._last_entries = []
+            self._gaze_label_display = []
+            gated_data = ""
+
+        gated_msg = String()
+        gated_msg.data = gated_data
+        self._gaze_label_pub.publish(gated_msg)
 
     def _draw_circles(
         self, img: np.ndarray, result,
@@ -522,7 +567,6 @@ def run_gaze_rgb_visualizer(
     std_dist: float = 200.0,
     s_min: float = 0.3,
     participant: str = "",
-    label_hold_duration: float = 2.0,
 ) -> None:
     overlay = GazeOverlay(
         homography_path=homography_path,
@@ -538,7 +582,6 @@ def run_gaze_rgb_visualizer(
         std_dist=std_dist,
         s_min=s_min,
         participant=participant,
-        label_hold_duration=label_hold_duration,
     )
     stream = AriaRgbStream(
         device_ip=device_ip,
@@ -618,10 +661,6 @@ def parse_args() -> argparse.Namespace:
         "--participant", type=str, default="",
         help="Participant ID (e.g. AB12). Required for video recording to recordings/<participant>/NN/.",
     )
-    parser.add_argument(
-        "--label-hold", type=float, default=2.0, dest="label_hold",
-        help="Seconds to hold and re-publish the last non-empty gaze label when detection is lost (default: 2.0).",
-    )
     return parser.parse_args()
 
 
@@ -643,7 +682,6 @@ def main() -> None:
         std_dist=args.std_dist,
         s_min=args.s_min,
         participant=args.participant,
-        label_hold_duration=args.label_hold,
     )
 
 
