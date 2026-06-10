@@ -205,12 +205,12 @@ def main() -> None:
     print("Start listening to image data")
     streaming_client.subscribe()
 
-    eyetrack_window = "Aria EyeTrack"
+    # eyetrack_window = "Aria EyeTrack"
 
-    cv2.namedWindow(eyetrack_window, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(eyetrack_window, 640, 240)
-    cv2.setWindowProperty(eyetrack_window, cv2.WND_PROP_TOPMOST, 1)
-    cv2.moveWindow(eyetrack_window, 50, 800)
+    # cv2.namedWindow(eyetrack_window, cv2.WINDOW_NORMAL)
+    # cv2.resizeWindow(eyetrack_window, 640, 240)
+    # cv2.setWindowProperty(eyetrack_window, cv2.WND_PROP_TOPMOST, 1)
+    # cv2.moveWindow(eyetrack_window, 50, 800)
 
     # Sliding-window state: keep (timestamp, pitch_cal, yaw_cal) for the past
     # `smooth_window` seconds and publish their average.
@@ -360,7 +360,7 @@ def main() -> None:
                 eyetrack_image = observer.images[aria.CameraId.EyeTrack]
                 del observer.images[aria.CameraId.EyeTrack]
 
-                cv2.imshow(eyetrack_window, eyetrack_image)
+                # cv2.imshow(eyetrack_window, eyetrack_image)
 
                 # The model expects a single grayscale image containing [left | right] eyes.
                 eye_tensor = torch.from_numpy(eyetrack_image)
