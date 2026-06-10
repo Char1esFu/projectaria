@@ -1,9 +1,13 @@
 import argparse
+import os
 import sys
 import threading
 from math import gcd
 from pathlib import Path
 from typing import Optional
+
+import time
+import sounddevice as sd
 
 import aria.sdk as aria
 import numpy as np
@@ -23,6 +27,39 @@ ARIA_NUM_CHANNELS = 7
 WHISPER_SAMPLE_RATE = 16000
 AUDIO_GAP_TOLERANCE_SAMPLES = 2
 
+# Local headset capture (via PulseAudio). The raw ALSA device is held exclusively
+# by PulseAudio, so we record through the "default" pulse source: plugging in the
+# H390 makes it the system default input, so no hardware name needs hard-coding.
+# Override with --pulse-source if a non-default source is ever needed.
+LOCAL_SAMPLE_RATE = 44100
+
+def beep(freq: float = 440.0, duration: float = 0.1, volume: float = 0.5, sample_rate: int = 44100) -> None:
+    t = np.linspace(0, duration, int(sample_rate * duration), endpoint=False)
+    wave = (volume * np.sin(2 * np.pi * freq * t)).astype(np.float32)
+    sd.play(wave, samplerate=sample_rate)
+    sd.wait()
+
+
+def beep_n(times: int = 1, freq: float = 880.0, duration: float = 0.2, interval: float = 0.1) -> None:
+    for i in range(times):
+        beep(freq=freq, duration=duration)
+        if i < times - 1:
+            time.sleep(interval)
+
+def play_calib_beep():
+    beep()
+    time.sleep(0.5)
+    beep()
+    time.sleep(0.5)
+    beep()
+    time.sleep(0.5)
+    beep()
+    time.sleep(0.5)
+
+    print("Triple beep:")
+    beep_n(times=1)
+    time.sleep(0.5)
+    
 
 class AudioHandler:
     """Receives audio frames from the shared AriaStream, drives the record / transcribe
@@ -43,24 +80,34 @@ class AudioHandler:
         highcut: float = 4000.0,
         filter_order: int = 6,
         whisper_model: str = "small",
+        source: str = "aria",
     ) -> None:
         self.channels = channels
         self.gain = gain
         self.language = language
 
-        self.audio_buffer: list[tuple[np.ndarray, np.ndarray]] = []
+        # Input sample rate depends on the capture source: Aria glasses (48 kHz,
+        # 7 ch int32) vs. the local H390 headset (44.1 kHz, mono float32).
+        self.source = source
+        self.input_sample_rate = LOCAL_SAMPLE_RATE if source == "local" else ARIA_AUDIO_SAMPLE_RATE
+
+        self.audio_buffer: list = []
         self._buffer_lock = threading.Lock()
         self.recording: bool = False
+
+        # Local-capture InputStream (created lazily in start_local_capture()).
+        self._local_stream: Optional[sd.InputStream] = None
 
         print("Loading whisper model...")
         self.model = whisper.load_model(whisper_model)
 
-        self._g = gcd(ARIA_AUDIO_SAMPLE_RATE, WHISPER_SAMPLE_RATE)
+        self._g = gcd(self.input_sample_rate, WHISPER_SAMPLE_RATE)
         self._sos = butter(
             filter_order, [lowcut, highcut], btype="band",
-            fs=ARIA_AUDIO_SAMPLE_RATE, output="sos",
+            fs=self.input_sample_rate, output="sos",
         )
-        print(f"Bandpass filter: {lowcut}–{highcut} Hz, order {filter_order}")
+        print(f"Bandpass filter: {lowcut}–{highcut} Hz, order {filter_order} "
+              f"(source={source}, {self.input_sample_rate} Hz)")
 
         self._participant_base: Optional[Path] = None
         if participant:
@@ -94,9 +141,6 @@ class AudioHandler:
         print("Press [B] to record, release to transcribe. Ctrl+C to quit.")
 
     def _on_b_press(self, _msg: Empty) -> None:
-        with self._buffer_lock:
-            self.audio_buffer.clear()
-            self.recording = True
         if self._participant_base is not None:
             existing = [
                 int(p.name) for p in self._participant_base.iterdir()
@@ -107,6 +151,10 @@ class AudioHandler:
             session_dir.mkdir()
             self._current_session_dir = session_dir
         self._pub_start.publish(Empty())
+        with self._buffer_lock:
+            self.audio_buffer.clear()
+            play_calib_beep()
+            self.recording = True
         print("Recording...")
 
     def _on_b_release(self, _msg: Empty) -> None:
@@ -130,6 +178,43 @@ class AudioHandler:
             pass
 
     # ------------------------------------------------------------------
+    # Local H390 capture (sounddevice / PulseAudio)
+    # ------------------------------------------------------------------
+
+    def _on_local_audio(self, indata: np.ndarray, frames: int, time_info, status) -> None:
+        """sounddevice callback: buffer mono float32 frames while recording."""
+        if not self.recording:
+            return
+        # indata is (frames, 1) float32; flatten to mono and copy (the buffer is reused).
+        chunk = indata[:, 0].copy()
+        with self._buffer_lock:
+            if self.recording:
+                self.audio_buffer.append(chunk)
+
+    def start_local_capture(self) -> None:
+        """Open the local input stream. Uses PulseAudio's default source (the H390
+        once plugged in), unless PULSE_SOURCE was set in main() to override it."""
+        self._local_stream = sd.InputStream(
+            device="default",
+            channels=1,
+            samplerate=self.input_sample_rate,
+            dtype="float32",
+            callback=self._on_local_audio,
+        )
+        self._local_stream.start()
+        override = os.environ.get("PULSE_SOURCE")
+        print(f"Local capture started (source={override or 'PulseAudio default'}).")
+
+    def stop_local_capture(self) -> None:
+        if self._local_stream is not None:
+            try:
+                self._local_stream.stop()
+                self._local_stream.close()
+            except Exception:
+                pass
+            self._local_stream = None
+
+    # ------------------------------------------------------------------
     # Transcription pipeline
     # ------------------------------------------------------------------
 
@@ -144,27 +229,15 @@ class AudioHandler:
             print("Press [B] to record again. Ctrl+C to quit.")
             return
 
-        frames, inserted_samples, dropped_overlap = self._timestamp_aligned_frames(chunks)
-        if frames.size == 0:
+        if self.source == "local":
+            audio_float = self._local_audio_float(chunks)
+        else:
+            audio_float = self._aria_audio_float(chunks)
+        if audio_float is None or audio_float.size == 0:
             print("No complete audio frames received.")
             print("Press [B] to record again. Ctrl+C to quit.")
             return
-        if inserted_samples:
-            inserted_ms = inserted_samples / ARIA_AUDIO_SAMPLE_RATE * 1000.0
-            print(
-                f"Audio timestamp alignment inserted {inserted_samples} "
-                f"samples ({inserted_ms:.1f} ms) of silence."
-            )
-        if dropped_overlap:
-            dropped_ms = dropped_overlap / ARIA_AUDIO_SAMPLE_RATE * 1000.0
-            print(
-                f"Audio timestamp alignment dropped {dropped_overlap} "
-                f"overlapping samples ({dropped_ms:.1f} ms)."
-            )
 
-        channels = self.channels if self.channels is not None else list(range(ARIA_NUM_CHANNELS))
-        channel_data = frames[:, channels].mean(axis=1).astype(np.int32)
-        audio_float = (channel_data >> 16).astype(np.float32) / 32768.0
         audio_float = sosfilt(self._sos, audio_float).astype(np.float32)
 
         rms = np.sqrt(np.mean(audio_float ** 2))
@@ -175,7 +248,7 @@ class AudioHandler:
         audio_16k = resample_poly(
             audio_float,
             WHISPER_SAMPLE_RATE // self._g,
-            ARIA_AUDIO_SAMPLE_RATE // self._g,
+            self.input_sample_rate // self._g,
         ).astype(np.float32)
 
         if self._current_session_dir is not None:
@@ -200,6 +273,33 @@ class AudioHandler:
 
         print(f"Text: {text}")
         print("Press [B] to record again. Ctrl+C to quit.")
+
+    def _aria_audio_float(self, chunks: list) -> Optional[np.ndarray]:
+        """Aria path: timestamp-align 7-channel int32 frames, mix selected channels,
+        and convert to mono float32 at ARIA_AUDIO_SAMPLE_RATE (pre-filter)."""
+        frames, inserted_samples, dropped_overlap = self._timestamp_aligned_frames(chunks)
+        if frames.size == 0:
+            return None
+        if inserted_samples:
+            inserted_ms = inserted_samples / ARIA_AUDIO_SAMPLE_RATE * 1000.0
+            print(
+                f"Audio timestamp alignment inserted {inserted_samples} "
+                f"samples ({inserted_ms:.1f} ms) of silence."
+            )
+        if dropped_overlap:
+            dropped_ms = dropped_overlap / ARIA_AUDIO_SAMPLE_RATE * 1000.0
+            print(
+                f"Audio timestamp alignment dropped {dropped_overlap} "
+                f"overlapping samples ({dropped_ms:.1f} ms)."
+            )
+
+        channels = self.channels if self.channels is not None else list(range(ARIA_NUM_CHANNELS))
+        channel_data = frames[:, channels].mean(axis=1).astype(np.int32)
+        return (channel_data >> 16).astype(np.float32) / 32768.0
+
+    def _local_audio_float(self, chunks: list) -> Optional[np.ndarray]:
+        """Local path: concatenate the buffered mono float32 H390 chunks."""
+        return np.concatenate(chunks).astype(np.float32)
 
     def _timestamp_aligned_frames(
         self,
@@ -292,11 +392,23 @@ def parse_args() -> argparse.Namespace:
                         help="Bandpass upper cutoff frequency in Hz (default: 4000)")
     parser.add_argument("--filter-order", type=int, default=6,
                         help="Butterworth filter order (default: 6)")
+    parser.add_argument("--source", choices=["aria", "local"], default="aria",
+                        help="Audio source: 'aria' (glasses, 48kHz 7ch) or "
+                             "'local' (headset via PulseAudio default source, 44.1kHz mono). Default: aria")
+    parser.add_argument("--pulse-source", default=None,
+                        help="Override the PulseAudio capture source name for --source local "
+                             "(default: system default source, i.e. the plugged-in headset).")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+
+    # Only override PulseAudio's default capture source if explicitly requested;
+    # otherwise the system default (the plugged-in headset) is used. libpulse reads
+    # PULSE_SOURCE when the stream connects.
+    if args.source == "local" and args.pulse_source:
+        os.environ["PULSE_SOURCE"] = args.pulse_source
 
     handler = AudioHandler(
         channels=args.channel,
@@ -306,7 +418,23 @@ def main() -> None:
         lowcut=args.lowcut,
         highcut=args.highcut,
         filter_order=args.filter_order,
+        source=args.source,
     )
+
+    if args.source == "local":
+        # No Aria stream needed; capture locally and keep the process alive while
+        # the ROS spin thread drives the B-key record/transcribe state machine.
+        handler.start_local_capture()
+        try:
+            while True:
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            handler.stop_local_capture()
+            handler.shutdown()
+        return
+
     stream = AriaStream(
         device_ip=args.device_ip,
         update_iptables_rules=args.update_iptables,
