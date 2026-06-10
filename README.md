@@ -49,8 +49,8 @@ python3 -m projectaria_eyetracking.gaze_detect
 # gaze projection on egocentric image with yolo detection and gaze score calculation
 python3 -m src.gaze_rgb_visualizer --yolo --draw-gaze --participant AB12
 
-# record audio, long press bottom right button
-python3 -m src.audio_record --participant AB12
+# record audio, long press bottom right button, if --source local is added, use PulseAudio's default microphone
+python3 -m src.audio_record --participant AB12 # --source local
 ```
 In ~/venv/sam3_env:
 ```bash
