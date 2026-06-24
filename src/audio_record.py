@@ -128,6 +128,11 @@ class AudioHandler:
         self._node = Node("audio_transcriber")
         self._pub_text = self._node.create_publisher(String, "/transcription", 10)
         self._pub_start = self._node.create_publisher(Empty, "/recording/start", 10)
+        # Published once the calibration beep ends, so gaze_label accumulation begins
+        # after the beep rather than at video-recording start.
+        self._pub_gaze_label_start = self._node.create_publisher(
+            Empty, "/gaze_label_recording_start", 10
+        )
         self._node.create_subscription(Empty, "/key/b/press", self._on_b_press, 10)
         self._node.create_subscription(Empty, "/key/b/release", self._on_b_release, 10)
         # Dedicated executor so we don't fight other modules over the rclpy
@@ -155,6 +160,8 @@ class AudioHandler:
             self.audio_buffer.clear()
             play_calib_beep()
             self.recording = True
+        # Beep finished — signal gaze_label accumulation to start now.
+        self._pub_gaze_label_start.publish(Empty())
         print("Recording...")
 
     def _on_b_release(self, _msg: Empty) -> None:
