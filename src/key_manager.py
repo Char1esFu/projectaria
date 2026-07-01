@@ -26,15 +26,15 @@ def _watch_presenter(device, b_press_pub, b_release_pub, stop_event):
         pass
 
 
-def _watch_keyboard(device, c_pub, stop_event):
+def _watch_keyboard(device, lb_pub, stop_event):
     try:
         for event in device.read_loop():
             if stop_event.is_set():
                 break
             if event.type != ecodes.EV_KEY:
                 continue
-            if event.code == ecodes.KEY_C and event.value == 1:
-                c_pub.publish(Empty())
+            if event.code == ecodes.KEY_LEFTBRACE and event.value == 1:
+                lb_pub.publish(Empty())
     except Exception:
         pass
 
@@ -44,7 +44,7 @@ def main():
     node = Node("key_manager")
     b_press_pub = node.create_publisher(Empty, "/key/b/press", 10)
     b_release_pub = node.create_publisher(Empty, "/key/b/release", 10)
-    c_pub = node.create_publisher(Empty, "/key/c", 10)
+    lb_pub = node.create_publisher(Empty, "/key/leftbrace", 10)
 
     threading.Thread(target=rclpy.spin, args=(node,), daemon=True).start()
 
@@ -55,11 +55,11 @@ def main():
     print(f"key_manager: grabbed {PRESENTER_DEVICE}")
     print(f"key_manager: grabbed {KEYBOARD_DEVICE}")
     print("  B press/release → /key/b/press, /key/b/release")
-    print("  C press         → /key/c  (starts calibration; auto-stops after --calib-duration seconds)")
+    print("  [ press         → /key/leftbrace  (starts calibration; auto-stops after --calib-duration seconds)")
 
     stop_event = threading.Event()
     t1 = threading.Thread(target=_watch_presenter, args=(presenter, b_press_pub, b_release_pub, stop_event), daemon=True)
-    t2 = threading.Thread(target=_watch_keyboard, args=(keyboard, c_pub, stop_event), daemon=True)
+    t2 = threading.Thread(target=_watch_keyboard, args=(keyboard, lb_pub, stop_event), daemon=True)
     t1.start()
     t2.start()
 

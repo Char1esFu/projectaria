@@ -255,14 +255,14 @@ def main() -> None:
             calibrating = True
         print(
             f"Calibrating: look at marker {CALIB_MARKER_ID} center and move your head; "
-            f"auto-stops in {calib_duration:.0f}s, or press C again to stop early..."
+            f"auto-stops in {calib_duration:.0f}s, or press [ again to stop early..."
         )
         t = threading.Timer(calib_duration, _stop_calib)
         t.daemon = True
         t.start()
         _calib_timer = t
 
-    ros_node.create_subscription(Empty, "/key/c", _on_calib_start, 10)
+    ros_node.create_subscription(Empty, "/key/leftbrace", _on_calib_start, 10)
     threading.Thread(target=rclpy.spin, args=(ros_node,), daemon=True).start()
 
     # Latest raw gaze (updated each EyeTrack frame, used when pairing with RGB)
