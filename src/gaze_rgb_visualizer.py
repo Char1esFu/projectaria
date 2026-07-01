@@ -482,6 +482,19 @@ class GazeOverlay:
         after stop it keeps re-publishing the last averaged result for
         label_tail_duration seconds."""
         from std_msgs.msg import String
+
+        def _normalize(items: list[dict]) -> list[dict]:
+            """Divide each score by the sum of scores in this outgoing result, so the
+            published scores form a relative distribution. Applied right before sending;
+            the averaging buffer keeps the raw (un-normalized) scores."""
+            total = sum(it["score"] for it in items)
+            if total <= 0:
+                return items
+            return [
+                {"label": it["label"], "score": round(it["score"] / total, 4)}
+                for it in items
+            ]
+
         entries = [
             {"label": label, "score": round(score, 4)}
             for label, _, score in det_summary
@@ -506,8 +519,7 @@ class GazeOverlay:
             # (buffer was cleared on /gaze_label_recording_start; never trimmed here).
             self._label_buffer.append((now, entries))
 
-        # Average each label's score over the frames it appeared in (divide by appearances,
-        # not by the total frame count), then sort descending.
+        # average label scores over the accumulated frames/occurances
         sums: dict[str, float] = {}
         counts: dict[str, int] = {}
         for _, frame_entries in self._label_buffer:
@@ -515,37 +527,45 @@ class GazeOverlay:
                 lbl = item["label"]
                 sums[lbl] = sums.get(lbl, 0.0) + item["score"]
                 counts[lbl] = counts.get(lbl, 0) + 1
+        num_count = len(self._label_buffer)
         avg_entries = [
             {"label": lbl, "score": round(sums[lbl] / counts[lbl], 4)} for lbl in sums
+            # {"label": lbl, "score": round(sums[lbl] / num_count, 4)} for lbl in sums
+            
         ]
         avg_entries.sort(key=lambda x: -x["score"])
 
         if self._label_active:
-            # While accumulating: publish the averaged result and remember it for the tail.
+            # While accumulating: send the averaged result and remember it for the tail.
             self._last_entries = avg_entries
-            self._gaze_label_display = avg_entries
-            gated_data = json.dumps(avg_entries) if avg_entries else ""
-            # Log this frame's raw detections and the published (averaged) result,
-            # keyed by the same manip stamp the frame PNGs use.
-            with self._writer_lock:
-                if self._label_active:
-                    self._label_log.append({
-                        "stamp_ns": self._latest_manip_stamp_ns,
-                        "detected": entries,
-                        "published": avg_entries,
-                    })
+            out_entries = avg_entries
         elif self._last_entries and (now - self._rec_stop_time) <= self._label_tail_duration:
             # 2s tail after stop: keep emitting the last averaged result.
-            self._gaze_label_display = self._last_entries
-            gated_data = json.dumps(self._last_entries)
+            out_entries = self._last_entries
         else:
             # Not accumulating (or tail expired): emit nothing.
             self._last_entries = []
-            self._gaze_label_display = []
-            gated_data = ""
+            out_entries = []
+
+        # Normalize the outgoing result right before sending (divide by the sum of its
+        # own scores), so the published distribution sums to 1 over its labels. The
+        # averaging buffer above keeps the raw (un-normalized) scores.
+        self._gaze_label_display = out_entries.copy()
+        out_entries = _normalize(out_entries)
+
+
+        if self._label_active:
+            # Log this frame's raw detections and the published (normalized) result,
+            # keyed by the same manip stamp the frame PNGs use.
+            with self._writer_lock:
+                self._label_log.append({
+                    "stamp_ns": self._latest_manip_stamp_ns,
+                    "detected": entries,
+                    "published": out_entries,
+                })
 
         gated_msg = String()
-        gated_msg.data = gated_data
+        gated_msg.data = json.dumps(out_entries) if out_entries else ""
         self._gaze_label_pub.publish(gated_msg)
 
     def _draw_circles(
