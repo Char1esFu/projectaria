@@ -10,11 +10,15 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
+from src.frame_stitcher import stitch_recording
+from src.gaze_track_cluster import analyze_track
 from utils.aria_rgb_stream import AriaRgbStream
 
 MODEL_PATH = Path(__file__).parent.parent / "yolo_model" / "last_aria_4.pt"
 CROP_SIZE = 200
 RESIZE_SIZE = 1080
+DEFAULT_GAZE_CLUSTER_WINDOW = 9
+DEFAULT_GAZE_CLUSTER_RADIUS = 20.0
 
 
 class GazeOverlay:
@@ -35,7 +39,8 @@ class GazeOverlay:
         std_dist: float = 200.0,
         s_min: float = 0.3,
         participant: str = "",
-        label_window_duration: Optional[float] = None,
+        gaze_cluster_window: int = DEFAULT_GAZE_CLUSTER_WINDOW,
+        gaze_cluster_radius: float = DEFAULT_GAZE_CLUSTER_RADIUS,
     ) -> None:
         self.gaze_pitch: float = 0.0
         self.gaze_yaw: float = 0.0
@@ -49,28 +54,25 @@ class GazeOverlay:
         self._rec_active: bool = False
         self._rec_dir: Optional[Path] = None
         self._rec_frames: list[tuple[int, np.ndarray]] = []
+        # Pristine copies (post-warp, pre-annotation) for stitching — one per
+        # unique manip stamp, handed from draw() to record_frame().
+        self._rec_clean_frames: list[tuple[int, np.ndarray]] = []
+        self._clean_frame: Optional[np.ndarray] = None
 
-        # /gaze_label accumulation state. This is gated by /gaze_label_recording_start
-        # (published after the calibration beep finishes), NOT by /recording/start —
-        # so gaze_label score accumulation begins once the beep ends, not when video
-        # recording starts.
-        # Averaging mode depends on label_window_duration:
-        #   - given (not None): rolling window — average each label's score over the
-        #     last label_window_duration seconds.
-        #   - None: full-recording — accumulate every frame from accumulation start to
-        #     stop and average over the whole window.
-        # In both modes the average divides by the number of frames the label
-        # *appeared* in (not the total frame count). After stop, the last averaged
-        # result is re-published for label_tail_duration seconds.
+        # /gaze_label accumulation state. Accumulation is gated by
+        # /gaze_label_recording_start (published after the calibration beep finishes),
+        # NOT by /recording/start — so score accumulation begins once the beep ends.
+        # Nothing is published on /gaze_label while recording. On /key/b/release the
+        # recording is stitched and gaze-clustered; each logged frame then gets a
+        # temporal weight exp(-1e-8 * |stamp_ns - center_stamp_ns|) peaking at the
+        # kept cluster's center, the weights are normalized to sum 1, and each label's
+        # final score is the weighted sum of its per-frame scores. That result is
+        # published once and re-published for _label_tail_duration seconds.
         self._label_active: bool = False
-        self._label_window_duration: Optional[float] = label_window_duration
-        self._label_buffer: list[tuple[float, list[dict]]] = []
         self._label_tail_duration: float = 2.0
-        self._last_entries: list[dict] = []
-        # Latest /gaze_label content (window-averaged, recording-gated) for the
-        # top-left overlay drawn onto the recorded frames.
+        # Top-left overlay content: live per-frame scores while accumulating, the
+        # final weighted result during the post-release re-publish tail.
         self._gaze_label_display: list[dict] = []
-        self._rec_stop_time: float = 0.0
         # Per-frame label log captured during recording: one entry per published
         # frame with the raw detections and the averaged (/gaze_label) result.
         # Written to <session_dir>/gaze_labels.json when recording stops.
@@ -120,6 +122,8 @@ class GazeOverlay:
         self.std_dist: float = std_dist
         self.s_min: float = s_min
         self._last_det_summary: list[tuple[str, float, float]] = []
+        self._gaze_cluster_window = gaze_cluster_window
+        self._gaze_cluster_radius = gaze_cluster_radius
 
     def _setup_ros_subscriber(self) -> None:
         try:
@@ -196,19 +200,21 @@ class GazeOverlay:
             self._rec_dir = session_dir / "frames"
             self._rec_active = True
             self._rec_frames = []
+            self._rec_clean_frames = []
+            self._clean_frame = None
+            # Clear the previous session's weighted result so the recorded frames
+            # between now and the beep end don't carry a stale overlay.
+            self._gaze_label_display = []
             print(f"Image recording started → {self._rec_dir}")
 
     def _on_gaze_label_start(self) -> None:
         """Begin gaze_label accumulation. Fired by /gaze_label_recording_start once the
         calibration beep ends — this, not video recording start, marks t=0 for the
-        averaged /gaze_label score."""
+        weighted /gaze_label score."""
         with self._writer_lock:
             self._label_active = True
             self._label_log = []
-            self._last_entries = []
-            # Drop anything buffered before accumulation began (window mode self-trims,
-            # but clearing here keeps the first window clean too).
-            self._label_buffer = []
+            self._gaze_label_display = []
         print("gaze_label accumulation started.")
 
     def record_frame(self, frame: np.ndarray) -> None:
@@ -220,6 +226,13 @@ class GazeOverlay:
             # `display`) is a fresh array each iteration, so we can keep the
             # reference without copying.
             self._rec_frames.append((ts, frame))
+            # Clean copy stashed by draw() this iteration (same thread, so it
+            # matches `frame`). The stitcher uses one frame per unique stamp,
+            # so buffer only the first clean frame per stamp.
+            if self._clean_frame is not None:
+                if not self._rec_clean_frames or self._rec_clean_frames[-1][0] != ts:
+                    self._rec_clean_frames.append((ts, self._clean_frame))
+                self._clean_frame = None
 
     def _stop_recording(self) -> None:
         with self._writer_lock:
@@ -227,13 +240,14 @@ class GazeOverlay:
                 return
             self._rec_active = False
             self._label_active = False
-            # Start the 2s tail during which /gaze_label keeps re-publishing the last frame.
-            self._rec_stop_time = time.monotonic()
             rec_dir = self._rec_dir
             frames = self._rec_frames
+            clean_frames = self._rec_clean_frames
             label_log = self._label_log
             self._rec_dir = None
             self._rec_frames = []
+            self._rec_clean_frames = []
+            self._clean_frame = None
             self._label_log = []
 
         if rec_dir is None or not frames:
@@ -241,13 +255,84 @@ class GazeOverlay:
         # Flush the whole batch to disk and encode off the main thread; lag here
         # is fine since recording has already stopped.
         threading.Thread(
-            target=self._flush_and_encode, args=(rec_dir, frames, label_log), daemon=True
+            target=self._flush_and_encode,
+            args=(rec_dir, frames, label_log, clean_frames), daemon=True,
         ).start()
 
     def _flush_and_encode(
         self, frames_dir: Path, frames: list[tuple[int, np.ndarray]],
         label_log: Optional[list[dict]] = None,
+        clean_frames: Optional[list[tuple[int, np.ndarray]]] = None,
     ) -> None:
+        session_dir = frames_dir.parent
+
+        # Priority path first: stitch → cluster → weighted /gaze_label publish.
+        # This must run BEFORE the PNG flush and video encode (both take tens of
+        # seconds) — audio_record holds /transcription until /gaze_label is out,
+        # and its wait times out, so any slow work ahead of the publish risks the
+        # receiver pairing the transcription with the previous query's label.
+        # stitch_recording works on the in-memory frames, so no disk flush is
+        # needed yet.
+        center_stamp_ns: Optional[int] = None
+        if label_log:
+            # Stitch the recorded frames into one large mosaic, anchored on the
+            # logged YOLO detection centers (no feature-point matching). Uses the
+            # pristine (pre-annotation) copies; falls back to the display frames
+            # if none were captured. A stitch failure must not block the final
+            # /gaze_label publish or video encoding.
+            try:
+                stitched_path = stitch_recording(
+                    clean_frames if clean_frames else frames,
+                    label_log, session_dir / "stitched.png",
+                )
+                if stitched_path is not None:
+                    track_path = stitched_path.with_name(
+                        f"{stitched_path.stem}_gaze_track.json"
+                    )
+                    if track_path.exists():
+                        cluster_path = analyze_track(
+                            track_path,
+                            self._gaze_cluster_window,
+                            self._gaze_cluster_radius,
+                        )
+                        clusters = json.loads(cluster_path.read_text()).get("clusters", [])
+                        if clusters:
+                            center_stamp_ns = clusters[0].get("center_stamp_ns")
+                    else:
+                        print(f"Gaze clustering skipped: {track_path} not found.")
+            except Exception as exc:
+                print(f"Frame stitching or gaze clustering failed: {exc}")
+
+        # Final /gaze_label result: cluster-center-weighted average over the whole
+        # recording, published exactly once here (plus the 2s re-publish tail
+        # driven by the draw loop).
+        if center_stamp_ns is None:
+            print("No gaze cluster center; /gaze_label falls back to the unweighted average.")
+        elif label_log:
+            # Console reference: the raw detections of the highest-weight frame(s)
+            # (stamp closest to the cluster center), to eyeball against the
+            # published weighted result printed below.
+            stamped = [f for f in label_log if f.get("stamp_ns") is not None]
+            if stamped:
+                best_dt = min(abs(f["stamp_ns"] - center_stamp_ns) for f in stamped)
+                for f in stamped:
+                    if abs(f["stamp_ns"] - center_stamp_ns) != best_dt:
+                        continue
+                    # Normalized like the published result, so the two lines compare
+                    # score-for-score.
+                    dets = self._normalize_entries([
+                        {"label": d["label"], "score": d["score"]}
+                        for d in f.get("detected", [])
+                    ])
+                    print(
+                        f"Cluster-center frame stamp_ns={f['stamp_ns']} "
+                        f"(|dt|={best_dt / 1e6:.1f} ms): {json.dumps(dets) if dets else '(no detections)'}"
+                    )
+        weighted = self._compute_weighted_entries(label_log or [], center_stamp_ns)
+        print()
+        published = self._publish_final_labels(weighted)
+
+        # Slow path: flush the frame PNGs, persist the label log, encode the video.
         frames_dir.mkdir(parents=True, exist_ok=True)
         timestamps: list[int] = []
         for ts, frame in frames:
@@ -255,11 +340,10 @@ class GazeOverlay:
             timestamps.append(ts)
         print(f"Saved {len(timestamps)} frames to {frames_dir}")
 
-        # Persist the per-frame label log next to the frames/video.
         if label_log:
-            session_dir = frames_dir.parent
             payload = {
-                "label_window_duration": self._label_window_duration,
+                "cluster_center_stamp_ns": center_stamp_ns,
+                "published": published,
                 "frames": label_log,
             }
             labels_path = session_dir / "gaze_labels.json"
@@ -305,6 +389,12 @@ class GazeOverlay:
             h, w = display_image.shape[:2]
             warped = cv2.warpPerspective(display_image, self.H, (w, h))
             display_image[:] = warped
+
+        # Pristine copy for stitching: post-warp, before any annotation (or the
+        # capture-mode zoom) touches display_image. record_frame() consumes it
+        # on the same loop iteration/thread.
+        if self._rec_active:
+            self._clean_frame = display_image.copy()
 
         if camera_matrix is None:
             return
@@ -384,16 +474,22 @@ class GazeOverlay:
                     ocy = (y1 + y2) / 2.0
                     d = math.sqrt((gaze_in_crop[0] - ocx) ** 2 + (gaze_in_crop[1] - ocy) ** 2)
                     score = self._compute_score(d)
-                    det_summary.append((names_map.get(cid, str(cid)), conf, score))
+                    # Map the detection center from resized-crop space back to full
+                    # display-image pixels, so the logged coordinate matches the saved frame.
+                    center_px = (
+                        int(round(x_start + ocx / scale)),
+                        int(round(y_start + ocy / scale)),
+                    )
+                    det_summary.append((names_map.get(cid, str(cid)), conf, score, center_px))
 
             self._last_det_summary = sorted(det_summary, key=lambda x: x[2], reverse=True)
             crop_vis = self._draw_circles(resized_crop, results[0])
             vis_y = 18
-            for det_label, _, det_score in self._last_det_summary:
+            for det_label, _, det_score, _ in self._last_det_summary:
                 cv2.putText(crop_vis, f"{det_label}  score={det_score:.2f}",
                             (6, vis_y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1, cv2.LINE_AA)
                 vis_y += 18
-            self._publish_labels(det_summary)
+            self._publish_labels(det_summary, gaze_px=(gx, gy))
             results[0].boxes = None
         elif self.enable_capture and resized_crop is not None:
             display_image[:] = cv2.resize(resized_crop, (w, h), interpolation=cv2.INTER_LINEAR)
@@ -415,8 +511,9 @@ class GazeOverlay:
             2,
             cv2.LINE_AA,
         )
-        # Top-left detection text mirrors /gaze_label (window-averaged, recording-gated),
-        # not /gaze_label_raw, so the recorded video shows the published labels.
+        # Top-left detection text: live per-frame scores (/gaze_label_raw content)
+        # while accumulating, the final weighted /gaze_label result during the 2s
+        # post-release tail, empty otherwise.
         if self._gaze_label_display:
             det_y = 60
             for entry in self._gaze_label_display:
@@ -473,100 +570,140 @@ class GazeOverlay:
             return 0.0
         return math.exp(-(d ** 2) / (2 * self.std_dist ** 2))
 
-    def _publish_labels(self, det_summary: list[tuple[str, float, float]]) -> None:
+    @staticmethod
+    def _normalize_entries(entries: list[dict]) -> list[dict]:
+        """Divide each score by the sum of scores in the result, so the published
+        scores form a relative distribution summing to 1 over its labels."""
+        total = sum(it["score"] for it in entries)
+        if total <= 0:
+            return entries
+        return [
+            {"label": it["label"], "score": round(it["score"] / total, 4)}
+            for it in entries
+        ]
+
+    @staticmethod
+    def _compute_weighted_entries(
+        label_log: list[dict], center_stamp_ns: Optional[int]
+    ) -> list[dict]:
+        """Cluster-center-weighted average of the per-frame scores in label_log.
+
+        Each logged frame gets weight exp(-1e-8 * |stamp_ns - center_stamp_ns|):
+        highest at the kept gaze cluster's center, dropping off sharply along the
+        time axis (the 1e-8 factor folds in the ns unit conversion). Weights are
+        normalized to sum 1 across frames, then each label's score is the weighted
+        sum of its per-frame scores — frames where the label was not detected
+        contribute 0. Without a cluster center all weights are equal, which
+        degrades to a plain average over the whole recording."""
+        frames = [f for f in label_log if f.get("stamp_ns") is not None]
+        if not frames:
+            return []
+        if center_stamp_ns is None:
+            weights = [1.0] * len(frames)
+        else:
+            weights = [
+                math.exp(-1e-8 * abs(f["stamp_ns"] - center_stamp_ns))
+                for f in frames
+            ]
+        total_w = sum(weights)
+        if total_w <= 0:
+            return []
+        scores: dict[str, float] = {}
+        for frame, weight in zip(frames, weights):
+            w = weight / total_w
+            for item in frame.get("detected", []):
+                lbl = item["label"]
+                scores[lbl] = scores.get(lbl, 0.0) + w * item["score"]
+        weighted = [{"label": lbl, "score": round(s, 4)} for lbl, s in scores.items()]
+        weighted.sort(key=lambda x: -x["score"])
+        return weighted
+
+    def _publish_final_labels(self, entries: list[dict]) -> list[dict]:
+        """Publish the weighted /gaze_label result, re-publishing at 10 Hz for
+        _label_tail_duration seconds so a late or lossy subscriber still gets it.
+
+        Runs on the flush thread right after clustering and before the PNG/video
+        flush, so /gaze_label is guaranteed to go out before /transcription
+        (audio_record holds the transcription until it sees this message). Always
+        publishes — empty data when there is no result — so the audio side never
+        stalls. The tail aborts early if a new recording starts.
+        Returns the normalized entries that were published."""
+        from std_msgs.msg import String
+
+        out_entries = self._normalize_entries(entries)
+        with self._writer_lock:
+            self._gaze_label_display = out_entries.copy()
+        msg = String()
+        msg.data = json.dumps(out_entries) if out_entries else ""
+        print(f"/gaze_label publishing: {msg.data or '(empty)'}")
+        deadline = time.monotonic() + self._label_tail_duration
+        while True:
+            self._gaze_label_pub.publish(msg)
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.1)
+            if self._rec_active or self._label_active:
+                # A new recording started; stop repeating the old result.
+                return out_entries
+        # Tail finished: drop the live-view overlay.
+        with self._writer_lock:
+            if not self._rec_active and not self._label_active:
+                self._gaze_label_display = []
+        return out_entries
+
+    def _publish_labels(
+        self,
+        det_summary: list[tuple[str, float, float, tuple[int, int]]],
+        gaze_px: Optional[tuple[int, int]] = None,
+    ) -> None:
         """Publish {"label", "score"} for detections with score >= s_min, sorted descending.
 
         /gaze_label_raw always carries the current frame's detections (backup stream).
-        /gaze_label carries an averaged result only while accumulating (started by
-        /gaze_label_recording_start, rolling-window or full per label_window_duration);
-        after stop it keeps re-publishing the last averaged result for
-        label_tail_duration seconds."""
+        /gaze_label is never published here: the cluster-weighted result is computed
+        and published (with its re-publish tail) by _flush_and_encode after
+        /key/b/release."""
         from std_msgs.msg import String
-
-        def _normalize(items: list[dict]) -> list[dict]:
-            """Divide each score by the sum of scores in this outgoing result, so the
-            published scores form a relative distribution. Applied right before sending;
-            the averaging buffer keeps the raw (un-normalized) scores."""
-            total = sum(it["score"] for it in items)
-            if total <= 0:
-                return items
-            return [
-                {"label": it["label"], "score": round(it["score"] / total, 4)}
-                for it in items
-            ]
 
         entries = [
             {"label": label, "score": round(score, 4)}
-            for label, _, score in det_summary
+            for label, _, score, _ in det_summary
             if score >= self.s_min
         ]
         entries.sort(key=lambda x: -x["score"])
+
+        # Detection-center pixel coords (full display-image space) keyed by label, for
+        # the JSON log only — kept out of the published messages to avoid changing the
+        # /gaze_label(_raw) wire format. Labels are unique here (_filter_results keeps
+        # one detection per class).
+        centers_px: dict[str, list[int]] = {
+            label: [int(center_px[0]), int(center_px[1])]
+            for label, _, score, center_px in det_summary
+            if score >= self.s_min
+        }
 
         raw_data = json.dumps(entries) if entries else ""
         raw_msg = String()
         raw_msg.data = raw_data
         self._gaze_label_raw_pub.publish(raw_msg)
 
-        now = time.monotonic()
-
-        if self._label_window_duration is not None:
-            # Rolling window: keep the last _label_window_duration seconds of per-frame entries.
-            self._label_buffer.append((now, entries))
-            cutoff = now - self._label_window_duration
-            self._label_buffer = [(t, e) for (t, e) in self._label_buffer if t >= cutoff]
-        elif self._label_active:
-            # Full window: accumulate every frame from accumulation start to stop
-            # (buffer was cleared on /gaze_label_recording_start; never trimmed here).
-            self._label_buffer.append((now, entries))
-
-        # average label scores over the accumulated frames/occurances
-        sums: dict[str, float] = {}
-        counts: dict[str, int] = {}
-        for _, frame_entries in self._label_buffer:
-            for item in frame_entries:
-                lbl = item["label"]
-                sums[lbl] = sums.get(lbl, 0.0) + item["score"]
-                counts[lbl] = counts.get(lbl, 0) + 1
-        num_count = len(self._label_buffer)
-        avg_entries = [
-            {"label": lbl, "score": round(sums[lbl] / counts[lbl], 4)} for lbl in sums
-            # {"label": lbl, "score": round(sums[lbl] / num_count, 4)} for lbl in sums
-            
-        ]
-        avg_entries.sort(key=lambda x: -x["score"])
-
         if self._label_active:
-            # While accumulating: send the averaged result and remember it for the tail.
-            self._last_entries = avg_entries
-            out_entries = avg_entries
-        elif self._last_entries and (now - self._rec_stop_time) <= self._label_tail_duration:
-            # 2s tail after stop: keep emitting the last averaged result.
-            out_entries = self._last_entries
-        else:
-            # Not accumulating (or tail expired): emit nothing.
-            self._last_entries = []
-            out_entries = []
-
-        # Normalize the outgoing result right before sending (divide by the sum of its
-        # own scores), so the published distribution sums to 1 over its labels. The
-        # averaging buffer above keeps the raw (un-normalized) scores.
-        self._gaze_label_display = out_entries.copy()
-        out_entries = _normalize(out_entries)
-
-
-        if self._label_active:
-            # Log this frame's raw detections and the published (normalized) result,
-            # keyed by the same manip stamp the frame PNGs use.
+            # Log this frame's raw detections, keyed by the same manip stamp the
+            # frame PNGs use. Each detected entry carries its center pixel coord;
+            # the frame carries the gaze pixel coord — both in full display-image
+            # space, matching the saved PNGs. This log feeds both the stitcher and
+            # the final cluster-weighted /gaze_label result.
+            detected_log = [
+                {**e, "center_px": centers_px.get(e["label"])} for e in entries
+            ]
             with self._writer_lock:
                 self._label_log.append({
                     "stamp_ns": self._latest_manip_stamp_ns,
-                    "detected": entries,
-                    "published": out_entries,
+                    "gaze_px": [int(gaze_px[0]), int(gaze_px[1])] if gaze_px is not None else None,
+                    "detected": detected_log,
                 })
-
-        gated_msg = String()
-        gated_msg.data = json.dumps(out_entries) if out_entries else ""
-        self._gaze_label_pub.publish(gated_msg)
+            # Recorded frames show the live per-frame scores (same content as
+            # /gaze_label_raw); the weighted result doesn't exist yet.
+            self._gaze_label_display = entries
 
     def _draw_circles(
         self, img: np.ndarray, result,
@@ -654,7 +791,8 @@ def run_gaze_rgb_visualizer(
     std_dist: float = 200.0,
     s_min: float = 0.3,
     participant: str = "",
-    label_window_duration: Optional[float] = None,
+    gaze_cluster_window: int = DEFAULT_GAZE_CLUSTER_WINDOW,
+    gaze_cluster_radius: float = DEFAULT_GAZE_CLUSTER_RADIUS,
 ) -> None:
     overlay = GazeOverlay(
         homography_path=homography_path,
@@ -670,7 +808,8 @@ def run_gaze_rgb_visualizer(
         std_dist=std_dist,
         s_min=s_min,
         participant=participant,
-        label_window_duration=label_window_duration,
+        gaze_cluster_window=gaze_cluster_window,
+        gaze_cluster_radius=gaze_cluster_radius,
     )
     stream = AriaRgbStream(
         device_ip=device_ip,
@@ -751,9 +890,13 @@ def parse_args() -> argparse.Namespace:
         help="Participant ID (e.g. AB12). Required for video recording to recordings/<participant>/NN/.",
     )
     parser.add_argument(
-        "--label-window", type=float, default=None, dest="label_window_duration",
-        help="Rolling-window duration (seconds) for averaging /gaze_label scores. "
-             "If omitted, averages over the entire recording (start to stop) instead.",
+        "--gaze-cluster-window", type=int, default=DEFAULT_GAZE_CLUSTER_WINDOW,
+        help="Odd temporal window for automatic stitched gaze clustering. "
+             "Default: 7.",
+    )
+    parser.add_argument(
+        "--gaze-cluster-radius", type=float, default=DEFAULT_GAZE_CLUSTER_RADIUS,
+        help="Pixel radius for automatic stitched gaze clustering. Default: 30.",
     )
     return parser.parse_args()
 
@@ -776,7 +919,8 @@ def main() -> None:
         std_dist=args.std_dist,
         s_min=args.s_min,
         participant=args.participant,
-        label_window_duration=args.label_window_duration,
+        gaze_cluster_window=args.gaze_cluster_window,
+        gaze_cluster_radius=args.gaze_cluster_radius,
     )
 
 

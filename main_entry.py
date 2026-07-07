@@ -57,9 +57,6 @@ def parse_args() -> argparse.Namespace:
                         help="Gaussian std (px) for score falloff.")
     parser.add_argument("--s-min", type=float, default=0.0, dest="s_min",
                         help="Minimum score threshold for /gaze_label entries.")
-    parser.add_argument("--label-hold", type=float, default=2.0, dest="label_hold",
-                        help="Seconds to hold the last non-empty gaze label.")
-
     # Audio
     parser.add_argument("--channel", type=int, nargs="+", default=None,
                         choices=range(ARIA_NUM_CHANNELS), metavar="{0..6}",
@@ -95,7 +92,6 @@ def main() -> None:
         std_dist=args.std_dist,
         s_min=args.s_min,
         participant=args.participant,
-        label_hold_duration=args.label_hold,
     )
     audio = AudioHandler(
         channels=args.channel,

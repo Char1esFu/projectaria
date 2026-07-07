@@ -27,6 +27,12 @@ ARIA_NUM_CHANNELS = 7
 WHISPER_SAMPLE_RATE = 16000
 AUDIO_GAP_TOLERANCE_SAMPLES = 2
 
+# /transcription must be published after /gaze_label (the reader on the other device
+# uses the transcription to decide whether to consume the gaze label). The gaze
+# pipeline publishes /gaze_label after stitching + clustering on B release; this is
+# the longest we hold the transcription waiting for it before giving up.
+GAZE_LABEL_TIMEOUT_SEC = 30.0
+
 # Local headset capture (via PulseAudio). The raw ALSA device is held exclusively
 # by PulseAudio, so we record through the "default" pulse source: plugging in the
 # H390 makes it the system default input, so no hardware name needs hard-coding.
@@ -135,6 +141,10 @@ class AudioHandler:
         )
         self._node.create_subscription(Empty, "/key/b/press", self._on_b_press, 10)
         self._node.create_subscription(Empty, "/key/b/release", self._on_b_release, 10)
+        # Set once the gaze pipeline publishes its post-release /gaze_label result;
+        # _do_transcribe waits on it so /transcription always goes out afterwards.
+        self._gaze_label_event = threading.Event()
+        self._node.create_subscription(String, "/gaze_label", self._on_gaze_label, 10)
         # Dedicated executor so we don't fight other modules over the rclpy
         # global executor when running under main_entry.py.
         self._executor = SingleThreadedExecutor()
@@ -166,7 +176,16 @@ class AudioHandler:
 
     def _on_b_release(self, _msg: Empty) -> None:
         self.recording = False
+        # Arm the wait: only a /gaze_label published after this release counts
+        # (the gaze pipeline needs at least stitch+cluster time, so nothing from
+        # this session can arrive before the clear).
+        self._gaze_label_event.clear()
         threading.Thread(target=self._do_transcribe, daemon=True).start()
+
+    def _on_gaze_label(self, msg: String) -> None:
+        if not self._gaze_label_event.is_set():
+            print(f"/gaze_label received ({len(msg.data)} bytes); /transcription unblocked.")
+        self._gaze_label_event.set()
 
     # ------------------------------------------------------------------
     # SDK audio callback
@@ -273,6 +292,22 @@ class AudioHandler:
             condition_on_previous_text=False
             )
         text = result["text"].strip()
+
+        # Hold /transcription until the gaze pipeline has published /gaze_label
+        # (it always publishes after B release, empty data on failure), so the
+        # reader on the other device sees the label result before the text.
+        wait_start = time.monotonic()
+        if not self._gaze_label_event.wait(timeout=GAZE_LABEL_TIMEOUT_SEC):
+            print("Timed out waiting for /gaze_label; publishing /transcription anyway.")
+        else:
+            waited = time.monotonic() - wait_start
+            if waited > 0.05:
+                print(f"Held /transcription {waited:.2f}s for /gaze_label.")
+            # The event fires when THIS node sees /gaze_label; the device reading
+            # /transcription subscribes independently and may lag by a moment.
+            # A short grace (well inside the 2s /gaze_label re-publish tail)
+            # keeps the ordering true on that device too.
+            time.sleep(0.5)
 
         msg = String()
         msg.data = text
