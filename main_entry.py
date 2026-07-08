@@ -16,7 +16,8 @@ from pathlib import Path
 import aria.sdk as aria
 
 from src.audio_record import AudioHandler, ARIA_NUM_CHANNELS
-from src.gaze_rgb_visualizer import GazeOverlay, MODEL_PATH
+from src.gaze_rgb_visualizer import DEFAULT_GAZE_CENTER_METHOD, GazeOverlay, MODEL_PATH
+from src.gaze_track_peak import GAZE_CENTER_METHODS
 from utils.aria_rgb_stream import AriaStream
 
 
@@ -57,6 +58,10 @@ def parse_args() -> argparse.Namespace:
                         help="Gaussian std (px) for score falloff.")
     parser.add_argument("--s-min", type=float, default=0.0, dest="s_min",
                         help="Minimum score threshold for /gaze_label entries.")
+    parser.add_argument("--gaze-center-method", choices=GAZE_CENTER_METHODS,
+                        default=DEFAULT_GAZE_CENTER_METHOD,
+                        help="Gaze-center stamp for score weighting: 'cluster' or 'peak'. "
+                             f"Default: {DEFAULT_GAZE_CENTER_METHOD}.")
     # Audio
     parser.add_argument("--channel", type=int, nargs="+", default=None,
                         choices=range(ARIA_NUM_CHANNELS), metavar="{0..6}",
@@ -92,6 +97,7 @@ def main() -> None:
         std_dist=args.std_dist,
         s_min=args.s_min,
         participant=args.participant,
+        gaze_center_method=args.gaze_center_method,
     )
     audio = AudioHandler(
         channels=args.channel,

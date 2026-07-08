@@ -11,7 +11,7 @@ import numpy as np
 from ultralytics import YOLO
 
 from src.frame_stitcher import stitch_recording
-from src.gaze_track_cluster import analyze_track
+from src.gaze_track_peak import GAZE_CENTER_METHODS, find_gaze_center_stamp
 from utils.aria_rgb_stream import AriaRgbStream
 
 MODEL_PATH = Path(__file__).parent.parent / "yolo_model" / "last_aria_4.pt"
@@ -19,6 +19,7 @@ CROP_SIZE = 200
 RESIZE_SIZE = 1080
 DEFAULT_GAZE_CLUSTER_WINDOW = 9
 DEFAULT_GAZE_CLUSTER_RADIUS = 20.0
+DEFAULT_GAZE_CENTER_METHOD = "peak"
 
 
 class GazeOverlay:
@@ -41,6 +42,7 @@ class GazeOverlay:
         participant: str = "",
         gaze_cluster_window: int = DEFAULT_GAZE_CLUSTER_WINDOW,
         gaze_cluster_radius: float = DEFAULT_GAZE_CLUSTER_RADIUS,
+        gaze_center_method: str = DEFAULT_GAZE_CENTER_METHOD,
     ) -> None:
         self.gaze_pitch: float = 0.0
         self.gaze_yaw: float = 0.0
@@ -59,19 +61,9 @@ class GazeOverlay:
         self._rec_clean_frames: list[tuple[int, np.ndarray]] = []
         self._clean_frame: Optional[np.ndarray] = None
 
-        # /gaze_label accumulation state. Accumulation is gated by
-        # /gaze_label_recording_start (published after the calibration beep finishes),
-        # NOT by /recording/start — so score accumulation begins once the beep ends.
-        # Nothing is published on /gaze_label while recording. On /key/b/release the
-        # recording is stitched and gaze-clustered; each logged frame then gets a
-        # temporal weight exp(-1e-8 * |stamp_ns - center_stamp_ns|) peaking at the
-        # kept cluster's center, the weights are normalized to sum 1, and each label's
-        # final score is the weighted sum of its per-frame scores. That result is
-        # published once and re-published for _label_tail_duration seconds.
         self._label_active: bool = False
         self._label_tail_duration: float = 2.0
-        # Top-left overlay content: live per-frame scores while accumulating, the
-        # final weighted result during the post-release re-publish tail.
+        # Top-left overlay content: live per-frame scores while accumulating, the final weighted result during the post-release re-publish tail.
         self._gaze_label_display: list[dict] = []
         # Per-frame label log captured during recording: one entry per published
         # frame with the raw detections and the averaged (/gaze_label) result.
@@ -124,6 +116,12 @@ class GazeOverlay:
         self._last_det_summary: list[tuple[str, float, float]] = []
         self._gaze_cluster_window = gaze_cluster_window
         self._gaze_cluster_radius = gaze_cluster_radius
+        if gaze_center_method not in GAZE_CENTER_METHODS:
+            raise ValueError(
+                f"gaze_center_method must be one of {GAZE_CENTER_METHODS}, "
+                f"got {gaze_center_method!r}"
+            )
+        self._gaze_center_method = gaze_center_method
 
     def _setup_ros_subscriber(self) -> None:
         try:
@@ -290,24 +288,25 @@ class GazeOverlay:
                         f"{stitched_path.stem}_gaze_track.json"
                     )
                     if track_path.exists():
-                        cluster_path = analyze_track(
+                        center_stamp_ns = find_gaze_center_stamp(
                             track_path,
+                            self._gaze_center_method,
                             self._gaze_cluster_window,
                             self._gaze_cluster_radius,
                         )
-                        clusters = json.loads(cluster_path.read_text()).get("clusters", [])
-                        if clusters:
-                            center_stamp_ns = clusters[0].get("center_stamp_ns")
                     else:
-                        print(f"Gaze clustering skipped: {track_path} not found.")
+                        print(f"Gaze center analysis skipped: {track_path} not found.")
             except Exception as exc:
-                print(f"Frame stitching or gaze clustering failed: {exc}")
+                print(f"Frame stitching or gaze center analysis failed: {exc}")
 
         # Final /gaze_label result: cluster-center-weighted average over the whole
         # recording, published exactly once here (plus the 2s re-publish tail
         # driven by the draw loop).
         if center_stamp_ns is None:
-            print("No gaze cluster center; /gaze_label falls back to the unweighted average.")
+            print(
+                f"No gaze center found ({self._gaze_center_method}); "
+                "/gaze_label falls back to the unweighted average."
+            )
         elif label_log:
             # Console reference: the raw detections of the highest-weight frame(s)
             # (stamp closest to the cluster center), to eyeball against the
@@ -325,7 +324,7 @@ class GazeOverlay:
                         for d in f.get("detected", [])
                     ])
                     print(
-                        f"Cluster-center frame stamp_ns={f['stamp_ns']} "
+                        f"Gaze-center frame stamp_ns={f['stamp_ns']} "
                         f"(|dt|={best_dt / 1e6:.1f} ms): {json.dumps(dets) if dets else '(no detections)'}"
                     )
         weighted = self._compute_weighted_entries(label_log or [], center_stamp_ns)
@@ -342,7 +341,8 @@ class GazeOverlay:
 
         if label_log:
             payload = {
-                "cluster_center_stamp_ns": center_stamp_ns,
+                "gaze_center_method": self._gaze_center_method,
+                "gaze_center_stamp_ns": center_stamp_ns,
                 "published": published,
                 "frames": label_log,
             }
@@ -793,6 +793,7 @@ def run_gaze_rgb_visualizer(
     participant: str = "",
     gaze_cluster_window: int = DEFAULT_GAZE_CLUSTER_WINDOW,
     gaze_cluster_radius: float = DEFAULT_GAZE_CLUSTER_RADIUS,
+    gaze_center_method: str = DEFAULT_GAZE_CENTER_METHOD,
 ) -> None:
     overlay = GazeOverlay(
         homography_path=homography_path,
@@ -810,6 +811,7 @@ def run_gaze_rgb_visualizer(
         participant=participant,
         gaze_cluster_window=gaze_cluster_window,
         gaze_cluster_radius=gaze_cluster_radius,
+        gaze_center_method=gaze_center_method,
     )
     stream = AriaRgbStream(
         device_ip=device_ip,
@@ -898,6 +900,14 @@ def parse_args() -> argparse.Namespace:
         "--gaze-cluster-radius", type=float, default=DEFAULT_GAZE_CLUSTER_RADIUS,
         help="Pixel radius for automatic stitched gaze clustering. Default: 30.",
     )
+    parser.add_argument(
+        "--gaze-center-method", choices=GAZE_CENTER_METHODS,
+        default=DEFAULT_GAZE_CENTER_METHOD,
+        help="How the gaze-center stamp for score weighting is found: 'cluster' "
+             "(temporal window/radius clustering, middle cluster kept) or 'peak' "
+             "(densest track point with boundary-connectivity check). "
+             f"Default: {DEFAULT_GAZE_CENTER_METHOD}.",
+    )
     return parser.parse_args()
 
 
@@ -921,6 +931,7 @@ def main() -> None:
         participant=args.participant,
         gaze_cluster_window=args.gaze_cluster_window,
         gaze_cluster_radius=args.gaze_cluster_radius,
+        gaze_center_method=args.gaze_center_method,
     )
 
 
