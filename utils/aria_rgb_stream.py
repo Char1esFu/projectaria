@@ -1,33 +1,7 @@
-"""
-Shared Aria streaming infrastructure.
+"""Shared Aria RGB/audio streaming helpers.
 
-AriaStream owns a single StreamingClient and dispatches each data type to
-registered handlers:
-  - RGB frames  → overlay.draw(...)   (registered via add_overlay)
-  - Audio frames → handler.on_audio_received(...) (registered via add_audio_handler)
-
-Overlays implement draw(display_image, camera_matrix, key), which is called after
-rot90 + crop. camera_matrix has cx/cy adjusted to the cropped image origin.
-
-Audio handlers implement on_audio_received(audio_data, record). They are
-called on the SDK's audio thread; handlers are responsible for their own
-thread safety.
-
-Example (RGB only — historical default):
-    stream = AriaStream(device_ip="192.168.x.x")
-    stream.add_overlay(GazeOverlay(...))
-    stream.run()
-
-Example (RGB + Audio combined):
-    stream = AriaStream(
-        device_ip="192.168.x.x",
-        data_types=aria.StreamingDataType.Rgb | aria.StreamingDataType.Audio,
-    )
-    stream.add_overlay(GazeOverlay(...))
-    stream.add_audio_handler(AudioHandler(...))
-    stream.run()
-
-AriaRgbStream is kept as an alias for backward compatibility.
+RGB overlays receive undistorted, rotated, cropped frames plus a matching
+camera matrix. Audio handlers are called from the SDK audio thread.
 """
 
 import sys
@@ -48,10 +22,7 @@ from projectaria_tools.core.sensor_data import AudioData, AudioDataRecord, Image
 
 
 def crop_fisheye_img(image: np.ndarray):
-    """Crop the largest inscribed square from an undistorted fisheye image.
-
-    Returns (cropped_image, ox, oy) where (ox, oy) is the crop offset.
-    """
+    """Crop the centered display square and return its offset."""
     h, w = image.shape[:2]
     crop_size = int(min(w, h) / 1.5)
     crop_size += crop_size % 2  # ensure even for codec compatibility
@@ -62,7 +33,7 @@ def crop_fisheye_img(image: np.ndarray):
 
 
 class AriaStream:
-    """Single StreamingClient + dispatch loop shared across RGB overlays and audio handlers."""
+    """Single StreamingClient for RGB overlays and audio handlers."""
 
     def __init__(
         self,
@@ -81,6 +52,10 @@ class AriaStream:
         self.rgb_calib = None
         self.dst_calib = None
         self.camera_matrix: Optional[np.ndarray] = None
+        # One-time undistort+rot90+crop LUT (built on first frame).
+        self._map_x: Optional[np.ndarray] = None
+        self._map_y: Optional[np.ndarray] = None
+        self._crop_offset: tuple[int, int] = (0, 0)
 
         self.streaming_client = None
         self.observer = None
@@ -103,8 +78,7 @@ class AriaStream:
         self._overlays.append(overlay)
 
     def add_audio_handler(self, handler) -> None:
-        """Register an object whose on_audio_received(audio_data, record) will be called
-        on every audio frame. Handler is responsible for its own thread safety."""
+        """Register an audio-frame handler."""
         self._audio_handlers.append(handler)
 
     def set_frame_callback(self, fn) -> None:
@@ -129,8 +103,7 @@ class AriaStream:
             self.streaming_client.unsubscribe()
 
     def _run_idle_loop(self) -> None:
-        """Audio-only (or non-RGB) mode: no cv2 window; just keep the process alive
-        until Ctrl+C so the SDK threads can keep delivering callbacks."""
+        """Keep non-RGB streaming alive until Ctrl+C."""
         print("Streaming without RGB display. Press Ctrl+C to stop.")
         try:
             while True:
@@ -162,13 +135,15 @@ class AriaStream:
                 # Initialise calibration on first frame using actual streaming resolution.
                 frame_h, frame_w = self.observer.rgb_image.shape[:2]
                 self._setup_dst_calib(frame_w, frame_h)
+                self._build_undistort_maps(frame_w, frame_h)
 
-            rgb_image = self._prepare_rgb_image(self.observer.rgb_image)
+            rgb_image = cv2.cvtColor(self.observer.rgb_image, cv2.COLOR_BGR2RGB)
             self.observer.rgb_image = None
 
-            # Aria RGB sensor is mounted rotated; rot90(-1) puts the image upright.
-            display = np.ascontiguousarray(np.rot90(rgb_image, -1))
-            display, ox, oy = crop_fisheye_img(display)
+            # Undistort + rot90 (sensor is mounted rotated) + fisheye crop,
+            # all in one remap through the precomputed LUT.
+            display = cv2.remap(rgb_image, self._map_x, self._map_y, cv2.INTER_LINEAR)
+            ox, oy = self._crop_offset
 
             # Shift cx/cy so overlays can use camera_matrix directly in cropped image coordinates.
             display_matrix = self.camera_matrix.copy()
@@ -186,9 +161,29 @@ class AriaStream:
 
             cv2.imshow(self.window_name, display)
 
-    def _prepare_rgb_image(self, bgr_image: np.ndarray) -> np.ndarray:
-        rgb_image = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
-        return distort_by_calibration(rgb_image, self.dst_calib, self.rgb_calib)
+    def _build_undistort_maps(self, w: int, h: int) -> None:
+        """Precompute the undistort, rotate, and crop remap."""
+        xs = np.tile(np.arange(1, w + 1, dtype=np.float32)[None, :], (h, 1))
+        ys = np.tile(np.arange(1, h + 1, dtype=np.float32)[:, None], (1, w))
+        map_x = distort_by_calibration(xs, self.dst_calib, self.rgb_calib)
+        map_y = distort_by_calibration(ys, self.dst_calib, self.rgb_calib)
+        invalid = (map_x == 0.0) | (map_y == 0.0)
+        map_x -= 1.0
+        map_y -= 1.0
+        map_x[invalid] = -1.0
+        map_y[invalid] = -1.0
+
+        # Fold display rotation and crop into the remap.
+        map_x = np.rot90(map_x, -1)
+        map_y = np.rot90(map_y, -1)
+        rh, rw = map_x.shape
+        crop_size = int(min(rw, rh) / 1.5)
+        crop_size += crop_size % 2  # even, matching crop_fisheye_img
+        ox = (rw - crop_size) // 2
+        oy = (rh - crop_size) // 2
+        self._map_x = np.ascontiguousarray(map_x[oy:oy + crop_size, ox:ox + crop_size])
+        self._map_y = np.ascontiguousarray(map_y[oy:oy + crop_size, ox:ox + crop_size])
+        self._crop_offset = (ox, oy)
 
     def _load_rgb_calibration(self) -> None:
         # Connect only to read calibration JSON, then disconnect immediately.
