@@ -176,17 +176,26 @@ def main() -> None:
 
     streaming_client = aria.StreamingClient()
 
-    config = streaming_client.subscription_config
-    config.subscriber_data_type = (
-        aria.StreamingDataType.EyeTrack | aria.StreamingDataType.Rgb
-    )
-    config.message_queue_size[aria.StreamingDataType.EyeTrack] = 1
-    config.message_queue_size[aria.StreamingDataType.Rgb] = 1
+    def _apply_subscription(include_rgb: bool) -> None:
+        config = streaming_client.subscription_config
+        if include_rgb:
+            config.subscriber_data_type = (
+                aria.StreamingDataType.EyeTrack | aria.StreamingDataType.Rgb
+            )
+        else:
+            config.subscriber_data_type = aria.StreamingDataType.EyeTrack
+        config.message_queue_size[aria.StreamingDataType.EyeTrack] = 1
+        config.message_queue_size[aria.StreamingDataType.Rgb] = 1
 
-    options = aria.StreamingSecurityOptions()
-    options.use_ephemeral_certs = True
-    config.security_options = options
-    streaming_client.subscription_config = config
+        options = aria.StreamingSecurityOptions()
+        options.use_ephemeral_certs = True
+        config.security_options = options
+        streaming_client.subscription_config = config
+
+    # RGB is only needed while calibrating; subscribe to EyeTrack alone by
+    # default so the glasses don't stream the large RGB image to two clients.
+    _apply_subscription(include_rgb=False)
+    rgb_subscribed = False
 
     class StreamingClientObserver:
         def __init__(self):
@@ -279,6 +288,20 @@ def main() -> None:
             key = cv2.waitKey(1) & 0xFF
             if key == 27 or key == ord("q"):
                 break
+
+            # Subscribe to RGB only while calibrating; drop it as soon as
+            # calibration ends so the RGB stream isn't sent to two clients.
+            if calibrating != rgb_subscribed:
+                streaming_client.unsubscribe()
+                _apply_subscription(include_rgb=calibrating)
+                streaming_client.subscribe()
+                rgb_subscribed = calibrating
+                if not rgb_subscribed:
+                    observer.rgb_image = None
+                print(
+                    "RGB subscription "
+                    + ("enabled for calibration." if rgb_subscribed else "disabled.")
+                )
 
             if compute_calib:
                 with _calib_lock:
