@@ -160,7 +160,7 @@ def save_visualization(
 ) -> None:
     import cv2
 
-    background_path = track_path.parent / "stitched.png"
+    background_path = track_path.parent / "stitched_trajectory.png"
     canvas = cv2.imread(str(background_path)) if background_path.exists() else None
     if canvas is None:
         width = int(np.ceil(points_xy[:, 0].max())) + 20

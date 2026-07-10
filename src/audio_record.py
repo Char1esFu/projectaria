@@ -20,6 +20,7 @@ from scipy.signal import butter, resample_poly, sosfilt
 from std_msgs.msg import Empty, String
 
 from projectaria_tools.core.sensor_data import AudioData, AudioDataRecord
+from src.gaze_rgb_config import TRANSCRIPTION_HOLD_SEC
 from utils.aria_rgb_stream import AriaStream
 
 ARIA_AUDIO_SAMPLE_RATE = 48000
@@ -305,9 +306,9 @@ class AudioHandler:
                 print(f"Held /transcription {waited:.2f}s for /gaze_label.")
             # The event fires when THIS node sees /gaze_label; the device reading
             # /transcription subscribes independently and may lag by a moment.
-            # A short grace (well inside the 2s /gaze_label re-publish tail)
+            # A short grace (well inside the GAZE_LABEL_TAIL_SEC re-publish tail)
             # keeps the ordering true on that device too.
-            time.sleep(0.5)
+            time.sleep(TRANSCRIPTION_HOLD_SEC)
 
         msg = String()
         msg.data = text
