@@ -1,22 +1,8 @@
 """Label-anchored frame stitching for recorded gaze sessions.
 
-Aligns recorded frames using the YOLO detection centers logged per frame
-(same label = same static object on the table), NOT feature-point
-matching/RANSAC. All frame poses — 2D rigid transforms (rotation +
-translation) — are solved jointly: each label has a single world position,
-and we minimize the total squared pixel distance between every frame's
-transformed detection centers and those world positions, via alternating
-least squares (world points = mean of transformed observations; per-frame
-pose = closed-form rigid Procrustes fit). No frame is privileged during the
-fit; the reference frame below only fixes the gauge (canvas orientation).
-
-Canvas reference frame rule: frames seeing < 3 labels are not eligible.
-The reference is the first frame that sees >= 3 labels AND whose next frame
-detects the same number of labels (a stable-detection pair). Fallback when
-that never happens: the frame with the most labels.
-
-Compositing: overlapping canvas pixels are the average of all frames
-covering them (float accumulation), not last-frame-wins.
+Frames are aligned by their logged YOLO detection centers (same label = same
+static object), not feature matching. Per-frame 2D rigid poses are solved
+jointly via alternating least squares; overlapping pixels are averaged.
 """
 
 import json
@@ -35,12 +21,7 @@ _PALETTE = [
 
 
 def _centers_by_stamp(label_log: list[dict]) -> dict[int, dict[str, np.ndarray]]:
-    """Map stamp_ns -> {label: center_px} from the per-frame label log.
-
-    Multiple log entries can share a stamp (the manip stamp updates at
-    camera_info rate, slower than the display loop); the first entry per
-    stamp wins, matching the first-per-stamp frame kept in stitch_recording.
-    """
+    """Map stamp_ns -> {label: center_px}; first log entry per stamp wins."""
     out: dict[int, dict[str, np.ndarray]] = {}
     for entry in label_log:
         ts = entry.get("stamp_ns")
@@ -57,8 +38,7 @@ def _centers_by_stamp(label_log: list[dict]) -> dict[int, dict[str, np.ndarray]]
 
 
 def _center_crop(img: np.ndarray, ratio: float) -> tuple[np.ndarray, tuple[int, int]]:
-    """Center-crop img to ratio of its width/height. Returns (view, (x0, y0))
-    where (x0, y0) is the crop origin in the original image."""
+    """Center-crop to ratio. Returns (view, crop origin in the original image)."""
     h, w = img.shape[:2]
     cw, ch = int(round(w * ratio)), int(round(h * ratio))
     x0, y0 = (w - cw) // 2, (h - ch) // 2
@@ -66,8 +46,7 @@ def _center_crop(img: np.ndarray, ratio: float) -> tuple[np.ndarray, tuple[int, 
 
 
 def _rigid_fit(src: np.ndarray, dst: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Closed-form least-squares rigid transform (R, t) with R a pure 2D
-    rotation (no scale, reflection excluded), mapping src -> dst. (N, 2) each."""
+    """Least-squares rigid transform (R, t) mapping src -> dst, (N, 2) each."""
     sc, dc = src.mean(axis=0), dst.mean(axis=0)
     H = (src - sc).T @ (dst - dc)
     U, _, Vt = np.linalg.svd(H)
@@ -77,8 +56,8 @@ def _rigid_fit(src: np.ndarray, dst: np.ndarray) -> tuple[np.ndarray, np.ndarray
 
 
 def _pick_ref_idx(counts: list[int]) -> int:
-    """First frame with >= 3 labels whose successor detects the same number
-    of labels; fallback: the frame with the most labels."""
+    """First frame with >= 3 labels whose successor sees the same count;
+    fallback: the frame with the most labels."""
     for i in range(len(counts) - 1):
         if counts[i] >= 3 and counts[i + 1] == counts[i]:
             return i
@@ -91,21 +70,14 @@ def _solve_poses(
     iters: int = 100,
     tol: float = 1e-4,
 ) -> tuple[list[np.ndarray], list[np.ndarray]]:
-    """Jointly solve one rigid pose (R, t) per frame minimizing
-    sum_f sum_l || R_f p_{f,l} + t_f - w_l ||^2 over world points w_l.
-
-    Alternating least squares: w_l = mean of transformed observations, then
-    each pose refit by _rigid_fit against the current world points. Frames
-    observing a single label keep their current rotation (unobservable) and
-    only update translation. The gauge is fixed afterwards so the reference
-    frame gets the identity pose."""
+    """Jointly solve one rigid pose per frame by alternating least squares
+    (world point = mean of transformed observations, then each pose refit).
+    The reference frame ends up with the identity pose."""
     n = len(obs)
     Rs = [np.eye(2) for _ in range(n)]
     ts = [np.zeros(2) for _ in range(n)]
 
-    # Init: chain translations via the median delta of labels shared with the
-    # previous frame (rotations start at identity); keeps disconnected or
-    # weakly-linked frames in a sane place for ALS to refine.
+    # Init translations by chaining median deltas of shared labels.
     for i in range(1, n):
         shared = obs[i - 1].keys() & obs[i].keys()
         if shared:
@@ -155,10 +127,8 @@ def _gaze_canvas_track(
     label_log: list[dict],
     stamp_affines: dict[int, np.ndarray],
 ) -> list[dict]:
-    """Every timestamped gaze sample mapped to stitched-canvas pixel coords:
-    one record {stamp_ns, canvas_xy} per log entry that has both a stamp and a
-    gaze point, in log order. Entries whose stamp wasn't placed (skipped frame
-    / duplicate stamp) reuse the most recent placed affine."""
+    """All timestamped gaze samples as {stamp_ns, canvas_xy} in canvas pixels;
+    entries whose stamp wasn't placed reuse the most recent placed affine."""
     first_affine = next(iter(stamp_affines.values()), None)
     if first_affine is None:
         return []
@@ -180,17 +150,12 @@ def _gaze_canvas_track(
 def _save_trajectory_map(
     label_log: list[dict],
     stamp_affines: dict[int, np.ndarray],
-    canvas_hw: tuple[int, int],
+    canvas: np.ndarray,
     out_path: Path,
 ) -> None:
-    """Draw every logged YOLO detection center (colored per label) and the gaze
-    trajectory (red polyline) on a blank canvas the same size as the mosaic.
-
-    stamp_affines: per placed stamp, the 2x3 affine mapping full-frame pixels
-    to canvas pixels. Log entries whose stamp wasn't placed (skipped frame /
-    duplicate stamp) reuse the most recent placed affine — the camera barely
-    moves between adjacent entries, so this keeps all gaze points."""
-    canvas = np.zeros((canvas_hw[0], canvas_hw[1], 3), dtype=np.uint8)
+    """Draw all detection centers (colored per label) and the gaze trajectory
+    (red polyline, start/end rings, legend) on a copy of the stitched mosaic."""
+    canvas = canvas.copy()
 
     def to_canvas(px, A) -> tuple[int, int]:
         p = A @ np.array([px[0], px[1], 1.0])
@@ -225,14 +190,11 @@ def _save_trajectory_map(
                       (0, 0, 255), 1, cv2.LINE_AA)
     for p in gaze_pts:
         cv2.circle(canvas, p, 2, (0, 0, 255), -1, cv2.LINE_AA)
-    # Start/end of the gaze track as rings (hollow, so they read differently
-    # from the filled label dots even on a color collision).
     _START_COLOR, _END_COLOR = (0, 255, 0), (255, 0, 255)
     if gaze_pts:
         cv2.circle(canvas, gaze_pts[0], 8, _START_COLOR, 2, cv2.LINE_AA)
         cv2.circle(canvas, gaze_pts[-1], 8, _END_COLOR, 2, cv2.LINE_AA)
 
-    # Legend: gaze, its start/end markers, one line per label.
     y = 18
     cv2.circle(canvas, (12, y - 4), 4, (0, 0, 255), -1, cv2.LINE_AA)
     cv2.putText(canvas, "gaze", (24, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
@@ -253,8 +215,8 @@ def _save_trajectory_map(
 
 
 def _central_speed(t: np.ndarray, P: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Central-difference speed |(p[i+1] - p[i-1]) / (t[i+1] - t[i-1])|;
-    endpoints excluded. Returns (t_mid, speed)."""
+    """Central-difference speed magnitude; endpoints excluded. Returns
+    (t_mid, speed)."""
     dt = t[2:] - t[:-2]
     ok = dt > 0
     vel = (P[2:] - P[:-2])[ok] / dt[ok, None]
@@ -262,8 +224,8 @@ def _central_speed(t: np.ndarray, P: np.ndarray) -> tuple[np.ndarray, np.ndarray
 
 
 def _smooth_series(y: np.ndarray, window: int = 9) -> np.ndarray:
-    """Gaussian-weighted moving average with reflect padding (no phase lag,
-    preserves length). Window is clamped to an odd size <= len(y)."""
+    """Gaussian moving average with reflect padding; window clamped to an odd
+    size <= len(y)."""
     n = len(y)
     window = min(window, n if n % 2 else n - 1)
     if window < 3:
@@ -284,17 +246,9 @@ def _save_gaze_kinematics(
     smooth_window: int = 13,
     speed_smooth_window: int = 3,
 ) -> None:
-    """Plot gaze canvas position and speed over time: three stacked panels
-    (canvas x, canvas y, speed magnitude) sharing the time axis.
-
-    One gaze sample per unique stamp (first entry wins, like the mosaic),
-    mapped through the same full-frame→canvas affines as the trajectory map.
-    Velocity is the central difference (p[i+1] - p[i-1]) / (t[i+1] - t[i-1]);
-    the first and last samples have no velocity.
-
-    Two figures: out_path with the raw track, and <stem>_smoothed.png where
-    x(t) and y(t) are Gaussian-smoothed (smooth_window samples) before the
-    same central-difference velocity is applied."""
+    """Plot gaze canvas x, y, and speed over time (stacked panels). Writes the
+    raw track to out_path plus <stem>_smoothed.png and <stem>_smoothed_speed.png
+    with Gaussian-smoothed variants."""
     # One sample per unique stamp (first wins) so dt > 0 for the differences.
     seen: set[int] = set()
     ts_ns: list[int] = []
@@ -327,9 +281,6 @@ def _save_gaze_kinematics(
                smooth_speed: bool = False) -> int:
         t_mid, speed = _central_speed(t, track)
         if smooth_speed:
-            # Second smoothing pass on the speed magnitude itself (the central
-            # difference re-amplifies residual jitter left in the track). Uses
-            # its own, much smaller window than the track smoothing.
             speed = _smooth_series(speed, speed_smooth_window)
         panels = [
             (t, track[:, 0], "canvas x (px)", "#2a78d6"),
@@ -359,8 +310,6 @@ def _save_gaze_kinematics(
     n_v = render(P, "Gaze on stitched canvas over time", out_path)
     print(f"Gaze kinematics ({len(pts)} samples, {n_v} velocity pts) → {out_path}")
 
-    # Same pipeline on the smoothed track: x(t) and y(t) each Gaussian-smoothed,
-    # then the identical central-difference velocity.
     P_smooth = np.column_stack([
         _smooth_series(P[:, 0], smooth_window),
         _smooth_series(P[:, 1], smooth_window),
@@ -371,8 +320,6 @@ def _save_gaze_kinematics(
            smooth_path)
     print(f"Smoothed gaze kinematics → {smooth_path}")
 
-    # Same smoothed track, but the speed magnitude gets its own second
-    # smoothing pass before plotting — saved as a separate figure.
     smooth_speed_path = out_path.with_name(out_path.stem + "_smoothed_speed.png")
     render(P_smooth,
            f"Gaze on stitched canvas over time "
@@ -391,25 +338,16 @@ def stitch_recording(
 ) -> Optional[Path]:
     """Stitch recorded frames into one mosaic anchored on YOLO detection centers.
 
-    frames: (stamp_ns, image) pairs as buffered during recording.
-    label_log: per-frame records from gaze_labels.json ("detected" entries must
-        carry "center_px" in full display-image pixels).
-    out_path: destination PNG for the stitched canvas.
-    max_canvas_dim: if the canvas would exceed this on either side, everything
-        is scaled down to fit.
-    save_placements: also write <out_path stem>_placements.json with each
-        frame's full-frame→canvas affine (useful to map gaze_px onto the mosaic).
-    crop_ratio: each frame is center-cropped to this fraction of its width and
-        height before pasting, trimming the fisheye vignette at the borders.
-        Anchor centers stay in full-frame coords; the crop only affects which
-        pixels get pasted, not the pose fit.
+    out_path is only the naming base (<stem>_trajectory.png, _gaze_track.json,
+    _placements.json, ...); the bare mosaic itself is not written — the
+    trajectory map shows it under its overlays. Frames are center-cropped to
+    crop_ratio before pasting to trim the fisheye vignette.
 
     Returns out_path on success, None if fewer than two frames could be placed.
     """
     centers_map = _centers_by_stamp(label_log)
 
-    # Keep the first frame per unique stamp that has anchor detections,
-    # center-cropped to trim the fisheye border (crop is a cheap view).
+    # First frame per unique stamp with anchor detections, center-cropped.
     seen: set[int] = set()
     keyed: list[tuple[int, np.ndarray]] = []
     crop_xy = (0, 0)
@@ -430,7 +368,6 @@ def stitch_recording(
     print(f"Poses solved for {len(keyed)} frames (ref frame index {ref_idx}).")
 
     # Canvas bounds from the transformed corners of every cropped frame.
-    # Cropped pixel q maps to canvas via p_full = q + crop_xy, then R p + t.
     ch, cw = keyed[0][1].shape[:2]
     crop_off = np.asarray(crop_xy, dtype=np.float64)
     corners_q = np.array([[0, 0], [cw, 0], [cw, ch], [0, ch]], dtype=np.float64)
@@ -449,16 +386,13 @@ def stitch_recording(
         canvas_h = int(np.ceil(canvas_h * scale))
         print(f"Stitch canvas capped: scaling by {scale:.3f}")
 
-    # Average compositing: float accumulator + per-pixel coverage count,
-    # warped per frame into its bounding ROI only (keeps cost ∝ frame area).
+    # Average compositing: float accumulator + coverage count, per-frame ROI.
     acc = np.zeros((canvas_h, canvas_w, 3), dtype=np.float32)
     cnt = np.zeros((canvas_h, canvas_w), dtype=np.float32)
     placement_log: list[dict] = []
     for (ts, img), R, t in zip(keyed, Rs, ts_):
-        # Full-frame px → canvas px (scale included).
-        A_full = np.hstack([scale * R, (scale * (t - min_xy))[:, None]])
-        # Cropped px → canvas px.
-        A_crop = A_full.copy()
+        A_full = np.hstack([scale * R, (scale * (t - min_xy))[:, None]])  # full-frame → canvas
+        A_crop = A_full.copy()  # cropped → canvas
         A_crop[:, 2] += A_full[:, :2] @ crop_off
 
         pts = (corners_q @ A_crop[:, :2].T) + A_crop[:, 2]
@@ -488,29 +422,22 @@ def stitch_recording(
     canvas = (acc / np.maximum(cnt, 1.0)[..., None]).astype(np.uint8)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(out_path), canvas)
-    print(
-        f"Stitched {len(placement_log)} frames (avg-blended) "
-        f"→ {out_path} ({canvas_w}x{canvas_h})"
-    )
+    print(f"Stitched {len(placement_log)} frames (avg-blended, {canvas_w}x{canvas_h})")
 
-    # Companion map, same canvas size: all detection centers + gaze trajectory,
-    # no background imagery.
+    # The mosaic is only saved with detection centers + gaze trajectory on top.
     stamp_affines = {
         p["stamp_ns"]: np.asarray(p["affine_full_to_canvas"]) for p in placement_log
     }
     _save_trajectory_map(
-        label_log, stamp_affines, (canvas_h, canvas_w),
+        label_log, stamp_affines, canvas,
         out_path.with_name(out_path.stem + "_trajectory.png"),
     )
-    # Time-series panels of the same canvas-space gaze track: x(t), y(t), |v|(t).
     _save_gaze_kinematics(
         label_log, stamp_affines,
         out_path.with_name(out_path.stem + "_gaze_kinematics.png"),
     )
 
-    # All gaze samples in stitched-canvas pixel coords with their timestamps,
-    # as a standalone JSON (same mapping the trajectory map / kinematics use).
+    # Standalone JSON of the gaze track in canvas pixel coords.
     gaze_track = _gaze_canvas_track(label_log, stamp_affines)
     if gaze_track:
         t0 = gaze_track[0]["stamp_ns"]
@@ -518,7 +445,7 @@ def stitch_recording(
             rec["t_sec"] = round((rec["stamp_ns"] - t0) / 1e9, 6)
         track_path = out_path.with_name(out_path.stem + "_gaze_track.json")
         track_path.write_text(json.dumps({
-            "coordinate_frame": "stitched canvas pixels (matches stitched.png)",
+            "coordinate_frame": "stitched canvas pixels (matches stitched_trajectory.png)",
             "t0_stamp_ns": t0,
             "count": len(gaze_track),
             "points": gaze_track,
