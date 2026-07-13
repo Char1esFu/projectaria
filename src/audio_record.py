@@ -30,7 +30,7 @@ AUDIO_GAP_TOLERANCE_SAMPLES = 2
 
 # /transcription must be published after /gaze_label (the reader on the other device
 # uses the transcription to decide whether to consume the gaze label). The gaze
-# pipeline publishes /gaze_label after stitching + clustering on B release; this is
+# pipeline publishes /gaze_label after stitching + peak analysis on B release; this is
 # the longest we hold the transcription waiting for it before giving up.
 GAZE_LABEL_TIMEOUT_SEC = 30.0
 
@@ -178,7 +178,7 @@ class AudioHandler:
     def _on_b_release(self, _msg: Empty) -> None:
         self.recording = False
         # Arm the wait: only a /gaze_label published after this release counts
-        # (the gaze pipeline needs at least stitch+cluster time, so nothing from
+        # (the gaze pipeline needs at least stitch+peak-analysis time, so nothing from
         # this session can arrive before the clear).
         self._gaze_label_event.clear()
         threading.Thread(target=self._do_transcribe, daemon=True).start()
