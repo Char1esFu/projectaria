@@ -147,6 +147,33 @@ def _gaze_canvas_track(
     return track
 
 
+def _detection_canvas_points(
+    label_log: list[dict], stamp_affines: dict[int, np.ndarray]
+) -> list[dict]:
+    """Return logged YOLO centers transformed into stitched-canvas pixels."""
+    first_affine = next(iter(stamp_affines.values()), None)
+    if first_affine is None:
+        return []
+    affine = None
+    points: list[dict] = []
+    for entry in label_log:
+        stamp_ns = entry.get("stamp_ns")
+        if stamp_ns in stamp_affines:
+            affine = stamp_affines[stamp_ns]
+        current = affine if affine is not None else first_affine
+        for detection in entry.get("detected", []):
+            center = detection.get("center_px")
+            if center is None:
+                continue
+            canvas_point = current @ np.array([center[0], center[1], 1.0])
+            points.append({
+                "stamp_ns": stamp_ns,
+                "label": detection.get("label"),
+                "canvas_xy": [float(canvas_point[0]), float(canvas_point[1])],
+            })
+    return points
+
+
 def _save_trajectory_map(
     label_log: list[dict],
     stamp_affines: dict[int, np.ndarray],
@@ -190,6 +217,25 @@ def _save_trajectory_map(
                       (0, 0, 255), 1, cv2.LINE_AA)
     for p in gaze_pts:
         cv2.circle(canvas, p, 2, (0, 0, 255), -1, cv2.LINE_AA)
+    # Keep these labels aligned with the zero-based indices stored in
+    # stitched_gaze_track.json and stitched_gaze_track_peak.json.
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.35
+    font_thickness = 1
+    canvas_h, canvas_w = canvas.shape[:2]
+    for index, (px, py) in enumerate(gaze_pts):
+        text = str(index)
+        (text_w, text_h), baseline = cv2.getTextSize(
+            text, font, font_scale, font_thickness
+        )
+        text_x = min(max(px + 4, 0), max(0, canvas_w - text_w - 1))
+        text_y = min(max(py - 4, text_h + 1), canvas_h - baseline - 1)
+        # A dark outline keeps the index readable on both bright and dark
+        # regions of the stitched RGB image.
+        cv2.putText(canvas, text, (text_x, text_y), font, font_scale,
+                    (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(canvas, text, (text_x, text_y), font, font_scale,
+                    (0, 255, 255), font_thickness, cv2.LINE_AA)
     _START_COLOR, _END_COLOR = (0, 255, 0), (255, 0, 255)
     if gaze_pts:
         cv2.circle(canvas, gaze_pts[0], 8, _START_COLOR, 2, cv2.LINE_AA)
@@ -199,6 +245,10 @@ def _save_trajectory_map(
     cv2.circle(canvas, (12, y - 4), 4, (0, 0, 255), -1, cv2.LINE_AA)
     cv2.putText(canvas, "gaze", (24, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
                 (0, 0, 255), 1, cv2.LINE_AA)
+    y += 18
+    cv2.putText(canvas, "numbers: gaze index (0-based)", (12, y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1,
+                cv2.LINE_AA)
     for text, col in (("gaze start", _START_COLOR), ("gaze end", _END_COLOR)):
         y += 18
         cv2.circle(canvas, (12, y - 4), 5, col, 2, cv2.LINE_AA)
@@ -449,6 +499,7 @@ def stitch_recording(
             "t0_stamp_ns": t0,
             "count": len(gaze_track),
             "points": gaze_track,
+            "detection_points": _detection_canvas_points(label_log, stamp_affines),
         }, indent=2))
         print(f"Gaze track ({len(gaze_track)} pts) → {track_path}")
 

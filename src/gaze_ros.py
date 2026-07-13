@@ -30,7 +30,8 @@ class GazeRos:
                 lambda msg: on_gaze(float(msg.x), float(msg.y)), 10,
             )
             self._node.create_subscription(
-                CameraInfo, "/zedr/zed_node/rgb/camera_info",
+                # CameraInfo, "/zedr/zed_node/rgb/camera_info",
+                CameraInfo, '/static_camera/zed_right_node/rgb/camera_info',
                 lambda msg: on_manip_stamp(
                     msg.header.stamp.sec * 10**9 + msg.header.stamp.nanosec
                 ),

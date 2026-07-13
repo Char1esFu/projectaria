@@ -5,12 +5,11 @@ from typing import Optional
 from utils.aria_rgb_stream import AriaRgbStream
 from src.gaze_overlay import GazeOverlay
 from src.gaze_rgb_config import (
-    DEFAULT_GAZE_CENTER_METHOD,
-    DEFAULT_GAZE_CLUSTER_RADIUS,
-    DEFAULT_GAZE_CLUSTER_WINDOW,
+    DEFAULT_GAZE_PEAK_RADIUS,
+    DEFAULT_GAZE_PEAK_YOLO_MAX_DISTANCE,
+    DEFAULT_GAZE_PEAK_WINDOW,
     MODEL_PATH,
 )
-from src.gaze_track_peak import GAZE_CENTER_METHODS
 
 
 def run_gaze_rgb_visualizer(
@@ -29,9 +28,9 @@ def run_gaze_rgb_visualizer(
     std_dist: float = 200.0,
     s_min: float = 0.3,
     participant: str = "",
-    gaze_cluster_window: int = DEFAULT_GAZE_CLUSTER_WINDOW,
-    gaze_cluster_radius: float = DEFAULT_GAZE_CLUSTER_RADIUS,
-    gaze_center_method: str = DEFAULT_GAZE_CENTER_METHOD,
+    gaze_peak_window: int = DEFAULT_GAZE_PEAK_WINDOW,
+    gaze_peak_radius: float = DEFAULT_GAZE_PEAK_RADIUS,
+    gaze_peak_yolo_max_distance: float = DEFAULT_GAZE_PEAK_YOLO_MAX_DISTANCE,
 ) -> None:
     overlay = GazeOverlay(
         homography_path=homography_path,
@@ -47,9 +46,9 @@ def run_gaze_rgb_visualizer(
         std_dist=std_dist,
         s_min=s_min,
         participant=participant,
-        gaze_cluster_window=gaze_cluster_window,
-        gaze_cluster_radius=gaze_cluster_radius,
-        gaze_center_method=gaze_center_method,
+        gaze_peak_window=gaze_peak_window,
+        gaze_peak_radius=gaze_peak_radius,
+        gaze_peak_yolo_max_distance=gaze_peak_yolo_max_distance,
     )
     stream = AriaRgbStream(
         device_ip=device_ip,
@@ -144,24 +143,24 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Participant ID (e.g. AB12). Required for video recording to recordings/<participant>/NN/.",
     )
-    parser.add_argument("--gaze-cluster-window", 
+    parser.add_argument("--gaze-peak-window",
         type=int, 
-        default=DEFAULT_GAZE_CLUSTER_WINDOW,
-        help="Odd temporal window for automatic stitched gaze clustering. "
-             "Default: 7.",
+        default=DEFAULT_GAZE_PEAK_WINDOW,
+        help="Temporal window for stitched gaze peak detection. Fixed default: 3.",
     )
-    parser.add_argument("--gaze-cluster-radius", 
+    parser.add_argument("--gaze-peak-radius",
         type=float, 
-        default=DEFAULT_GAZE_CLUSTER_RADIUS,
-        help="Pixel radius for automatic stitched gaze clustering. Default: 30.",
+        default=DEFAULT_GAZE_PEAK_RADIUS,
+        help="Pixel radius for filtering start/end fixation regions. Default: 15.",
     )
-    parser.add_argument("--gaze-center-method", 
-        choices=GAZE_CENTER_METHODS,
-        default=DEFAULT_GAZE_CENTER_METHOD,
-        help="How the gaze-center stamp for score weighting is found: 'cluster' "
-             "(temporal window/radius clustering, middle cluster kept) or 'peak' "
-             "(densest track point with boundary-connectivity check). "
-             f"Default: {DEFAULT_GAZE_CENTER_METHOD}.",
+    parser.add_argument(
+        "--gaze-peak-yolo-max-distance",
+        type=float,
+        default=DEFAULT_GAZE_PEAK_YOLO_MAX_DISTANCE,
+        help=(
+            "Reject a peak farther than this many stitched-canvas pixels from "
+            "every YOLO center. Default: 200."
+        ),
     )
     return parser.parse_args()
 
@@ -184,9 +183,9 @@ def main() -> None:
         std_dist=args.std_dist,
         s_min=args.s_min,
         participant=args.participant,
-        gaze_cluster_window=args.gaze_cluster_window,
-        gaze_cluster_radius=args.gaze_cluster_radius,
-        gaze_center_method=args.gaze_center_method,
+        gaze_peak_window=args.gaze_peak_window,
+        gaze_peak_radius=args.gaze_peak_radius,
+        gaze_peak_yolo_max_distance=args.gaze_peak_yolo_max_distance,
     )
 
 

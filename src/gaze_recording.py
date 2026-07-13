@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 
 from src.frame_stitcher import stitch_recording
-from src.gaze_track_peak import GAZE_CENTER_METHODS, find_gaze_center_stamp
+from src.gaze_track_peak import find_gaze_center_stamp, visualize_analyzed_peak
 
 
 def normalize_entries(entries: list[dict]) -> list[dict]:
@@ -27,7 +27,7 @@ def normalize_entries(entries: list[dict]) -> list[dict]:
 def compute_weighted_entries(
     label_log: list[dict], center_stamp_ns: Optional[int]
 ) -> list[dict]:
-    """Cluster-center-weighted average of per-frame detection scores."""
+    """Peak-center-weighted average of per-frame detection scores."""
     frames = [f for f in label_log if f.get("stamp_ns") is not None]
     if not frames:
         return []
@@ -52,6 +52,70 @@ def compute_weighted_entries(
     return weighted
 
 
+def validate_peak_center(
+    track_path: Path,
+    center_stamp_ns: Optional[int],
+    recording_stamps_ns: list[int],
+    max_yolo_distance_px: float,
+) -> tuple[Optional[int], Optional[str]]:
+    """Reject peaks near recording edges or far from every canvas YOLO center."""
+    if center_stamp_ns is None:
+        return None, "peak analysis did not choose a point"
+
+    stamps = [stamp for stamp in recording_stamps_ns if stamp is not None]
+    if len(stamps) < 2:
+        return None, "recording has fewer than two valid timestamps"
+    start_stamp_ns = min(stamps)
+    end_stamp_ns = max(stamps)
+    duration_ns = end_stamp_ns - start_stamp_ns
+    if duration_ns <= 0:
+        return None, "recording duration is not positive"
+
+    edge_threshold_ns = duration_ns / 8.0
+    start_gap_ns = center_stamp_ns - start_stamp_ns
+    end_gap_ns = end_stamp_ns - center_stamp_ns
+    if start_gap_ns < edge_threshold_ns or end_gap_ns < edge_threshold_ns:
+        return None, (
+            "peak is too close to a recording edge "
+            f"(start gap={start_gap_ns / 1e9:.3f}s, "
+            f"end gap={end_gap_ns / 1e9:.3f}s, "
+            f"minimum={edge_threshold_ns / 1e9:.3f}s)"
+        )
+
+    track = json.loads(track_path.read_text())
+    peak_record = next(
+        (point for point in track.get("points", [])
+         if point.get("stamp_ns") == center_stamp_ns),
+        None,
+    )
+    if peak_record is None or peak_record.get("canvas_xy") is None:
+        return None, "peak canvas coordinate is unavailable"
+
+    detection_points = [
+        detection["canvas_xy"]
+        for detection in track.get("detection_points", [])
+        if detection.get("canvas_xy") is not None
+    ]
+    if not detection_points:
+        return None, "no YOLO centers are available on the stitched canvas"
+
+    peak_xy = np.asarray(peak_record["canvas_xy"], dtype=np.float64)
+    yolo_xy = np.asarray(detection_points, dtype=np.float64)
+    nearest_distance_px = float(np.linalg.norm(yolo_xy - peak_xy, axis=1).min())
+    if nearest_distance_px > max_yolo_distance_px:
+        return None, (
+            f"nearest canvas YOLO center is {nearest_distance_px:.1f}px away "
+            f"(maximum={max_yolo_distance_px:.1f}px)"
+        )
+
+    print(
+        "Gaze peak validation passed: "
+        f"nearest YOLO center={nearest_distance_px:.1f}px, "
+        f"recording-edge minimum={edge_threshold_ns / 1e9:.3f}s."
+    )
+    return center_stamp_ns, None
+
+
 class GazeRecord:
     """Owns all recording / gaze-label state: frame buffers, the per-frame
     label log, the on-screen score display, and the final /gaze_label result.
@@ -66,21 +130,18 @@ class GazeRecord:
         participant: str,
         s_min: float,
         label_tail_duration: float,
-        gaze_center_method: str,
-        gaze_cluster_window: int,
-        gaze_cluster_radius: float,
+        gaze_peak_window: int,
+        gaze_peak_radius: float,
+        gaze_peak_yolo_max_distance: float = 200.0,
     ) -> None:
-        if gaze_center_method not in GAZE_CENTER_METHODS:
-            raise ValueError(
-                f"gaze_center_method must be one of {GAZE_CENTER_METHODS}, "
-                f"got {gaze_center_method!r}"
-            )
         self._participant = participant
         self._s_min = s_min
         self._label_tail_duration = label_tail_duration
-        self._gaze_center_method = gaze_center_method
-        self._gaze_cluster_window = gaze_cluster_window
-        self._gaze_cluster_radius = gaze_cluster_radius
+        self._gaze_peak_window = gaze_peak_window
+        self._gaze_peak_radius = gaze_peak_radius
+        if gaze_peak_yolo_max_distance <= 0:
+            raise ValueError("gaze_peak_yolo_max_distance must be > 0")
+        self._gaze_peak_yolo_max_distance = gaze_peak_yolo_max_distance
 
         # Latest camera_info stamp from the manipulation workstation (ns).
         self.latest_manip_stamp_ns: Optional[int] = None
@@ -227,6 +288,7 @@ class GazeRecord:
         session_dir = frames_dir.parent
 
         center_stamp_ns: Optional[int] = None
+        fallback_reason: Optional[str] = None
         if label_log:
             try:
                 stitched_path = stitch_recording(
@@ -241,18 +303,31 @@ class GazeRecord:
                     if track_path.exists():
                         center_stamp_ns = find_gaze_center_stamp(
                             track_path,
-                            self._gaze_center_method,
-                            self._gaze_cluster_window,
-                            self._gaze_cluster_radius,
+                            self._gaze_peak_window,
+                            self._gaze_peak_radius,
+                            visualize=False,
                         )
+                        center_stamp_ns, fallback_reason = validate_peak_center(
+                            track_path,
+                            center_stamp_ns,
+                            [stamp_ns for stamp_ns, _ in frames],
+                            self._gaze_peak_yolo_max_distance,
+                        )
+                        if center_stamp_ns is not None:
+                            visualize_analyzed_peak(
+                                track_path, self._gaze_peak_radius
+                            )
                     else:
                         print(f"Gaze center analysis skipped: {track_path} not found.")
             except Exception as exc:
+                fallback_reason = f"peak processing failed: {exc}"
                 print(f"Frame stitching or gaze center analysis failed: {exc}")
 
         if center_stamp_ns is None:
             print(
-                f"No gaze center found ({self._gaze_center_method}); "
+                "Gaze peak rejected"
+                + (f": {fallback_reason}" if fallback_reason else "")
+                + "; "
                 "/gaze_label falls back to the unweighted average."
             )
         elif label_log:
@@ -284,8 +359,11 @@ class GazeRecord:
 
         if label_log:
             payload = {
-                "gaze_center_method": self._gaze_center_method,
+                "gaze_center_method": (
+                    "peak" if center_stamp_ns is not None else "unweighted_average"
+                ),
                 "gaze_center_stamp_ns": center_stamp_ns,
+                "gaze_peak_fallback_reason": fallback_reason,
                 "published": published,
                 "frames": label_log,
             }

@@ -8,6 +8,7 @@ import numpy as np
 from src.gaze_recording import GazeRecord
 from src.gaze_rgb_config import (
     CROP_SIZE,
+    DEFAULT_GAZE_PEAK_YOLO_MAX_DISTANCE,
     GAZE_LABEL_TAIL_SEC,
     RESIZE_SIZE,
 )
@@ -35,9 +36,9 @@ class GazeOverlay:
         std_dist: float = 200.0,
         s_min: float = 0.3,
         participant: str = "",
-        gaze_cluster_window: int = 7,
-        gaze_cluster_radius: float = 20.0,
-        gaze_center_method: str = "peak",
+        gaze_peak_window: int = 5,
+        gaze_peak_radius: float = 15.0,
+        gaze_peak_yolo_max_distance: float = DEFAULT_GAZE_PEAK_YOLO_MAX_DISTANCE,
     ) -> None:
         self.gaze_pitch: float = 0.0
         self.gaze_yaw: float = 0.0
@@ -48,9 +49,9 @@ class GazeOverlay:
             participant=participant,
             s_min=s_min,
             label_tail_duration=GAZE_LABEL_TAIL_SEC,
-            gaze_center_method=gaze_center_method,
-            gaze_cluster_window=gaze_cluster_window,
-            gaze_cluster_radius=gaze_cluster_radius,
+            gaze_peak_window=gaze_peak_window,
+            gaze_peak_radius=gaze_peak_radius,
+            gaze_peak_yolo_max_distance=gaze_peak_yolo_max_distance,
         )
         self.ros = GazeRos(
             on_gaze=self._set_gaze,

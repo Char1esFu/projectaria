@@ -1,8 +1,7 @@
-"""Densest-point gaze analysis for stitched gaze tracks.
+"""Minimum-spread gaze analysis for stitched gaze tracks.
 
-Each point is ranked by nearby temporal neighbors, with ties broken by local
-spread. Dense segments touching the track boundary are rejected as sweep-in/out
-motion. ``find_gaze_center_stamp`` also dispatches to the cluster method.
+Endpoint-connected fixation regions are removed first. The remaining point
+with the smallest local mean squared distance is selected as the gaze peak.
 """
 
 import argparse
@@ -12,17 +11,18 @@ from typing import Optional
 
 import numpy as np
 
-from src.gaze_track_cluster import (
-    _validate_params,
-    analyze_track,
-    count_neighbors_in_radius,
-)
+from src.gaze_rgb_config import DEFAULT_GAZE_MIN_BOUNDARY_POINTS
+from src.gaze_track_boundary import find_boundary_regions
 
-GAZE_CENTER_METHODS = ("cluster", "peak")
+def _validate_params(window: int, radius: float) -> None:
+    if window < 3 or window % 2 == 0:
+        raise ValueError("window must be an odd integer >= 3")
+    if radius <= 0:
+        raise ValueError("radius must be > 0")
 
 
-def _window_mean_sq_dist(points_xy: np.ndarray, window: int, radius: float) -> np.ndarray:
-    """Return each point's local spread within its temporal window."""
+def _window_mean_sq_dist(points_xy: np.ndarray, window: int) -> np.ndarray:
+    """Return each point's local spread using every point in its time window."""
     half = window // 2
     n = len(points_xy)
     msd = np.full(n, np.inf, dtype=np.float64)
@@ -31,47 +31,31 @@ def _window_mean_sq_dist(points_xy: np.ndarray, window: int, radius: float) -> n
         stop = min(n, i + half + 1)
         neighbors = np.delete(points_xy[start:stop], i - start, axis=0)
         sq_dists = np.sum((neighbors - point) ** 2, axis=1)
-        sq_dists = sq_dists[sq_dists <= radius * radius]
         if len(sq_dists):
             msd[i] = float(np.mean(sq_dists))
     return msd
 
 
-def _dense_segment(points_xy: np.ndarray, center: int, radius: float) -> tuple[int, int]:
-    """Return the consecutive in-radius segment around center."""
-    p = points_xy[center]
-    lo = center
-    while lo > 0 and np.linalg.norm(points_xy[lo - 1] - p) <= radius:
-        lo -= 1
-    hi = center
-    while hi < len(points_xy) - 1 and np.linalg.norm(points_xy[hi + 1] - p) <= radius:
-        hi += 1
-    return lo, hi
-
-
 def find_peak(
-    points_xy: np.ndarray, window: int, radius: float
-) -> tuple[Optional[int], np.ndarray, np.ndarray, list[tuple[int, int]]]:
-    """Pick the densest non-boundary track point."""
+    points_xy: np.ndarray,
+    window: int,
+    radius: float,
+    min_boundary_points: int = DEFAULT_GAZE_MIN_BOUNDARY_POINTS,
+) -> tuple[Optional[int], np.ndarray, set[int], set[int]]:
+    """Pick the lowest-MSD point after removing endpoint fixation regions."""
     _validate_params(window, radius)
-    n = len(points_xy)
-    counts = count_neighbors_in_radius(points_xy, window, radius)
-    msd = _window_mean_sq_dist(points_xy, window, radius)
-    min_count = 1
-
-    order = sorted(range(n), key=lambda i: (-counts[i], msd[i]))
-    excluded = np.zeros(n, dtype=bool)
-    rejected: list[tuple[int, int]] = []
-    for i in order:
-        if excluded[i] or counts[i] < min_count:
-            continue
-        lo, hi = _dense_segment(points_xy, i, radius)
-        if lo == 0 or hi == n - 1:
-            excluded[lo:hi + 1] = True
-            rejected.append((lo, hi))
-            continue
-        return i, counts, msd, rejected
-    return None, counts, msd, rejected
+    msd = _window_mean_sq_dist(points_xy, window)
+    start_region, end_region = find_boundary_regions(
+        points_xy, radius, min_boundary_points
+    )
+    excluded = start_region | end_region
+    eligible = [
+        i for i in range(len(points_xy))
+        if i not in excluded and np.isfinite(msd[i])
+    ]
+    if not eligible:
+        return None, msd, start_region, end_region
+    return min(eligible, key=lambda i: msd[i]), msd, start_region, end_region
 
 
 def save_peak_visualization(
@@ -118,15 +102,17 @@ def save_peak_visualization(
     cv2.imwrite(str(output_path), canvas)
 
 
-def analyze_track_peak(track_path: Path, window: int, radius: float) -> Path:
-    """Write peak analysis JSON and update the trajectory visualization."""
+def analyze_track_peak(
+    track_path: Path, window: int, radius: float, visualize: bool = True
+) -> Path:
+    """Write peak analysis JSON and optionally update the trajectory image."""
     data = json.loads(track_path.read_text())
     records = data.get("points", [])
     if not records:
         raise ValueError(f"No points found in {track_path}.")
 
     points_xy = np.asarray([r["canvas_xy"] for r in records], dtype=np.float64)
-    idx, counts, msd, rejected = find_peak(points_xy, window, radius)
+    idx, msd, start_region, end_region = find_peak(points_xy, window, radius)
 
     chosen = None
     if idx is not None:
@@ -136,7 +122,6 @@ def analyze_track_peak(track_path: Path, window: int, radius: float) -> Path:
             "stamp_ns": r.get("stamp_ns"),
             "t_sec": r.get("t_sec"),
             "canvas_xy": r["canvas_xy"],
-            "neighbors_in_radius": int(counts[idx]),
             "mean_sq_dist_px2": round(float(msd[idx]), 2),
         }
 
@@ -144,67 +129,81 @@ def analyze_track_peak(track_path: Path, window: int, radius: float) -> Path:
     output = {
         "source": str(track_path),
         "coordinate_frame": data.get("coordinate_frame"),
-        "method": "densest point with boundary-connectivity check",
+        "method": (
+            "minimum local mean squared distance over all points in the temporal "
+            "window after endpoint filtering"
+        ),
         "params": {
             "window": window,
-            "radius_px": radius,
-            "min_neighbors": 1,
+            "boundary_radius_px": radius,
+            "min_boundary_points": DEFAULT_GAZE_MIN_BOUNDARY_POINTS,
         },
         "count": len(records),
         "chosen": chosen,
-        "rejected_boundary_segments": [
-            {
-                "start_index": lo,
-                "end_index": hi,
-                "stamp_ns_start": records[lo].get("stamp_ns"),
-                "stamp_ns_end": records[hi].get("stamp_ns"),
-            }
-            for lo, hi in rejected
-        ],
+        "start_boundary_indices": sorted(start_region),
+        "end_boundary_indices": sorted(end_region),
         "points": [
-            {**record, "neighbors_in_radius": int(count)}
-            for record, count in zip(records, counts)
+            {
+                **record,
+                "mean_sq_dist_px2": (
+                    round(float(point_msd), 2) if np.isfinite(point_msd) else None
+                ),
+                "boundary_region": (
+                    "start" if i in start_region else "end" if i in end_region else ""
+                ),
+            }
+            for i, (record, point_msd) in enumerate(zip(records, msd))
         ],
     }
     output_path.write_text(json.dumps(output, indent=2))
 
     png_path = track_path.parent / "stitched_trajectory.png"
-    save_peak_visualization(points_xy, chosen, radius, track_path, png_path)
+    if visualize:
+        save_peak_visualization(points_xy, chosen, radius, track_path, png_path)
 
     print(
         f"{len(records)} points, window={window}, radius={radius}px -> "
         + (
             f"peak at index {chosen['index']} (stamp_ns={chosen['stamp_ns']}, "
-            f"count={chosen['neighbors_in_radius']})"
+            f"MSD={chosen['mean_sq_dist_px2']}px²)"
             if chosen
             else "no acceptable peak"
         )
-        + f", {len(rejected)} boundary segment(s) rejected"
+        + f", {len(start_region)} start + {len(end_region)} end points rejected"
     )
     print(f"Saved peak JSON: {output_path}")
-    print(f"Saved trajectory PNG: {png_path}")
+    if visualize:
+        print(f"Saved trajectory PNG: {png_path}")
 
     return output_path
 
 
 def find_gaze_center_stamp(
-    track_path: Path, method: str, window: int, radius: float
+    track_path: Path, window: int, radius: float, visualize: bool = True
 ) -> Optional[int]:
-    """Return the gaze-center timestamp from the selected method."""
-    if method == "cluster":
-        out_path = analyze_track(track_path, window, radius)
-        clusters = json.loads(out_path.read_text()).get("clusters", [])
-        return clusters[0].get("center_stamp_ns") if clusters else None
-    if method == "peak":
-        out_path = analyze_track_peak(track_path, window, radius)
-        chosen = json.loads(out_path.read_text()).get("chosen")
-        return chosen.get("stamp_ns") if chosen else None
-    raise ValueError(f"Unknown gaze center method: {method!r} (use 'cluster' or 'peak').")
+    """Return the peak gaze-center timestamp."""
+    out_path = analyze_track_peak(track_path, window, radius, visualize=visualize)
+    chosen = json.loads(out_path.read_text()).get("chosen")
+    return chosen.get("stamp_ns") if chosen else None
+
+
+def visualize_analyzed_peak(track_path: Path, radius: float) -> None:
+    """Draw a previously analyzed peak after external validation succeeds."""
+    data = json.loads(track_path.read_text())
+    records = data.get("points", [])
+    if not records:
+        raise ValueError(f"No points found in {track_path}.")
+    peak_path = track_path.with_name(f"{track_path.stem}_peak.json")
+    chosen = json.loads(peak_path.read_text()).get("chosen")
+    points_xy = np.asarray([record["canvas_xy"] for record in records], dtype=np.float64)
+    output_path = track_path.parent / "stitched_trajectory.png"
+    save_peak_visualization(points_xy, chosen, radius, track_path, output_path)
+    print(f"Saved validated peak to trajectory PNG: {output_path}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Densest-point gaze track analysis with boundary-connectivity check."
+        description="Minimum-MSD gaze analysis after endpoint fixation filtering."
     )
     parser.add_argument("track", type=Path, help="Path to stitched_gaze_track.json")
     parser.add_argument(
@@ -213,7 +212,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--radius", type=float, required=True,
-        help="Pixel radius of the circle drawn around each track point.",
+        help="Pixel radius used to identify start/end fixation regions.",
     )
     args = parser.parse_args()
     analyze_track_peak(args.track, args.window, args.radius)
