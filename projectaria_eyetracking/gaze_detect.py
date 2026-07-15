@@ -62,6 +62,15 @@ def parse_args() -> argparse.Namespace:
         help="Sliding-window duration (seconds) to average pitch/yaw before publishing.",
     )
     parser.add_argument(
+        "--gaze-buffer-delay-frames",
+        type=int,
+        default=0,
+        help=(
+            "Publish the gaze result this many EyeTrack results behind the newest "
+            "result (0 publishes immediately)."
+        ),
+    )
+    parser.add_argument(
         "--undistort-width",
         type=int,
         default=1408,
@@ -82,7 +91,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--device-ip",
         type=str,
-        default="192.168.8.117",
+        default=None,
         help="IP address of the Aria device (e.g. 192.168.8.117).",
     )
     parser.add_argument(
@@ -140,6 +149,8 @@ def _setup_aruco_detector():
 
 def main() -> None:
     args = parse_args()
+    if args.gaze_buffer_delay_frames < 0:
+        raise ValueError("--gaze-buffer-delay-frames must be >= 0")
     if args.update_iptables and sys.platform.startswith("linux"):
         update_iptables()
 
@@ -176,14 +187,11 @@ def main() -> None:
 
     streaming_client = aria.StreamingClient()
 
-    def _apply_subscription(include_rgb: bool) -> None:
+    def _apply_subscription() -> None:
         config = streaming_client.subscription_config
-        if include_rgb:
-            config.subscriber_data_type = (
-                aria.StreamingDataType.EyeTrack | aria.StreamingDataType.Rgb
-            )
-        else:
-            config.subscriber_data_type = aria.StreamingDataType.EyeTrack
+        config.subscriber_data_type = (
+            aria.StreamingDataType.EyeTrack | aria.StreamingDataType.Rgb
+        )
         config.message_queue_size[aria.StreamingDataType.EyeTrack] = 1
         config.message_queue_size[aria.StreamingDataType.Rgb] = 1
 
@@ -192,21 +200,21 @@ def main() -> None:
         config.security_options = options
         streaming_client.subscription_config = config
 
-    # RGB is only needed while calibrating; subscribe to EyeTrack alone by
-    # default so the glasses don't stream the large RGB image to two clients.
-    _apply_subscription(include_rgb=False)
-    rgb_subscribed = False
+    # Keep both camera streams active so their device capture timestamps remain
+    # available on the same Aria hardware clock throughout the run.
+    _apply_subscription()
 
     class StreamingClientObserver:
         def __init__(self):
             self.images = {}
-            self.rgb_image = None
+            self.rgb_sample = None
 
         def on_image_received(self, image: np.ndarray, record) -> None:
+            sample = (int(record.capture_timestamp_ns), image)
             if record.camera_id == aria.CameraId.EyeTrack:
-                self.images[record.camera_id] = image
+                self.images[record.camera_id] = sample
             elif record.camera_id == aria.CameraId.Rgb:
-                self.rgb_image = image
+                self.rgb_sample = sample
 
     observer = StreamingClientObserver()
     streaming_client.set_streaming_client_observer(observer)
@@ -225,6 +233,10 @@ def main() -> None:
     # `smooth_window` seconds and publish their average.
     smooth_window: float = args.smooth_window
     gaze_history: deque[tuple[float, float, float]] = deque()
+    # Each entry is (EyeTrack capture timestamp, smoothed pitch, smoothed yaw).
+    # Keeping N entries queued makes publication lag the newest result by N
+    # EyeTrack inference results.
+    gaze_publish_buffer: deque[tuple[int, float, float]] = deque()
 
     # Calibration state
     calibrating = False
@@ -277,6 +289,7 @@ def main() -> None:
     # Latest raw gaze (updated each EyeTrack frame, used when pairing with RGB)
     latest_pitch_raw: float = 0.0
     latest_yaw_raw: float = 0.0
+    latest_rgb_timestamp_ns: int | None = None
 
     print(
         f"Press C to start calibration (look at ArUco marker {CALIB_MARKER_ID}); "
@@ -288,20 +301,6 @@ def main() -> None:
             key = cv2.waitKey(1) & 0xFF
             if key == 27 or key == ord("q"):
                 break
-
-            # Subscribe to RGB only while calibrating; drop it as soon as
-            # calibration ends so the RGB stream isn't sent to two clients.
-            if calibrating != rgb_subscribed:
-                streaming_client.unsubscribe()
-                _apply_subscription(include_rgb=calibrating)
-                streaming_client.subscribe()
-                rgb_subscribed = calibrating
-                if not rgb_subscribed:
-                    observer.rgb_image = None
-                print(
-                    "RGB subscription "
-                    + ("enabled for calibration." if rgb_subscribed else "disabled.")
-                )
 
             if compute_calib:
                 with _calib_lock:
@@ -340,10 +339,16 @@ def main() -> None:
                 else:
                     print("Not enough samples for calibration (need >= 2).")
 
-            # Process RGB frame for ArUco detection during calibration
-            if calibrating and observer.rgb_image is not None:
-                bgr = observer.rgb_image
-                observer.rgb_image = None
+            # Consume RGB continuously. The image itself is processed only for
+            # calibration, but every frame retains its hardware timestamp.
+            rgb_sample = observer.rgb_sample
+            observer.rgb_sample = None
+            if rgb_sample is not None:
+                rgb_timestamp_ns, bgr = rgb_sample
+                latest_rgb_timestamp_ns = rgb_timestamp_ns
+                print(f"RGB capture_timestamp_ns={rgb_timestamp_ns}")
+
+            if calibrating and rgb_sample is not None:
                 rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
                 if rgb_calib is not None:
                     rgb = distort_by_calibration(rgb, dst_calib, rgb_calib)
@@ -380,8 +385,18 @@ def main() -> None:
                             break
 
             if aria.CameraId.EyeTrack in observer.images:
-                eyetrack_image = observer.images[aria.CameraId.EyeTrack]
+                eye_timestamp_ns, eyetrack_image = observer.images[aria.CameraId.EyeTrack]
                 del observer.images[aria.CameraId.EyeTrack]
+
+                timestamp_text = (
+                    str(latest_rgb_timestamp_ns)
+                    if latest_rgb_timestamp_ns is not None
+                    else "unavailable"
+                )
+                print(
+                    f"EyeTrack capture_timestamp_ns={eye_timestamp_ns}, "
+                    f"latest RGB capture_timestamp_ns={timestamp_text}"
+                )
 
                 # cv2.imshow(eyetrack_window, eyetrack_image)
 
@@ -406,16 +421,34 @@ def main() -> None:
                 pitch = sum(s[1] for s in gaze_history) / len(gaze_history)
                 yaw = sum(s[2] for s in gaze_history) / len(gaze_history)
 
-                print(
-                    f"pitch={pitch:.4f}, yaw={yaw:.4f}"
-                    + (" [calibrating]" if calibrating else "")
-                )
+                gaze_publish_buffer.append((eye_timestamp_ns, pitch, yaw))
+                delay_frames = args.gaze_buffer_delay_frames
+                if len(gaze_publish_buffer) <= delay_frames:
+                    print(
+                        "Gaze publish buffer warming up: "
+                        f"{len(gaze_publish_buffer)}/{delay_frames} frame(s)"
+                    )
+                else:
+                    publish_timestamp_ns, publish_pitch, publish_yaw = (
+                        gaze_publish_buffer.popleft()
+                    )
+                    buffered_duration_ms = (
+                        eye_timestamp_ns - publish_timestamp_ns
+                    ) / 1e6
+                    print(
+                        f"Publishing pitch={publish_pitch:.4f}, "
+                        f"yaw={publish_yaw:.4f}, "
+                        f"EyeTrack capture_timestamp_ns={publish_timestamp_ns}, "
+                        f"delay_frames={delay_frames}, "
+                        f"buffered_device_time={buffered_duration_ms:.2f} ms"
+                        + (" [calibrating]" if calibrating else "")
+                    )
 
-                gaze_msg = Vector3()
-                gaze_msg.x = pitch
-                gaze_msg.y = yaw
-                gaze_msg.z = 0.0
-                gaze_publisher.publish(gaze_msg)
+                    gaze_msg = Vector3()
+                    gaze_msg.x = publish_pitch
+                    gaze_msg.y = publish_yaw
+                    gaze_msg.z = 0.0
+                    gaze_publisher.publish(gaze_msg)
 
             time.sleep(0.001)
     finally:
