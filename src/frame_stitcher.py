@@ -1,8 +1,9 @@
 """Label-anchored frame stitching for recorded gaze sessions.
 
 Frames are aligned by their logged YOLO detection centers (same label = same
-static object), not feature matching. Per-frame 2D rigid poses are solved
-jointly via alternating least squares; overlapping pixels are averaged.
+static object), not feature matching. Valid frames are chained in timestamp
+order, then jointly optimized to minimize every label cluster's spread while
+one maximum-label frame fixes the coordinate gauge; overlapping pixels are averaged.
 """
 
 import json
@@ -55,72 +56,161 @@ def _rigid_fit(src: np.ndarray, dst: np.ndarray) -> tuple[np.ndarray, np.ndarray
     return R, dc - R @ sc
 
 
-def _pick_ref_idx(counts: list[int]) -> int:
-    """First frame with >= 3 labels whose successor sees the same count;
-    fallback: the frame with the most labels."""
-    for i in range(len(counts) - 1):
-        if counts[i] >= 3 and counts[i + 1] == counts[i]:
-            return i
-    return int(np.argmax(counts))
+def _chain_poses(
+    obs: list[dict[str, np.ndarray]], min_points: int = 3
+) -> tuple[list[int], list[np.ndarray], list[np.ndarray], list[dict], list[dict]]:
+    """Fit consecutive usable frames and compose their relative rigid poses.
+
+    A frame is usable only when it has at least ``min_points`` detections and
+    shares at least that many labels with the previous placed frame.  Returned
+    R/t map full-frame pixels into the coordinate system of the first placed
+    frame.  No joint/global optimization is performed here.
+    """
+    frame_log = [
+        {"frame_index": i, "label_count": len(points),
+         "labels": sorted(points), "placed": False}
+        for i, points in enumerate(obs)
+    ]
+    start = next((i for i, points in enumerate(obs) if len(points) >= min_points), None)
+    if start is None:
+        return [], [], [], frame_log, []
+    for i in range(start):
+        frame_log[i]["skip_reason"] = "before_initial_reference"
+
+    placed = [start]
+    Rs = [np.eye(2)]
+    ts = [np.zeros(2)]
+    frame_log[start].update({
+        "placed": True, "previous_placed_frame_index": None,
+        "shared_label_count": None,
+        "relative_R": np.eye(2).tolist(), "relative_T": [0.0, 0.0],
+    })
+
+    for i in range(start + 1, len(obs)):
+        previous = placed[-1]
+        shared = sorted(obs[previous].keys() & obs[i].keys())
+        if len(obs[i]) < min_points:
+            frame_log[i]["skip_reason"] = "label_count_below_minimum"
+            continue
+        if len(shared) < min_points:
+            frame_log[i].update({
+                "skip_reason": "shared_label_count_below_minimum",
+                "previous_placed_frame_index": previous,
+                "shared_label_count": len(shared),
+                "shared_labels": shared,
+            })
+            continue
+
+        # Current-frame pixels -> previous-frame pixels.
+        src = np.stack([obs[i][label] for label in shared])
+        dst = np.stack([obs[previous][label] for label in shared])
+        relative_R, relative_t = _rigid_fit(src, dst)
+        # Compose with previous-frame -> initial-reference pose.
+        R = Rs[-1] @ relative_R
+        t = Rs[-1] @ relative_t + ts[-1]
+        placed.append(i)
+        Rs.append(R)
+        ts.append(t)
+        frame_log[i].update({
+            "placed": True,
+            "previous_placed_frame_index": previous,
+            "shared_label_count": len(shared),
+            "shared_labels": shared,
+            "relative_R": relative_R.tolist(),
+            "relative_T": relative_t.tolist(),
+        })
+
+    gaps = []
+    for left, right in zip(placed, placed[1:]):
+        skipped = list(range(left + 1, right))
+        if skipped:
+            gaps.append({
+                "between_frame_indices": [left, right],
+                "skipped_count": len(skipped),
+                "skipped_frame_indices": skipped,
+            })
+    return placed, Rs, ts, frame_log, gaps
 
 
-def _solve_poses(
-    obs: list[dict[str, np.ndarray]],
-    ref_idx: int,
-    iters: int = 100,
-    tol: float = 1e-4,
-) -> tuple[list[np.ndarray], list[np.ndarray]]:
-    """Jointly solve one rigid pose per frame by alternating least squares
-    (world point = mean of transformed observations, then each pose refit).
-    The reference frame ends up with the identity pose."""
-    n = len(obs)
-    Rs = [np.eye(2) for _ in range(n)]
-    ts = [np.zeros(2) for _ in range(n)]
+def _optimize_globally(
+    obs: list[dict[str, np.ndarray]], placed: list[int],
+    Rs: list[np.ndarray], ts: list[np.ndarray], max_nfev: int = 200,
+) -> tuple[list[np.ndarray], list[np.ndarray], int, dict]:
+    """Jointly minimize the within-label spread of all placed observations.
 
-    # Init translations by chaining median deltas of shared labels.
-    for i in range(1, n):
-        shared = obs[i - 1].keys() & obs[i].keys()
-        if shared:
-            deltas = np.stack([
-                (Rs[i - 1] @ obs[i - 1][l] + ts[i - 1]) - obs[i][l] for l in shared
+    Every non-anchor frame contributes one angle and one 2-D translation to a
+    single nonlinear least-squares problem. The anchor pose is held fixed only
+    to remove the global rigid-transform gauge freedom; its label positions are
+    not used as fixed targets. Thus every observation contributes symmetrically
+    to its label cluster center and frames can compromise with one another.
+    """
+    from scipy.optimize import least_squares
+
+    anchor_pos = max(range(len(placed)), key=lambda j: len(obs[placed[j]]))
+    anchor_idx = placed[anchor_pos]  # max() keeps the first maximum
+    variable_positions = [i for i in range(len(placed)) if i != anchor_pos]
+    variable_slot = {position: slot for slot, position in enumerate(variable_positions)}
+    label_observations: dict[str, list[tuple[int, np.ndarray]]] = {}
+    for position, frame_idx in enumerate(placed):
+        for label, point in obs[frame_idx].items():
+            label_observations.setdefault(label, []).append((position, point))
+    # A label seen only once has no cluster spread and supplies no constraint.
+    label_observations = {
+        label: values for label, values in label_observations.items()
+        if len(values) >= 2
+    }
+
+    x0 = np.empty(3 * len(variable_positions), dtype=np.float64)
+    for slot, position in enumerate(variable_positions):
+        x0[3 * slot] = math.atan2(Rs[position][1, 0], Rs[position][0, 0])
+        x0[3 * slot + 1:3 * slot + 3] = ts[position]
+
+    def poses_from_params(params: np.ndarray):
+        current_Rs = [R.copy() for R in Rs]
+        current_ts = [t.copy() for t in ts]
+        for position, slot in variable_slot.items():
+            theta, tx, ty = params[3 * slot:3 * slot + 3]
+            c, s = math.cos(theta), math.sin(theta)
+            current_Rs[position] = np.array([[c, -s], [s, c]])
+            current_ts[position] = np.array([tx, ty])
+        return current_Rs, current_ts
+
+    def residuals(params: np.ndarray) -> np.ndarray:
+        current_Rs, current_ts = poses_from_params(params)
+        parts = []
+        for values in label_observations.values():
+            transformed = np.stack([
+                current_Rs[position] @ point + current_ts[position]
+                for position, point in values
             ])
-            ts[i] = np.median(deltas, axis=0)
-        else:
-            ts[i] = ts[i - 1].copy()
+            parts.append((transformed - transformed.mean(axis=0)).ravel())
+        return np.concatenate(parts) if parts else np.empty(0, dtype=np.float64)
 
-    prev_world: dict[str, np.ndarray] = {}
-    for _ in range(iters):
-        sums: dict[str, np.ndarray] = {}
-        cnts: dict[str, int] = {}
-        for i in range(n):
-            for l, p in obs[i].items():
-                q = Rs[i] @ p + ts[i]
-                sums[l] = sums.get(l, 0.0) + q
-                cnts[l] = cnts.get(l, 0) + 1
-        world = {l: sums[l] / cnts[l] for l in sums}
-
-        for i in range(n):
-            labels = list(obs[i].keys())
-            src = np.stack([obs[i][l] for l in labels])
-            dst = np.stack([world[l] for l in labels])
-            if len(labels) == 1:
-                ts[i] = dst[0] - Rs[i] @ src[0]
-            else:
-                Rs[i], ts[i] = _rigid_fit(src, dst)
-
-        if prev_world and all(
-            np.linalg.norm(world[l] - prev_world[l]) < tol for l in world
-        ):
-            break
-        prev_world = world
-
-    # Gauge fix: express every pose relative to the reference frame.
-    R0T = Rs[ref_idx].T
-    t0 = ts[ref_idx]
-    for i in range(n):
-        Rs[i] = R0T @ Rs[i]
-        ts[i] = R0T @ (ts[i] - t0)
-    return Rs, ts
+    initial_residuals = residuals(x0)
+    result = least_squares(
+        residuals, x0, method="trf", loss="linear", x_scale="jac",
+        ftol=1e-10, xtol=1e-10, gtol=1e-10, max_nfev=max_nfev,
+    )
+    out_Rs, out_ts = poses_from_params(result.x)
+    final_residuals = residuals(result.x)
+    optimization_log = {
+        "method": "joint_nonlinear_least_squares_label_cluster_spread",
+        "anchor_frame_index": anchor_idx,
+        "optimized_frame_count": len(variable_positions),
+        "cluster_label_count": len(label_observations),
+        "residual_count": int(len(final_residuals)),
+        "max_function_evaluations": max_nfev,
+        "function_evaluations": int(result.nfev),
+        "jacobian_evaluations": int(result.njev) if result.njev is not None else None,
+        "success": bool(result.success),
+        "status": int(result.status),
+        "message": result.message,
+        "initial_sum_squared_error": float(initial_residuals @ initial_residuals),
+        "final_sum_squared_error": float(final_residuals @ final_residuals),
+        "initial_mean_squared_error": float(np.mean(initial_residuals ** 2)),
+        "final_mean_squared_error": float(np.mean(final_residuals ** 2)),
+    }
+    return out_Rs, out_ts, anchor_idx, optimization_log
 
 
 def _gaze_canvas_track(
@@ -154,13 +244,12 @@ def _detection_canvas_points(
     first_affine = next(iter(stamp_affines.values()), None)
     if first_affine is None:
         return []
-    affine = None
     points: list[dict] = []
     for entry in label_log:
         stamp_ns = entry.get("stamp_ns")
-        if stamp_ns in stamp_affines:
-            affine = stamp_affines[stamp_ns]
-        current = affine if affine is not None else first_affine
+        current = stamp_affines.get(stamp_ns)
+        if current is None:
+            continue
         for detection in entry.get("detected", []):
             center = detection.get("center_px")
             if center is None:
@@ -179,6 +268,7 @@ def _save_trajectory_map(
     stamp_affines: dict[int, np.ndarray],
     canvas: np.ndarray,
     out_path: Path,
+    gaze_track: Optional[list[dict]] = None,
 ) -> None:
     """Draw all detection centers (colored per label) and the gaze trajectory
     (red polyline, start/end rings, legend) on a copy of the stitched mosaic."""
@@ -197,20 +287,27 @@ def _save_trajectory_map(
     first_affine = next(iter(stamp_affines.values()), None)
     if first_affine is None:
         return
-    affine = None
     gaze_pts: list[tuple[int, int]] = []
     for entry in label_log:
         ts = entry.get("stamp_ns")
-        if ts in stamp_affines:
-            affine = stamp_affines[ts]
-        cur = affine if affine is not None else first_affine
+        cur = stamp_affines.get(ts)
+        if cur is None:
+            continue
         for d in entry.get("detected", []):
             c = d.get("center_px")
             if c is not None:
                 cv2.circle(canvas, to_canvas(c, cur), 4, colors[d["label"]], -1, cv2.LINE_AA)
-        g = entry.get("gaze_px")
-        if g is not None:
-            gaze_pts.append(to_canvas(g, cur))
+    if gaze_track is None:
+        for entry in label_log:
+            cur = stamp_affines.get(entry.get("stamp_ns"))
+            g = entry.get("gaze_px")
+            if cur is not None and g is not None:
+                gaze_pts.append(to_canvas(g, cur))
+    else:
+        gaze_pts = [
+            (int(round(rec["canvas_xy"][0])), int(round(rec["canvas_xy"][1])))
+            for rec in gaze_track
+        ]
 
     if len(gaze_pts) >= 2:
         cv2.polylines(canvas, [np.array(gaze_pts, dtype=np.int32)], False,
@@ -386,133 +483,167 @@ def stitch_recording(
     save_placements: bool = True,
     crop_ratio: float = 0.65,
 ) -> Optional[Path]:
-    """Stitch recorded frames into one mosaic anchored on YOLO detection centers.
-
-    out_path is only the naming base (<stem>_trajectory.png, _gaze_track.json,
-    _placements.json, ...); the bare mosaic itself is not written — the
-    trajectory map shows it under its overlays. Frames are center-cropped to
-    crop_ratio before pasting to trim the fisheye vignette.
-
-    Returns out_path on success, None if fewer than two frames could be placed.
-    """
+    """Chain adjacent valid frames, then tighten them against one anchor."""
     centers_map = _centers_by_stamp(label_log)
-
-    # First frame per unique stamp with anchor detections, center-cropped.
     seen: set[int] = set()
-    keyed: list[tuple[int, np.ndarray]] = []
-    crop_xy = (0, 0)
-    for ts, img in frames:
-        if ts in seen or ts not in centers_map:
+    timeline: list[tuple[int, np.ndarray, tuple[int, int]]] = []
+    for stamp_ns, image in frames:
+        if stamp_ns in seen:
             continue
-        seen.add(ts)
-        cropped, crop_xy = _center_crop(img, crop_ratio)
-        keyed.append((ts, cropped))
-
-    if len(keyed) < 2:
-        print(f"Stitching skipped: only {len(keyed)} frame(s) with anchor detections.")
+        seen.add(stamp_ns)
+        cropped, crop_xy = _center_crop(image, crop_ratio)
+        timeline.append((stamp_ns, cropped, crop_xy))
+    obs = [centers_map.get(stamp_ns, {}) for stamp_ns, _, _ in timeline]
+    placed, chained_Rs, chained_ts, frame_log, gaps = _chain_poses(obs)
+    for rec, (stamp_ns, _, _) in zip(frame_log, timeline):
+        rec["stamp_ns"] = stamp_ns
+    for gap in gaps:
+        left, right = gap["between_frame_indices"]
+        gap["between_stamp_ns"] = [timeline[left][0], timeline[right][0]]
+        gap["skipped_stamp_ns"] = [
+            timeline[i][0] for i in gap["skipped_frame_indices"]
+        ]
+    if len(placed) < 2:
+        print(f"Stitching skipped: only {len(placed)} frame(s) could be chained.")
         return None
 
-    obs = [centers_map[ts] for ts, _ in keyed]
-    ref_idx = _pick_ref_idx([len(o) for o in obs])
-    Rs, ts_ = _solve_poses(obs, ref_idx)
-    print(f"Poses solved for {len(keyed)} frames (ref frame index {ref_idx}).")
+    optimized_Rs, optimized_ts, anchor_idx, optimization_log = _optimize_globally(
+        obs, placed, chained_Rs, chained_ts
+    )
 
-    # Canvas bounds from the transformed corners of every cropped frame.
-    ch, cw = keyed[0][1].shape[:2]
-    crop_off = np.asarray(crop_xy, dtype=np.float64)
-    corners_q = np.array([[0, 0], [cw, 0], [cw, ch], [0, ch]], dtype=np.float64)
-    all_pts = np.concatenate([
-        (corners_q + crop_off) @ R.T + t for R, t in zip(Rs, ts_)
-    ])
-    min_xy = all_pts.min(axis=0)
-    max_xy = all_pts.max(axis=0)
-    canvas_w = int(np.ceil(max_xy[0] - min_xy[0]))
-    canvas_h = int(np.ceil(max_xy[1] - min_xy[1]))
+    def compose(Rs: list[np.ndarray], translations: list[np.ndarray]):
+        transformed_corners = []
+        for frame_idx, R, t in zip(placed, Rs, translations):
+            _, image, crop_xy = timeline[frame_idx]
+            h, w = image.shape[:2]
+            full_corners = np.array([
+                crop_xy, (crop_xy[0] + w, crop_xy[1]),
+                (crop_xy[0] + w, crop_xy[1] + h),
+                (crop_xy[0], crop_xy[1] + h),
+            ], dtype=np.float64)
+            transformed_corners.append(full_corners @ R.T + t)
+        bounds = np.concatenate(transformed_corners)
+        min_xy, max_xy = bounds.min(axis=0), bounds.max(axis=0)
+        unscaled_size = np.maximum(np.ceil(max_xy - min_xy).astype(int), 1)
+        scale = min(1.0, max_canvas_dim / float(max(unscaled_size)))
+        canvas_w, canvas_h = np.maximum(np.ceil(unscaled_size * scale).astype(int), 1)
+        acc = np.zeros((canvas_h, canvas_w, 3), dtype=np.float32)
+        count = np.zeros((canvas_h, canvas_w), dtype=np.float32)
+        placements = []
+        for frame_idx, R, t in zip(placed, Rs, translations):
+            stamp_ns, image, crop_xy = timeline[frame_idx]
+            A_full = np.hstack([
+                scale * R, (scale * (t - min_xy))[:, None]
+            ])
+            A_crop = A_full.copy()
+            A_crop[:, 2] += A_full[:, :2] @ np.asarray(crop_xy, dtype=np.float64)
+            h, w = image.shape[:2]
+            crop_corners = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float64)
+            canvas_corners = crop_corners @ A_crop[:, :2].T + A_crop[:, 2]
+            x0 = max(int(np.floor(canvas_corners[:, 0].min())), 0)
+            y0 = max(int(np.floor(canvas_corners[:, 1].min())), 0)
+            x1 = min(int(np.ceil(canvas_corners[:, 0].max())), canvas_w)
+            y1 = min(int(np.ceil(canvas_corners[:, 1].max())), canvas_h)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            A_roi = A_crop.copy()
+            A_roi[:, 2] -= (x0, y0)
+            warped = cv2.warpAffine(image, A_roi, (x1 - x0, y1 - y0))
+            mask = cv2.warpAffine(
+                np.full((h, w), 255, dtype=np.uint8), A_roi,
+                (x1 - x0, y1 - y0), flags=cv2.INTER_NEAREST,
+            ) > 0
+            acc[y0:y1, x0:x1][mask] += warped[mask]
+            count[y0:y1, x0:x1][mask] += 1
+            placements.append({
+                "frame_index": frame_idx, "stamp_ns": stamp_ns,
+                "theta_deg": math.degrees(math.atan2(R[1, 0], R[0, 0])),
+                "R": R.tolist(), "T": t.tolist(),
+                "affine_full_to_canvas": A_full.tolist(),
+            })
+        canvas = (acc / np.maximum(count, 1)[..., None]).astype(np.uint8)
+        return canvas, placements, scale
 
-    scale = 1.0
-    if max(canvas_w, canvas_h) > max_canvas_dim:
-        scale = max_canvas_dim / max(canvas_w, canvas_h)
-        canvas_w = int(np.ceil(canvas_w * scale))
-        canvas_h = int(np.ceil(canvas_h * scale))
-        print(f"Stitch canvas capped: scaling by {scale:.3f}")
-
-    # Average compositing: float accumulator + coverage count, per-frame ROI.
-    acc = np.zeros((canvas_h, canvas_w, 3), dtype=np.float32)
-    cnt = np.zeros((canvas_h, canvas_w), dtype=np.float32)
-    placement_log: list[dict] = []
-    for (ts, img), R, t in zip(keyed, Rs, ts_):
-        A_full = np.hstack([scale * R, (scale * (t - min_xy))[:, None]])  # full-frame → canvas
-        A_crop = A_full.copy()  # cropped → canvas
-        A_crop[:, 2] += A_full[:, :2] @ crop_off
-
-        pts = (corners_q @ A_crop[:, :2].T) + A_crop[:, 2]
-        x0 = max(int(np.floor(pts[:, 0].min())), 0)
-        y0 = max(int(np.floor(pts[:, 1].min())), 0)
-        x1 = min(int(np.ceil(pts[:, 0].max())), canvas_w)
-        y1 = min(int(np.ceil(pts[:, 1].max())), canvas_h)
-        if x1 <= x0 or y1 <= y0:
-            continue
-        A_roi = A_crop.copy()
-        A_roi[:, 2] -= (x0, y0)
-
-        warped = cv2.warpAffine(img, A_roi, (x1 - x0, y1 - y0), flags=cv2.INTER_LINEAR)
-        mask = cv2.warpAffine(
-            np.full(img.shape[:2], 255, dtype=np.uint8), A_roi,
-            (x1 - x0, y1 - y0), flags=cv2.INTER_NEAREST,
-        ) > 0
-        acc[y0:y1, x0:x1][mask] += warped[mask]
-        cnt[y0:y1, x0:x1][mask] += 1.0
-
-        placement_log.append({
-            "stamp_ns": ts,
-            "theta_deg": math.degrees(math.atan2(R[1, 0], R[0, 0])),
-            "affine_full_to_canvas": A_full.tolist(),
-        })
-
-    canvas = (acc / np.maximum(cnt, 1.0)[..., None]).astype(np.uint8)
-
+    raw_canvas, raw_placements, raw_scale = compose(chained_Rs, chained_ts)
+    optimized_canvas, optimized_placements, optimized_scale = compose(
+        optimized_Rs, optimized_ts
+    )
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    print(f"Stitched {len(placement_log)} frames (avg-blended, {canvas_w}x{canvas_h})")
+    cv2.imwrite(str(out_path), raw_canvas)
+    optimized_path = out_path.with_name(out_path.stem + "_optimized.png")
+    cv2.imwrite(str(optimized_path), optimized_canvas)
 
-    # The mosaic is only saved with detection centers + gaze trajectory on top.
     stamp_affines = {
-        p["stamp_ns"]: np.asarray(p["affine_full_to_canvas"]) for p in placement_log
+        rec["stamp_ns"]: np.asarray(rec["affine_full_to_canvas"])
+        for rec in optimized_placements
     }
-    _save_trajectory_map(
-        label_log, stamp_affines, canvas,
-        out_path.with_name(out_path.stem + "_trajectory.png"),
-    )
-    _save_gaze_kinematics(
-        label_log, stamp_affines,
-        out_path.with_name(out_path.stem + "_gaze_kinematics.png"),
-    )
-
-    # Standalone JSON of the gaze track in canvas pixel coords.
-    gaze_track = _gaze_canvas_track(label_log, stamp_affines)
+    gaze_by_stamp = {
+        entry["stamp_ns"]: entry.get("gaze_px") for entry in label_log
+        if entry.get("stamp_ns") is not None and entry.get("gaze_px") is not None
+    }
+    gaze_track: list[dict] = []
+    for segment, (left_idx, right_idx) in enumerate(zip(placed, placed[1:])):
+        left_stamp, right_stamp = timeline[left_idx][0], timeline[right_idx][0]
+        left_gaze, right_gaze = gaze_by_stamp.get(left_stamp), gaze_by_stamp.get(right_stamp)
+        if left_gaze is None or right_gaze is None:
+            continue
+        left_xy = stamp_affines[left_stamp] @ np.array([*left_gaze, 1.0])
+        right_xy = stamp_affines[right_stamp] @ np.array([*right_gaze, 1.0])
+        if segment == 0:
+            gaze_track.append({"stamp_ns": left_stamp,
+                               "canvas_xy": left_xy.tolist(), "interpolated": False})
+        skipped_indices = list(range(left_idx + 1, right_idx))
+        for offset, skipped_idx in enumerate(skipped_indices, start=1):
+            alpha = offset / (len(skipped_indices) + 1)
+            xy = (1.0 - alpha) * left_xy + alpha * right_xy
+            gaze_track.append({
+                "stamp_ns": timeline[skipped_idx][0], "canvas_xy": xy.tolist(),
+                "interpolated": True, "between_stamp_ns": [left_stamp, right_stamp],
+            })
+        gaze_track.append({"stamp_ns": right_stamp,
+                           "canvas_xy": right_xy.tolist(), "interpolated": False})
+    # A placed frame can occur after a segment whose endpoint gaze is missing.
+    unique_track = {rec["stamp_ns"]: rec for rec in gaze_track}
+    gaze_track = [unique_track[stamp] for stamp in sorted(unique_track)]
     if gaze_track:
         t0 = gaze_track[0]["stamp_ns"]
         for rec in gaze_track:
             rec["t_sec"] = round((rec["stamp_ns"] - t0) / 1e9, 6)
+
+    trajectory_path = out_path.with_name(out_path.stem + "_trajectory.png")
+    _save_trajectory_map(
+        label_log, stamp_affines, optimized_canvas, trajectory_path, gaze_track
+    )
+    if gaze_track:
         track_path = out_path.with_name(out_path.stem + "_gaze_track.json")
         track_path.write_text(json.dumps({
-            "coordinate_frame": "stitched canvas pixels (matches stitched_trajectory.png)",
-            "t0_stamp_ns": t0,
-            "count": len(gaze_track),
+            "coordinate_frame": "optimized stitched canvas pixels",
+            "t0_stamp_ns": gaze_track[0]["stamp_ns"], "count": len(gaze_track),
             "points": gaze_track,
             "detection_points": _detection_canvas_points(label_log, stamp_affines),
         }, indent=2))
-        print(f"Gaze track ({len(gaze_track)} pts) → {track_path}")
 
     if save_placements:
-        placements_path = out_path.with_name(out_path.stem + "_placements.json")
-        placements_path.write_text(json.dumps({
-            "scale": scale,
-            "frame_size": [cw, ch],
+        out_path.with_name(out_path.stem + "_placements.json").write_text(json.dumps({
+            "method": "sequential_rigid_then_joint_global_optimization",
+            "minimum_detection_and_shared_label_count": 3,
             "crop_ratio": crop_ratio,
-            "crop_offset_xy": [crop_xy[0], crop_xy[1]],
-            "ref_stamp_ns": keyed[ref_idx][0],
-            # Per frame: canvas_px = affine_full_to_canvas @ [x_fullframe, y_fullframe, 1]
-            "placements": placement_log,
+            "initial_reference_frame_index": placed[0],
+            "initial_reference_stamp_ns": timeline[placed[0]][0],
+            "optimization_anchor_frame_index": anchor_idx,
+            "optimization_anchor_stamp_ns": timeline[anchor_idx][0],
+            "raw_canvas_scale": raw_scale, "optimized_canvas_scale": optimized_scale,
+            "frames": frame_log, "skipped_gaps": gaps,
+            "optimization": optimization_log,
+            "raw_placements": raw_placements,
+            "optimized_placements": optimized_placements,
         }, indent=2))
-
+    print(f"Sequential stitch: {len(placed)}/{len(timeline)} frames → {out_path}")
+    print(
+        f"Joint global optimization: {optimization_log['function_evaluations']} "
+        f"function evaluations, MSE "
+        f"{optimization_log['initial_mean_squared_error']:.6g} → "
+        f"{optimization_log['final_mean_squared_error']:.6g}"
+    )
+    print(f"Globally optimized mosaic → {optimized_path}")
     return out_path
