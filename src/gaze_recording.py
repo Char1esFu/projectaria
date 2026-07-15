@@ -1,5 +1,4 @@
 import json
-import math
 import subprocess
 import threading
 import time
@@ -10,7 +9,7 @@ import cv2
 import numpy as np
 
 from src.frame_stitcher import stitch_recording
-from src.gaze_track_peak import find_gaze_center_stamp, visualize_analyzed_peak
+from src.gaze_track_peak import find_stable_gaze_stamps, visualize_analyzed_peak
 
 
 def normalize_entries(entries: list[dict]) -> list[dict]:
@@ -24,96 +23,24 @@ def normalize_entries(entries: list[dict]) -> list[dict]:
     ]
 
 
-def compute_weighted_entries(
-    label_log: list[dict], center_stamp_ns: Optional[int]
+def compute_average_entries(
+    label_log: list[dict], selected_stamps_ns: Optional[set[int]]
 ) -> list[dict]:
-    """Peak-center-weighted average of per-frame detection scores."""
+    """Unweighted average over selected frames, or all frames for fallback."""
     frames = [f for f in label_log if f.get("stamp_ns") is not None]
+    if selected_stamps_ns is not None:
+        frames = [f for f in frames if f["stamp_ns"] in selected_stamps_ns]
     if not frames:
         return []
-    if center_stamp_ns is None:
-        weights = [1.0] * len(frames)
-    else:
-        weights = [
-            math.exp(-1e-8 * abs(f["stamp_ns"] - center_stamp_ns))
-            for f in frames
-        ]
-    total_w = sum(weights)
-    if total_w <= 0:
-        return []
     scores: dict[str, float] = {}
-    for frame, weight in zip(frames, weights):
-        w = weight / total_w
+    frame_weight = 1.0 / len(frames)
+    for frame in frames:
         for item in frame.get("detected", []):
             lbl = item["label"]
-            scores[lbl] = scores.get(lbl, 0.0) + w * item["score"]
+            scores[lbl] = scores.get(lbl, 0.0) + frame_weight * item["score"]
     weighted = [{"label": lbl, "score": round(s, 4)} for lbl, s in scores.items()]
     weighted.sort(key=lambda x: -x["score"])
     return weighted
-
-
-def validate_peak_center(
-    track_path: Path,
-    center_stamp_ns: Optional[int],
-    recording_stamps_ns: list[int],
-    max_yolo_distance_px: float,
-) -> tuple[Optional[int], Optional[str]]:
-    """Reject peaks near recording edges or far from every canvas YOLO center."""
-    if center_stamp_ns is None:
-        return None, "peak analysis did not choose a point"
-
-    stamps = [stamp for stamp in recording_stamps_ns if stamp is not None]
-    if len(stamps) < 2:
-        return None, "recording has fewer than two valid timestamps"
-    start_stamp_ns = min(stamps)
-    end_stamp_ns = max(stamps)
-    duration_ns = end_stamp_ns - start_stamp_ns
-    if duration_ns <= 0:
-        return None, "recording duration is not positive"
-
-    edge_threshold_ns = duration_ns / 8.0
-    start_gap_ns = center_stamp_ns - start_stamp_ns
-    end_gap_ns = end_stamp_ns - center_stamp_ns
-    if start_gap_ns < edge_threshold_ns or end_gap_ns < edge_threshold_ns:
-        return None, (
-            "peak is too close to a recording edge "
-            f"(start gap={start_gap_ns / 1e9:.3f}s, "
-            f"end gap={end_gap_ns / 1e9:.3f}s, "
-            f"minimum={edge_threshold_ns / 1e9:.3f}s)"
-        )
-
-    track = json.loads(track_path.read_text())
-    peak_record = next(
-        (point for point in track.get("points", [])
-         if point.get("stamp_ns") == center_stamp_ns),
-        None,
-    )
-    if peak_record is None or peak_record.get("canvas_xy") is None:
-        return None, "peak canvas coordinate is unavailable"
-
-    detection_points = [
-        detection["canvas_xy"]
-        for detection in track.get("detection_points", [])
-        if detection.get("canvas_xy") is not None
-    ]
-    if not detection_points:
-        return None, "no YOLO centers are available on the stitched canvas"
-
-    peak_xy = np.asarray(peak_record["canvas_xy"], dtype=np.float64)
-    yolo_xy = np.asarray(detection_points, dtype=np.float64)
-    nearest_distance_px = float(np.linalg.norm(yolo_xy - peak_xy, axis=1).min())
-    if nearest_distance_px > max_yolo_distance_px:
-        return None, (
-            f"nearest canvas YOLO center is {nearest_distance_px:.1f}px away "
-            f"(maximum={max_yolo_distance_px:.1f}px)"
-        )
-
-    print(
-        "Gaze peak validation passed: "
-        f"nearest YOLO center={nearest_distance_px:.1f}px, "
-        f"recording-edge minimum={edge_threshold_ns / 1e9:.3f}s."
-    )
-    return center_stamp_ns, None
 
 
 class GazeRecord:
@@ -132,19 +59,19 @@ class GazeRecord:
         label_tail_duration: float,
         gaze_peak_window: int,
         gaze_peak_radius: float,
-        gaze_peak_yolo_max_distance: float = 200.0,
     ) -> None:
         self._participant = participant
         self._s_min = s_min
         self._label_tail_duration = label_tail_duration
         self._gaze_peak_window = gaze_peak_window
         self._gaze_peak_radius = gaze_peak_radius
-        if gaze_peak_yolo_max_distance <= 0:
-            raise ValueError("gaze_peak_yolo_max_distance must be > 0")
-        self._gaze_peak_yolo_max_distance = gaze_peak_yolo_max_distance
 
         # Latest camera_info stamp from the manipulation workstation (ns).
         self.latest_manip_stamp_ns: Optional[int] = None
+        # Timestamp assigned to the RGB frame currently passing through the
+        # overlay/recording pipeline. It comes from ZED or Aria hardware,
+        # depending on the visualizer's selected timestamp source.
+        self.latest_rgb_stamp_ns: Optional[int] = None
         self._publish_label_msg: Optional[Callable[[str], None]] = None
 
         self._writer_lock = threading.Lock()
@@ -158,7 +85,7 @@ class GazeRecord:
 
         self._label_active: bool = False
         # Top-left overlay content: live per-frame scores while accumulating,
-        # the final weighted result during the post-release re-publish tail.
+        # the final averaged result during the post-release re-publish tail.
         self._gaze_label_display: list[dict] = []
         # Per-frame label log captured during recording; written to
         # <session_dir>/gaze_labels.json when recording stops.
@@ -170,6 +97,10 @@ class GazeRecord:
 
     def note_manip_stamp(self, stamp_ns: int) -> None:
         self.latest_manip_stamp_ns = stamp_ns
+        self.latest_rgb_stamp_ns = stamp_ns
+
+    def note_hardware_rgb_stamp(self, stamp_ns: int) -> None:
+        self.latest_rgb_stamp_ns = stamp_ns
 
     @property
     def label_display(self) -> list[dict]:
@@ -215,7 +146,7 @@ class GazeRecord:
         with self._writer_lock:
             if not self._rec_active or self._rec_dir is None:
                 return
-            ts = self.latest_manip_stamp_ns if self.latest_manip_stamp_ns is not None else 0
+            ts = self.latest_rgb_stamp_ns if self.latest_rgb_stamp_ns is not None else 0
             self._rec_frames.append((ts, frame))
             if self._clean_frame is not None:
                 if not self._rec_clean_frames or self._rec_clean_frames[-1][0] != ts:
@@ -272,7 +203,7 @@ class GazeRecord:
             ]
             with self._writer_lock:
                 self._label_log.append({
-                    "stamp_ns": self.latest_manip_stamp_ns,
+                    "stamp_ns": self.latest_rgb_stamp_ns,
                     "gaze_px": [int(gaze_px[0]), int(gaze_px[1])] if gaze_px is not None else None,
                     "detected": detected_log,
                 })
@@ -287,7 +218,7 @@ class GazeRecord:
     ) -> None:
         session_dir = frames_dir.parent
 
-        center_stamp_ns: Optional[int] = None
+        selected_stamps_ns: list[int] = []
         fallback_reason: Optional[str] = None
         if label_log:
             try:
@@ -301,54 +232,75 @@ class GazeRecord:
                         f"{stitched_path.stem}_gaze_track.json"
                     )
                     if track_path.exists():
-                        center_stamp_ns = find_gaze_center_stamp(
+                        selected_stamps_ns = find_stable_gaze_stamps(
                             track_path,
                             self._gaze_peak_window,
                             self._gaze_peak_radius,
                             visualize=False,
                         )
-                        center_stamp_ns, fallback_reason = validate_peak_center(
-                            track_path,
-                            center_stamp_ns,
-                            [stamp_ns for stamp_ns, _ in frames],
-                            self._gaze_peak_yolo_max_distance,
-                        )
-                        if center_stamp_ns is not None:
+                        if selected_stamps_ns:
                             visualize_analyzed_peak(
                                 track_path, self._gaze_peak_radius
                             )
+                        else:
+                            fallback_reason = "no non-boundary gaze point is below MSD threshold"
                     else:
                         print(f"Gaze center analysis skipped: {track_path} not found.")
             except Exception as exc:
                 fallback_reason = f"peak processing failed: {exc}"
                 print(f"Frame stitching or gaze center analysis failed: {exc}")
 
-        if center_stamp_ns is None:
+        selected_stamp_set = set(selected_stamps_ns) if selected_stamps_ns else None
+        averaged = compute_average_entries(label_log or [], selected_stamp_set)
+        used_low_msd_frames = bool(selected_stamps_ns and averaged)
+        stamped_frames = [
+            frame for frame in (label_log or []) if frame.get("stamp_ns") is not None
+        ]
+
+        if selected_stamps_ns and not averaged:
+            fallback_reason = (
+                "low-MSD gaze frames have no corresponding YOLO detections"
+            )
+            averaged = compute_average_entries(label_log or [], None)
             print(
-                "Gaze peak rejected"
+                "Selected low-MSD gaze frames contain no YOLO detections; "
+                "/gaze_label falls back to the whole-recording unweighted average."
+            )
+        elif not selected_stamps_ns:
+            print(
+                "No low-MSD gaze frames selected"
                 + (f": {fallback_reason}" if fallback_reason else "")
                 + "; "
                 "/gaze_label falls back to the unweighted average."
             )
         elif label_log:
-            stamped = [f for f in label_log if f.get("stamp_ns") is not None]
-            if stamped:
-                best_dt = min(abs(f["stamp_ns"] - center_stamp_ns) for f in stamped)
-                for f in stamped:
-                    if abs(f["stamp_ns"] - center_stamp_ns) != best_dt:
-                        continue
-                    dets = normalize_entries([
-                        {"label": d["label"], "score": d["score"]}
-                        for d in f.get("detected", [])
-                    ])
-                    print(
-                        f"Gaze-center frame stamp_ns={f['stamp_ns']} "
-                        f"(|dt|={best_dt / 1e6:.1f} ms): {json.dumps(dets) if dets else '(no detections)'}"
-                    )
+            print(
+                f"Selected {len(selected_stamps_ns)} low-MSD gaze timestamp(s) "
+                "for unweighted YOLO score averaging."
+            )
 
-        weighted = compute_weighted_entries(label_log or [], center_stamp_ns)
+        if used_low_msd_frames:
+            averaging_frames = [
+                frame for frame in stamped_frames
+                if frame["stamp_ns"] in selected_stamp_set
+            ]
+            averaging_source = "LOW_MSD_FRAMES"
+        else:
+            averaging_frames = stamped_frames
+            averaging_source = "WHOLE_RECORDING_FALLBACK"
+        detection_frame_count = sum(
+            bool(frame.get("detected")) for frame in averaging_frames
+        )
+        print(
+            "YOLO score averaging source: "
+            f"{averaging_source}; unweighted average over "
+            f"{len(averaging_frames)} frame(s), "
+            f"{detection_frame_count} with YOLO detections"
+            + (f"; reason: {fallback_reason}" if not used_low_msd_frames and fallback_reason else "")
+        )
+
         print()
-        published = self._publish_final_labels(weighted)
+        published = self._publish_final_labels(averaged)
 
         frames_dir.mkdir(parents=True, exist_ok=True)
         timestamps: list[int] = []
@@ -360,9 +312,9 @@ class GazeRecord:
         if label_log:
             payload = {
                 "gaze_center_method": (
-                    "peak" if center_stamp_ns is not None else "unweighted_average"
+                    "low_msd_frames" if used_low_msd_frames else "unweighted_average"
                 ),
-                "gaze_center_stamp_ns": center_stamp_ns,
+                "gaze_selected_stamps_ns": selected_stamps_ns,
                 "gaze_peak_fallback_reason": fallback_reason,
                 "published": published,
                 "frames": label_log,
@@ -374,7 +326,7 @@ class GazeRecord:
         self._encode_video(frames_dir, timestamps)
 
     def _publish_final_labels(self, entries: list[dict]) -> list[dict]:
-        """Publish the weighted /gaze_label result, with a short repeat tail."""
+        """Publish the averaged /gaze_label result, with a short repeat tail."""
         out_entries = normalize_entries(entries)
         with self._writer_lock:
             self._gaze_label_display = out_entries.copy()

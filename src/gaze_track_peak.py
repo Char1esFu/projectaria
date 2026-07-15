@@ -1,17 +1,15 @@
-"""Minimum-spread gaze analysis for stitched gaze tracks.
+"""Low-spread gaze analysis for stitched gaze tracks.
 
 Endpoint-connected fixation regions are removed first. The remaining point
-with the smallest local mean squared distance is selected as the gaze peak.
+whose local mean squared distance is below MSD_THRESHOLD are selected.
 """
 
 import argparse
 import json
 from pathlib import Path
-from typing import Optional
-
 import numpy as np
 
-from src.gaze_rgb_config import DEFAULT_GAZE_MIN_BOUNDARY_POINTS
+from src.gaze_rgb_config import DEFAULT_GAZE_MIN_BOUNDARY_POINTS, MSD_THRESHOLD
 from src.gaze_track_boundary import find_boundary_regions
 
 def _validate_params(window: int, radius: float) -> None:
@@ -36,31 +34,32 @@ def _window_mean_sq_dist(points_xy: np.ndarray, window: int) -> np.ndarray:
     return msd
 
 
-def find_peak(
+def find_stable_points(
     points_xy: np.ndarray,
     window: int,
     radius: float,
+    msd_threshold: float = MSD_THRESHOLD,
     min_boundary_points: int = DEFAULT_GAZE_MIN_BOUNDARY_POINTS,
-) -> tuple[Optional[int], np.ndarray, set[int], set[int]]:
-    """Pick the lowest-MSD point after removing endpoint fixation regions."""
+) -> tuple[list[int], np.ndarray, set[int], set[int]]:
+    """Return every non-boundary point whose local MSD is below threshold."""
     _validate_params(window, radius)
+    if msd_threshold <= 0:
+        raise ValueError("msd_threshold must be > 0")
     msd = _window_mean_sq_dist(points_xy, window)
     start_region, end_region = find_boundary_regions(
         points_xy, radius, min_boundary_points
     )
     excluded = start_region | end_region
-    eligible = [
-        i for i in range(len(points_xy))
-        if i not in excluded and np.isfinite(msd[i])
+    selected = [
+        i for i, value in enumerate(msd)
+        if i not in excluded and np.isfinite(value) and value < msd_threshold
     ]
-    if not eligible:
-        return None, msd, start_region, end_region
-    return min(eligible, key=lambda i: msd[i]), msd, start_region, end_region
+    return selected, msd, start_region, end_region
 
 
 def save_peak_visualization(
     points_xy: np.ndarray,
-    chosen: Optional[dict],
+    selected: list[dict],
     radius: float,
     track_path: Path,
     output_path: Path,
@@ -82,22 +81,12 @@ def save_peak_visualization(
         for pt in pts:
             cv2.circle(canvas, tuple(pt), 2, (160, 160, 160), -1, cv2.LINE_AA)
 
-    if chosen is not None:
-        cx, cy = (int(round(v)) for v in chosen["canvas_xy"])
+    for point in selected:
+        cx, cy = (int(round(v)) for v in point["canvas_xy"])
         peak_color = (255, 255, 0)
-        peak_radius = max(1, int(round(radius)))
-        cv2.circle(canvas, (cx, cy), peak_radius, peak_color, 2, cv2.LINE_AA)
-        cv2.circle(canvas, (cx, cy), 5, peak_color, -1, cv2.LINE_AA)
-        cv2.putText(
-            canvas,
-            "peak",
-            (cx + peak_radius + 4, cy),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            peak_color,
-            2,
-            cv2.LINE_AA,
-        )
+        # Recolor the existing gaze center only. The MSD threshold radius and
+        # numeric value are analysis details and are intentionally not drawn.
+        cv2.circle(canvas, (cx, cy), 2, peak_color, -1, cv2.LINE_AA)
 
     cv2.imwrite(str(output_path), canvas)
 
@@ -112,34 +101,37 @@ def analyze_track_peak(
         raise ValueError(f"No points found in {track_path}.")
 
     points_xy = np.asarray([r["canvas_xy"] for r in records], dtype=np.float64)
-    idx, msd, start_region, end_region = find_peak(points_xy, window, radius)
+    selected_indices, msd, start_region, end_region = find_stable_points(
+        points_xy, window, radius
+    )
 
-    chosen = None
-    if idx is not None:
+    selected = []
+    for idx in selected_indices:
         r = records[idx]
-        chosen = {
+        selected.append({
             "index": idx,
             "stamp_ns": r.get("stamp_ns"),
             "t_sec": r.get("t_sec"),
             "canvas_xy": r["canvas_xy"],
             "mean_sq_dist_px2": round(float(msd[idx]), 2),
-        }
+        })
 
     output_path = track_path.with_name(f"{track_path.stem}_peak.json")
     output = {
         "source": str(track_path),
         "coordinate_frame": data.get("coordinate_frame"),
         "method": (
-            "minimum local mean squared distance over all points in the temporal "
-            "window after endpoint filtering"
+            "all local mean squared distances below threshold after endpoint filtering"
         ),
         "params": {
             "window": window,
             "boundary_radius_px": radius,
             "min_boundary_points": DEFAULT_GAZE_MIN_BOUNDARY_POINTS,
+            "msd_threshold_px2": MSD_THRESHOLD,
         },
         "count": len(records),
-        "chosen": chosen,
+        "selected": selected,
+        "selected_indices": selected_indices,
         "start_boundary_indices": sorted(start_region),
         "end_boundary_indices": sorted(end_region),
         "points": [
@@ -159,16 +151,11 @@ def analyze_track_peak(
 
     png_path = track_path.parent / "stitched_trajectory.png"
     if visualize:
-        save_peak_visualization(points_xy, chosen, radius, track_path, png_path)
+        save_peak_visualization(points_xy, selected, radius, track_path, png_path)
 
     print(
         f"{len(records)} points, window={window}, radius={radius}px -> "
-        + (
-            f"peak at index {chosen['index']} (stamp_ns={chosen['stamp_ns']}, "
-            f"MSD={chosen['mean_sq_dist_px2']}px²)"
-            if chosen
-            else "no acceptable peak"
-        )
+        + f"{len(selected)} point(s) with MSD < {MSD_THRESHOLD}px²"
         + f", {len(start_region)} start + {len(end_region)} end points rejected"
     )
     print(f"Saved peak JSON: {output_path}")
@@ -178,32 +165,32 @@ def analyze_track_peak(
     return output_path
 
 
-def find_gaze_center_stamp(
+def find_stable_gaze_stamps(
     track_path: Path, window: int, radius: float, visualize: bool = True
-) -> Optional[int]:
-    """Return the peak gaze-center timestamp."""
+) -> list[int]:
+    """Return timestamps of all non-boundary points below the MSD threshold."""
     out_path = analyze_track_peak(track_path, window, radius, visualize=visualize)
-    chosen = json.loads(out_path.read_text()).get("chosen")
-    return chosen.get("stamp_ns") if chosen else None
+    selected = json.loads(out_path.read_text()).get("selected", [])
+    return [point["stamp_ns"] for point in selected if point.get("stamp_ns") is not None]
 
 
 def visualize_analyzed_peak(track_path: Path, radius: float) -> None:
-    """Draw a previously analyzed peak after external validation succeeds."""
+    """Draw all previously analyzed low-MSD points."""
     data = json.loads(track_path.read_text())
     records = data.get("points", [])
     if not records:
         raise ValueError(f"No points found in {track_path}.")
     peak_path = track_path.with_name(f"{track_path.stem}_peak.json")
-    chosen = json.loads(peak_path.read_text()).get("chosen")
+    selected = json.loads(peak_path.read_text()).get("selected", [])
     points_xy = np.asarray([record["canvas_xy"] for record in records], dtype=np.float64)
     output_path = track_path.parent / "stitched_trajectory.png"
-    save_peak_visualization(points_xy, chosen, radius, track_path, output_path)
-    print(f"Saved validated peak to trajectory PNG: {output_path}")
+    save_peak_visualization(points_xy, selected, radius, track_path, output_path)
+    print(f"Saved selected low-MSD points to trajectory PNG: {output_path}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Minimum-MSD gaze analysis after endpoint fixation filtering."
+        description="Low-MSD gaze analysis after endpoint fixation filtering."
     )
     parser.add_argument("track", type=Path, help="Path to stitched_gaze_track.json")
     parser.add_argument(

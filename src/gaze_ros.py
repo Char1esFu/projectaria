@@ -1,4 +1,5 @@
 import threading
+import time
 from typing import Callable
 
 
@@ -12,7 +13,10 @@ class GazeRos:
         on_recording_start: Callable[[], None],
         on_label_start: Callable[[], None],
         on_recording_stop: Callable[[], None],
+        rgb_timestamp_source: str = "zedr",
     ) -> None:
+        if rgb_timestamp_source not in {"zedr", "hardware"}:
+            raise ValueError("rgb_timestamp_source must be 'zedr' or 'hardware'")
         try:
             import rclpy
             from geometry_msgs.msg import Vector3
@@ -29,22 +33,31 @@ class GazeRos:
                 Vector3, "/aria/gaze_euler",
                 lambda msg: on_gaze(float(msg.x), float(msg.y)), 10,
             )
-            self._node.create_subscription(
-                # CameraInfo, "/zedr/zed_node/rgb/camera_info",
-                CameraInfo, '/static_camera/zed_right_node/rgb/camera_info',
-                lambda msg: on_manip_stamp(
-                    msg.header.stamp.sec * 10**9 + msg.header.stamp.nanosec
-                ),
-                10,
-            )
+            if rgb_timestamp_source == "zedr":
+                self._node.create_subscription(
+                    CameraInfo, "/zedr/zed_node/rgb/camera_info",
+                    # CameraInfo, '/static_camera/zed_right_node/rgb/camera_info',
+                    lambda msg: on_manip_stamp(
+                        msg.header.stamp.sec * 10**9 + msg.header.stamp.nanosec
+                    ),
+                    10,
+                )
             self._node.create_subscription(
                 Empty, "/recording/start", lambda _: on_recording_start(), 10
             )
             self._node.create_subscription(
                 Empty, "/gaze_label_recording_start", lambda _: on_label_start(), 10
             )
+
+            def delayed_recording_stop(_: Empty) -> None:
+                def stop_after_delay() -> None:
+                    time.sleep(0.5)
+                    on_recording_stop()
+
+                threading.Thread(target=stop_after_delay, daemon=True).start()
+
             self._node.create_subscription(
-                Empty, "/key/b/release", lambda _: on_recording_stop(), 10
+                Empty, "/key/b/release", delayed_recording_stop, 10
             )
             self._gaze_label_pub = self._node.create_publisher(
                 String, "/gaze_label", 10

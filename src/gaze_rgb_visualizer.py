@@ -6,14 +6,13 @@ from utils.aria_rgb_stream import AriaRgbStream
 from src.gaze_overlay import GazeOverlay
 from src.gaze_rgb_config import (
     DEFAULT_GAZE_PEAK_RADIUS,
-    DEFAULT_GAZE_PEAK_YOLO_MAX_DISTANCE,
     DEFAULT_GAZE_PEAK_WINDOW,
     MODEL_PATH,
 )
 
 
 def run_gaze_rgb_visualizer(
-    device_ip: Optional[str] = None,
+    # device_ip: Optional[str] = None,
     update_iptables_rules: bool = False,
     homography_path: Optional[Path] = None,
     enable_yolo: bool = False,
@@ -30,7 +29,8 @@ def run_gaze_rgb_visualizer(
     participant: str = "",
     gaze_peak_window: int = DEFAULT_GAZE_PEAK_WINDOW,
     gaze_peak_radius: float = DEFAULT_GAZE_PEAK_RADIUS,
-    gaze_peak_yolo_max_distance: float = DEFAULT_GAZE_PEAK_YOLO_MAX_DISTANCE,
+    rgb_buffer_delay_frames: int = 0,
+    rgb_timestamp_source: str = "zedr",
 ) -> None:
     overlay = GazeOverlay(
         homography_path=homography_path,
@@ -48,12 +48,13 @@ def run_gaze_rgb_visualizer(
         participant=participant,
         gaze_peak_window=gaze_peak_window,
         gaze_peak_radius=gaze_peak_radius,
-        gaze_peak_yolo_max_distance=gaze_peak_yolo_max_distance,
+        rgb_timestamp_source=rgb_timestamp_source,
     )
     stream = AriaRgbStream(
-        device_ip=device_ip,
+        # device_ip=device_ip,
         update_iptables_rules=update_iptables_rules,
         window_name="Aria RGB Gaze",
+        rgb_buffer_delay_frames=rgb_buffer_delay_frames,
     )
     stream.add_overlay(overlay)
     stream.set_frame_callback(overlay.record_frame)
@@ -67,10 +68,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Visualize gaze direction on Aria RGB stream with optional YOLO detection."
     )
-    parser.add_argument("--device-ip", 
-        default="192.168.8.117",
-        help="IP address of the Aria device"
-    )
+    # parser.add_argument("--device-ip",
+    #     default="192.168.8.117",
+    #     help="IP address of the Aria device"
+    # )
     parser.add_argument("--update_iptables",
         default=False,
         action="store_true",
@@ -154,12 +155,21 @@ def parse_args() -> argparse.Namespace:
         help="Pixel radius for filtering start/end fixation regions. Default: 15.",
     )
     parser.add_argument(
-        "--gaze-peak-yolo-max-distance",
-        type=float,
-        default=DEFAULT_GAZE_PEAK_YOLO_MAX_DISTANCE,
+        "--rgb-buffer-delay-frames",
+        type=int,
+        default=0,
         help=(
-            "Reject a peak farther than this many stitched-canvas pixels from "
-            "every YOLO center. Default: 200."
+            "Display/process the RGB frame this many received RGB frames behind "
+            "the newest frame (0 displays immediately)."
+        ),
+    )
+    parser.add_argument(
+        "--rgb-timestamp-source",
+        choices=("zedr", "hardware"),
+        default="zedr",
+        help=(
+            "Timestamp recorded RGB frames with the latest ZED right camera_info "
+            "stamp or with each Aria RGB frame's hardware capture timestamp."
         ),
     )
     return parser.parse_args()
@@ -168,7 +178,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     run_gaze_rgb_visualizer(
-        device_ip=args.device_ip,
+        # device_ip=args.device_ip,
         update_iptables_rules=args.update_iptables,
         homography_path=args.homography,
         enable_yolo=args.yolo,
@@ -185,7 +195,8 @@ def main() -> None:
         participant=args.participant,
         gaze_peak_window=args.gaze_peak_window,
         gaze_peak_radius=args.gaze_peak_radius,
-        gaze_peak_yolo_max_distance=args.gaze_peak_yolo_max_distance,
+        rgb_buffer_delay_frames=args.rgb_buffer_delay_frames,
+        rgb_timestamp_source=args.rgb_timestamp_source,
     )
 
 

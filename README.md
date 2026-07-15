@@ -35,6 +35,7 @@ Start streaming with aria glass sdk:
 ```bash
 # subscribe first(needed in all scenarios)
 aria streaming start --interface wifi --device-ip 192.168.8.117 --use-ephemeral-certs --profile profile18
+aria streaming start --interface usb --use-ephemeral-certs --profile profile5 # profile5 20FPS for both RGB & eyetrack and use usb connection
 # stop streaming
 aria streaming stop --device-ip 192.168.8.117
 ```
@@ -46,11 +47,10 @@ python3 src/key_manager.py
 # gaze detection, with mouse focus on gaze image output window, press top left button on the indicator to start collecting calibration data while focusing on center of marker, press once more to stop.
 python3 -m projectaria_eyetracking.gaze_detect
 
-# gaze projection on egocentric image with yolo detection and gaze score calculation
-python3 -m src.gaze_rgb_visualizer --yolo --draw-gaze --participant AB12
-
+# gaze projection on egocentric image with yolo detection and gaze score calculation, --rgb-buffer-delay-frames to sync with gaze, --rgb-timestamp-source choose different timestamp source
+python3 -m src.gaze_rgb_visualizer --yolo --draw-gaze --participant AB12 --rgb-buffer-delay-frames 5 --rgb-timestamp-source hardware
 # record audio, long press bottom right button, if --source local is added, use PulseAudio's default microphone
-python3 -m src.audio_record --participant AB12 # --source local
+python3 -m src.audio_record --participant AB12 --source local
 ```
 In ~/venv/sam3_env:
 ```bash

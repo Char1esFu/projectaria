@@ -8,7 +8,6 @@ import numpy as np
 from src.gaze_recording import GazeRecord
 from src.gaze_rgb_config import (
     CROP_SIZE,
-    DEFAULT_GAZE_PEAK_YOLO_MAX_DISTANCE,
     GAZE_LABEL_TAIL_SEC,
     RESIZE_SIZE,
 )
@@ -38,8 +37,11 @@ class GazeOverlay:
         participant: str = "",
         gaze_peak_window: int = 5,
         gaze_peak_radius: float = 15.0,
-        gaze_peak_yolo_max_distance: float = DEFAULT_GAZE_PEAK_YOLO_MAX_DISTANCE,
+        rgb_timestamp_source: str = "zedr",
     ) -> None:
+        if rgb_timestamp_source not in {"zedr", "hardware"}:
+            raise ValueError("rgb_timestamp_source must be 'zedr' or 'hardware'")
+        self.rgb_timestamp_source = rgb_timestamp_source
         self.gaze_pitch: float = 0.0
         self.gaze_yaw: float = 0.0
 
@@ -51,7 +53,6 @@ class GazeOverlay:
             label_tail_duration=GAZE_LABEL_TAIL_SEC,
             gaze_peak_window=gaze_peak_window,
             gaze_peak_radius=gaze_peak_radius,
-            gaze_peak_yolo_max_distance=gaze_peak_yolo_max_distance,
         )
         self.ros = GazeRos(
             on_gaze=self._set_gaze,
@@ -59,6 +60,7 @@ class GazeOverlay:
             on_recording_start=self.recorder.on_recording_start,
             on_label_start=self.recorder.on_label_start,
             on_recording_stop=self.recorder.stop,
+            rgb_timestamp_source=rgb_timestamp_source,
         )
         self.recorder.set_label_publisher(self.ros.publish_gaze_label)
 
@@ -109,6 +111,10 @@ class GazeOverlay:
 
     def record_frame(self, frame: np.ndarray) -> None:
         self.recorder.record_frame(frame)
+
+    def note_rgb_hardware_stamp(self, stamp_ns: int) -> None:
+        if self.rgb_timestamp_source == "hardware":
+            self.recorder.note_hardware_rgb_stamp(stamp_ns)
 
     def shutdown(self) -> None:
         self.recorder.stop()

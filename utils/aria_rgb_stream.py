@@ -6,6 +6,7 @@ camera matrix. Audio handlers are called from the SDK audio thread.
 
 import sys
 import time
+from collections import deque
 from typing import Optional
 
 import aria.sdk as aria
@@ -42,12 +43,16 @@ class AriaStream:
         window_name: str = "Aria RGB",
         window_size: int = 1024,
         data_types: int = aria.StreamingDataType.Rgb,
+        rgb_buffer_delay_frames: int = 0,
     ) -> None:
+        if rgb_buffer_delay_frames < 0:
+            raise ValueError("rgb_buffer_delay_frames must be >= 0")
         self.device_ip = device_ip
         self.update_iptables_rules = update_iptables_rules
         self.window_name = window_name
         self.window_size = window_size
         self.data_types = data_types
+        self.rgb_buffer_delay_frames = rgb_buffer_delay_frames
 
         self.rgb_calib = None
         self.dst_calib = None
@@ -118,6 +123,7 @@ class AriaStream:
         cv2.moveWindow(self.window_name, 50, 50)
 
         pending_key = 255  # buffer key presses between frames (waitKey polls at 1ms, frames arrive ~33ms)
+        rgb_buffer: deque[tuple[int, np.ndarray]] = deque()
 
         while True:
             key = cv2.waitKey(1) & 0xFF
@@ -127,18 +133,24 @@ class AriaStream:
             if key != 255:
                 pending_key = key
 
-            if self.observer.rgb_image is None:
+            if self.observer.rgb_sample is None:
                 time.sleep(0.001)
                 continue
 
+            newest_rgb_sample = self.observer.rgb_sample
+            self.observer.rgb_sample = None
+            rgb_buffer.append(newest_rgb_sample)
+            if len(rgb_buffer) <= self.rgb_buffer_delay_frames:
+                continue
+            rgb_capture_timestamp_ns, buffered_rgb_image = rgb_buffer.popleft()
+
             if self.dst_calib is None:
                 # Initialise calibration on first frame using actual streaming resolution.
-                frame_h, frame_w = self.observer.rgb_image.shape[:2]
+                frame_h, frame_w = buffered_rgb_image.shape[:2]
                 self._setup_dst_calib(frame_w, frame_h)
                 self._build_undistort_maps(frame_w, frame_h)
 
-            rgb_image = cv2.cvtColor(self.observer.rgb_image, cv2.COLOR_BGR2RGB)
-            self.observer.rgb_image = None
+            rgb_image = cv2.cvtColor(buffered_rgb_image, cv2.COLOR_BGR2RGB)
 
             # Undistort + rot90 (sensor is mounted rotated) + fisheye crop,
             # all in one remap through the precomputed LUT.
@@ -154,6 +166,9 @@ class AriaStream:
             pending_key = 255
 
             for overlay in self._overlays:
+                note_stamp = getattr(overlay, "note_rgb_hardware_stamp", None)
+                if note_stamp is not None:
+                    note_stamp(rgb_capture_timestamp_ns)
                 overlay.draw(display, display_matrix, frame_key)
 
             if self._frame_callback is not None:
@@ -249,12 +264,12 @@ class AriaStream:
 
         class StreamingClientObserver:
             def __init__(self):
-                self.rgb_image = None
+                self.rgb_sample = None
 
             def on_image_received(self, image: np.ndarray, record: ImageDataRecord):
                 if record.camera_id != aria.CameraId.Rgb:
                     return
-                self.rgb_image = image
+                self.rgb_sample = (int(record.capture_timestamp_ns), image)
 
             def on_audio_received(self, audio_data: AudioData, record: AudioDataRecord):
                 for handler in audio_handlers:
