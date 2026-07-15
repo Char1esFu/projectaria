@@ -14,6 +14,7 @@
 
 import torch
 import yaml
+import time
 
 from .data.data import preprocess_image
 from .model import backbone
@@ -92,7 +93,13 @@ class EyeGazeInference:
         processed_image = (
             processed_image.clone().detach().to(torch.float).to(self.device)
         )
+        start_time = time.time()
         preds = self.model.forward(processed_image)
+        end_time = time.time()
+        inference_time = end_time - start_time
+        print(
+            f"Inference time: {inference_time:.6f}s"
+        )
 
         processed_preds = self.post_process(preds["main"])
         return processed_preds, preds["lower"], preds["upper"]

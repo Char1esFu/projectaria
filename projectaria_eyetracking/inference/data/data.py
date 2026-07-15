@@ -17,8 +17,19 @@ from torchvision import transforms
 
 
 def preprocess_image(et_image, size=(240, 320)):
-    h, w = et_image.shape
-    pred_image = torch.zeros((1, 2, h, w // 2))
+    if et_image.ndim != 2:
+        raise ValueError(
+            f"Expected a grayscale HxW eye-tracking image, got {tuple(et_image.shape)}"
+        )
+
+    _, w = et_image.shape
+    if w % 2:
+        raise ValueError(
+            f"Expected side-by-side eye images with an even width, got width={w}"
+        )
+
+    output_h, output_w = (int(size[0]), int(size[1]))
+    pred_image = torch.zeros((1, 2, output_h, output_w), dtype=torch.float32)
 
     pred_image[0, 0, :, :] = resize_and_normalize(et_image[:, : w // 2], size, False)
     pred_image[0, 1, :, :] = resize_and_normalize(et_image[:, w // 2 :], size, True)
@@ -28,18 +39,19 @@ def preprocess_image(et_image, size=(240, 320)):
 
 def resize_and_normalize(image, size=(240, 320), should_flip=False):
     image = image.float()
-    normalized_image = (image - torch.min(image)) / (
-        torch.max(image) - torch.min(image)
-    ) - 0.5
+    value_min = torch.min(image)
+    value_range = torch.max(image) - value_min
+    normalized_image = (image - value_min) / value_range.clamp_min(1e-6) - 0.5
     # Flip the image
     if should_flip:
         normalized_image = torch.fliplr(normalized_image)
-    transform = transforms.Compose(
-        [
-            transforms.Resize(size),  # replace with desired size
-        ]
-    )
-    # Resize the image
-    final_image = transform(normalized_image)
-    # Convert back to tensor and assign to pred_image
-    return final_image
+
+    target_size = (int(size[0]), int(size[1]))
+    if tuple(normalized_image.shape) == target_size:
+        return normalized_image
+
+    # TorchVision expects tensor images as CxHxW. Eye images arrive as HxW,
+    # so add a temporary grayscale channel for profiles such as profile5.
+    return transforms.Resize(target_size, antialias=True)(
+        normalized_image.unsqueeze(0)
+    ).squeeze(0)
