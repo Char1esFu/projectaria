@@ -31,6 +31,11 @@ def run_gaze_rgb_visualizer(
     gaze_peak_radius: float = DEFAULT_GAZE_PEAK_RADIUS,
     rgb_buffer_delay_frames: int = 0,
     rgb_timestamp_source: str = "zedr",
+    gaze_select_method: str = "msd",
+    gaze_var_window: int = 3,
+    gaze_var_threshold: Optional[float] = None,
+    gaze_var_top: Optional[int] = 5,
+    gaze_var_force_endpoint_points: int = 3,
 ) -> None:
     overlay = GazeOverlay(
         homography_path=homography_path,
@@ -48,6 +53,11 @@ def run_gaze_rgb_visualizer(
         participant=participant,
         gaze_peak_window=gaze_peak_window,
         gaze_peak_radius=gaze_peak_radius,
+        gaze_select_method=gaze_select_method,
+        gaze_var_window=gaze_var_window,
+        gaze_var_threshold=gaze_var_threshold,
+        gaze_var_top=gaze_var_top,
+        gaze_var_force_endpoint_points=gaze_var_force_endpoint_points,
         rgb_timestamp_source=rgb_timestamp_source,
     )
     stream = AriaRgbStream(
@@ -172,6 +182,54 @@ def parse_args() -> argparse.Namespace:
             "stamp or with each Aria RGB frame's hardware capture timestamp."
         ),
     )
+    parser.add_argument(
+        "--gaze-select-method",
+        choices=("msd", "variance"),
+        default="msd",
+        help=(
+            "Stable-frame selector for gaze-target averaging. 'msd' (default) is "
+            "the original pixel-space dense-point method on stitched_trajectory.png; "
+            "'variance' selects by label-score variance (src/gaze_score_stability.py)."
+        ),
+    )
+    parser.add_argument(
+        "--gaze-var-window",
+        type=int,
+        default=3,
+        help=(
+            "variance method only: sliding window length in frames for the "
+            "label-score variance (default: 3). Separate from --gaze-peak-window, "
+            "which the 'msd' method uses."
+        ),
+    )
+    parser.add_argument(
+        "--gaze-var-threshold",
+        type=float,
+        default=None,
+        help=(
+            "variance method only: keep windows with label-score variance below "
+            "this value before taking the top-N (default: no threshold)."
+        ),
+    )
+    parser.add_argument(
+        "--gaze-var-force-endpoint-points",
+        type=int,
+        default=3,
+        help=(
+            "variance method only: when an endpoint has no fixation cluster, "
+            "force-exclude this many outermost gaze points at that end "
+            "(default: 3)."
+        ),
+    )
+    parser.add_argument(
+        "--gaze-var-top",
+        type=int,
+        default=5,
+        help=(
+            "variance method only: keep the N lowest-variance interior windows "
+            "(default: 5; <=0 keeps all that pass the threshold)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -197,6 +255,11 @@ def main() -> None:
         gaze_peak_radius=args.gaze_peak_radius,
         rgb_buffer_delay_frames=args.rgb_buffer_delay_frames,
         rgb_timestamp_source=args.rgb_timestamp_source,
+        gaze_select_method=args.gaze_select_method,
+        gaze_var_window=args.gaze_var_window,
+        gaze_var_threshold=args.gaze_var_threshold,
+        gaze_var_top=args.gaze_var_top if args.gaze_var_top > 0 else None,
+        gaze_var_force_endpoint_points=args.gaze_var_force_endpoint_points,
     )
 
 

@@ -37,6 +37,11 @@ class GazeOverlay:
         participant: str = "",
         gaze_peak_window: int = 5,
         gaze_peak_radius: float = 15.0,
+        gaze_select_method: str = "msd",
+        gaze_var_window: int = 3,
+        gaze_var_threshold: Optional[float] = None,
+        gaze_var_top: Optional[int] = 5,
+        gaze_var_force_endpoint_points: int = 3,
         rgb_timestamp_source: str = "zedr",
     ) -> None:
         if rgb_timestamp_source not in {"zedr", "hardware"}:
@@ -53,6 +58,11 @@ class GazeOverlay:
             label_tail_duration=GAZE_LABEL_TAIL_SEC,
             gaze_peak_window=gaze_peak_window,
             gaze_peak_radius=gaze_peak_radius,
+            gaze_select_method=gaze_select_method,
+            gaze_var_window=gaze_var_window,
+            gaze_var_threshold=gaze_var_threshold,
+            gaze_var_top=gaze_var_top,
+            gaze_var_force_endpoint_points=gaze_var_force_endpoint_points,
         )
         self.ros = GazeRos(
             on_gaze=self._set_gaze,

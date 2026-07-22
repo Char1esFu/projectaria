@@ -9,6 +9,11 @@ import cv2
 import numpy as np
 
 from src.frame_stitcher import stitch_recording
+from src.gaze_score_stability import (
+    export_selected_frames,
+    plot_stitched_variance,
+    select_stable_windows,
+)
 from src.gaze_track_peak import find_stable_gaze_stamps, visualize_analyzed_peak
 
 
@@ -59,12 +64,27 @@ class GazeRecord:
         label_tail_duration: float,
         gaze_peak_window: int,
         gaze_peak_radius: float,
+        gaze_select_method: str = "msd",
+        gaze_var_window: int = 3,
+        gaze_var_threshold: Optional[float] = None,
+        gaze_var_top: Optional[int] = 5,
+        gaze_var_force_endpoint_points: int = 3,
     ) -> None:
         self._participant = participant
         self._s_min = s_min
         self._label_tail_duration = label_tail_duration
         self._gaze_peak_window = gaze_peak_window
         self._gaze_peak_radius = gaze_peak_radius
+        # Stable-frame selector: "msd" = original pixel-space dense-point method
+        # (find_stable_gaze_stamps, uses gaze_peak_window/radius); "variance" =
+        # label-score variance method (select_stable_windows; each selected
+        # window contributes only its centre frame, using its own window and
+        # force-endpoint knob but reusing gaze_peak_radius as the boundary radius).
+        self._gaze_select_method = gaze_select_method
+        self._gaze_var_window = gaze_var_window
+        self._gaze_var_threshold = gaze_var_threshold
+        self._gaze_var_top = gaze_var_top
+        self._gaze_var_force_endpoint_points = gaze_var_force_endpoint_points
 
         # Latest camera_info stamp from the manipulation workstation (ns).
         self.latest_manip_stamp_ns: Optional[int] = None
@@ -232,18 +252,44 @@ class GazeRecord:
                         f"{stitched_path.stem}_gaze_track.json"
                     )
                     if track_path.exists():
-                        selected_stamps_ns = find_stable_gaze_stamps(
-                            track_path,
-                            self._gaze_peak_window,
-                            self._gaze_peak_radius,
-                            visualize=False,
-                        )
-                        if selected_stamps_ns:
-                            visualize_analyzed_peak(
-                                track_path, self._gaze_peak_radius
+                        if self._gaze_select_method == "variance":
+                            selected_windows, excluded = select_stable_windows(
+                                label_log,
+                                track_path,
+                                window=self._gaze_var_window,
+                                threshold=self._gaze_var_threshold,
+                                top=self._gaze_var_top,
+                                boundary_radius=self._gaze_peak_radius,
+                                force_endpoint_points=self._gaze_var_force_endpoint_points,
                             )
+                            # A variance window only flags its centre timestamp
+                            # as a point of interest; the /gaze_label average and
+                            # the export both use those centre frames' scores
+                            # alone, not the windows' other member frames.
+                            selected_stamps_ns = sorted(
+                                {w["center_stamp_ns"] for w in selected_windows}
+                            )
+                            if selected_windows:
+                                plot_stitched_variance(
+                                    track_path.parent, selected_windows,
+                                    track_path.parent / "stitched_variance.png",
+                                    excluded=excluded,
+                                )
+                            else:
+                                fallback_reason = "no interior low-variance window selected"
                         else:
-                            fallback_reason = "no non-boundary gaze point is below MSD threshold"
+                            selected_stamps_ns = find_stable_gaze_stamps(
+                                track_path,
+                                self._gaze_peak_window,
+                                self._gaze_peak_radius,
+                                visualize=False,
+                            )
+                            if selected_stamps_ns:
+                                visualize_analyzed_peak(
+                                    track_path, self._gaze_peak_radius
+                                )
+                            else:
+                                fallback_reason = "no non-boundary gaze point is below MSD threshold"
                     else:
                         print(f"Gaze center analysis skipped: {track_path} not found.")
             except Exception as exc:
@@ -308,6 +354,15 @@ class GazeRecord:
             cv2.imwrite(str(frames_dir / f"{ts}.png"), frame)
             timestamps.append(ts)
         print(f"Saved {len(timestamps)} frames to {frames_dir}")
+
+        # For the variance selector, dump the chosen frames' images + YOLO scores
+        # into a dedicated subfolder of the session for offline inspection. These
+        # are the same centre frames used for the average (one per selected
+        # window), matching stitched_variance.png.
+        if self._gaze_select_method == "variance" and selected_stamps_ns and label_log:
+            export_selected_frames(
+                session_dir, frames_dir, label_log, selected_stamps_ns
+            )
 
         if label_log:
             payload = {

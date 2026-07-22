@@ -47,8 +47,23 @@ python3 src/key_manager.py
 # gaze detection, with mouse focus on gaze image output window, press top left button on the indicator to start collecting calibration data while focusing on center of marker, press once more to stop.
 python3 -m projectaria_eyetracking.gaze_detect
 
-# gaze projection on egocentric image with yolo detection and gaze score calculation, --rgb-buffer-delay-frames to sync with gaze, --rgb-timestamp-source choose different timestamp source
-python3 -m src.gaze_rgb_visualizer --yolo --draw-gaze --participant AB12 --rgb-buffer-delay-frames 5 --rgb-timestamp-source hardware
+# gaze projection on egocentric image with yolo detection and gaze score calculation.
+# --rgb-buffer-delay-frames: delay display/recording to sync frames with gaze.
+# --rgb-timestamp-source {zedr,hardware}: stamp recorded frames with the ZED right camera_info stamp or each Aria RGB frame's hardware capture time.
+# --gaze-select-method {msd,variance}: stable-frame selector feeding the /gaze_label average. 'msd' is the original pixel-space dense-point method on the stitched gaze track; 'variance' selects low label-score-variance windows and averages only each selected window's centre frame.
+# variance-method knobs: --gaze-var-window (frames per variance window), --gaze-var-threshold (max variance), --gaze-var-top (keep N lowest, <=0 = all), --gaze-var-force-endpoint-points (points force-excluded at a non-fixated endpoint). Boundary radius reuses --gaze-peak-radius. On stop it also writes stitched_variance.png and a variance_selected/ subfolder (selected frames' images + scores.json).
+python3 -m src.gaze_rgb_visualizer --yolo --draw-gaze --participant test02 --rgb-buffer-delay-frames 5 --gaze-select-method variance --gaze-var-window 5 --gaze-var-threshold 50 --gaze-var-top 5 --gaze-var-force-endpoint-points 3 --rgb-timestamp-source hardware
+
+# offline variance point-selection on a saved recording (or pass an experiment folder like recordings/test02 to batch every take).
+# -w window, -t variance threshold, -n keep N lowest (omit = all under threshold), --force-endpoint-points force-excluded endpoint points. Writes gaze_score_stability_variance.png (variance-vs-time), stitched_variance.png, a frames grid, and variance_selected/. --no-plot / --no-export to skip.
+python3 src/gaze_score_stability.py recordings/test02/33 -w 3 -t 50 -n 5 --force-endpoint-points 3
+
+# plot per-label detection score over time (one line per label) into the run's gaze_scores.png; pass an experiment folder (test02) to do every sub-run
+python src/plot_gaze_scores.py test02/32
+
+# report per-point local MSD of the stitched gaze track and highlight the low-MSD selected points; accepts one track file or an experiment directory
+python3 -m src.gaze_peak_window_stats recordings/test02/32
+
 # record audio, long press bottom right button, if --source local is added, use PulseAudio's default microphone
 python3 -m src.audio_record --participant AB12 --source local
 ```
