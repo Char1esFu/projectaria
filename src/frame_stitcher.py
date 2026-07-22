@@ -59,67 +59,93 @@ def _rigid_fit(src: np.ndarray, dst: np.ndarray) -> tuple[np.ndarray, np.ndarray
 def _chain_poses(
     obs: list[dict[str, np.ndarray]], min_points: int = 3
 ) -> tuple[list[int], list[np.ndarray], list[np.ndarray], list[dict], list[dict]]:
-    """Fit consecutive usable frames and compose their relative rigid poses.
+    """Chain usable frames into rigid-pose segments and keep the largest.
 
-    A frame is usable only when it has at least ``min_points`` detections and
-    shares at least that many labels with the previous placed frame.  Returned
-    R/t map full-frame pixels into the coordinate system of the first placed
-    frame.  No joint/global optimization is performed here.
+    A frame is usable only when it has at least ``min_points`` detections.  It
+    joins the best existing segment whose last placed frame shares at least that
+    many labels with it — preferring the largest such segment, then the most
+    recent one — and otherwise seeds a *new* segment instead of being discarded.
+
+    Preferring the largest candidate keeps the established chain going and lets
+    it bridge over a transient odd frame (which becomes a throwaway one-frame
+    segment) exactly as before.  Seeding rather than dropping is what fixes the
+    real failure: once a short early run's shared objects leave the view for
+    good, later frames form their own segment instead of being sunk by a stuck
+    reference.  The largest segment (most placed frames) wins.
+
+    The returned R/t map full-frame pixels into the coordinate system of the
+    chosen segment's first placed frame.  No joint/global optimization here.
     """
     frame_log = [
         {"frame_index": i, "label_count": len(points),
          "labels": sorted(points), "placed": False}
         for i, points in enumerate(obs)
     ]
-    start = next((i for i, points in enumerate(obs) if len(points) >= min_points), None)
-    if start is None:
-        return [], [], [], frame_log, []
-    for i in range(start):
-        frame_log[i]["skip_reason"] = "before_initial_reference"
 
-    placed = [start]
-    Rs = [np.eye(2)]
-    ts = [np.zeros(2)]
-    frame_log[start].update({
-        "placed": True, "previous_placed_frame_index": None,
-        "shared_label_count": None,
-        "relative_R": np.eye(2).tolist(), "relative_T": [0.0, 0.0],
-    })
-
-    for i in range(start + 1, len(obs)):
-        previous = placed[-1]
-        shared = sorted(obs[previous].keys() & obs[i].keys())
-        if len(obs[i]) < min_points:
+    segments: list[dict] = []
+    for i, points in enumerate(obs):
+        if len(points) < min_points:
             frame_log[i]["skip_reason"] = "label_count_below_minimum"
             continue
-        if len(shared) < min_points:
+        # Pick the segment this frame best continues: most placed frames first,
+        # then the most recent tail (nearest reference => most local fit).
+        best_key: Optional[tuple] = None
+        chosen: Optional[dict] = None
+        chosen_tail = -1
+        chosen_shared: list[str] = []
+        for seg in segments:
+            tail = seg["placed"][-1]
+            shared = sorted(obs[tail].keys() & obs[i].keys())
+            if len(shared) < min_points:
+                continue
+            key = (len(seg["placed"]), tail)
+            if best_key is None or key > best_key:
+                best_key, chosen, chosen_tail, chosen_shared = key, seg, tail, shared
+
+        if chosen is not None:
+            # Current-frame pixels -> chosen tail pixels.
+            src = np.stack([obs[i][label] for label in chosen_shared])
+            dst = np.stack([obs[chosen_tail][label] for label in chosen_shared])
+            relative_R, relative_t = _rigid_fit(src, dst)
+            # Compose with tail -> segment-reference pose.
+            prev_R, prev_t = chosen["Rs"][-1], chosen["ts"][-1]
+            chosen["placed"].append(i)
+            chosen["Rs"].append(prev_R @ relative_R)
+            chosen["ts"].append(prev_R @ relative_t + prev_t)
             frame_log[i].update({
-                "skip_reason": "shared_label_count_below_minimum",
-                "previous_placed_frame_index": previous,
-                "shared_label_count": len(shared),
-                "shared_labels": shared,
+                "placed": True,
+                "segment_index": chosen["index"],
+                "previous_placed_frame_index": chosen_tail,
+                "shared_label_count": len(chosen_shared),
+                "shared_labels": chosen_shared,
+                "relative_R": relative_R.tolist(),
+                "relative_T": relative_t.tolist(),
             })
             continue
 
-        # Current-frame pixels -> previous-frame pixels.
-        src = np.stack([obs[i][label] for label in shared])
-        dst = np.stack([obs[previous][label] for label in shared])
-        relative_R, relative_t = _rigid_fit(src, dst)
-        # Compose with previous-frame -> initial-reference pose.
-        R = Rs[-1] @ relative_R
-        t = Rs[-1] @ relative_t + ts[-1]
-        placed.append(i)
-        Rs.append(R)
-        ts.append(t)
+        # No active segment shares enough labels; seed a new one.
+        seg = {"index": len(segments), "placed": [i],
+               "Rs": [np.eye(2)], "ts": [np.zeros(2)]}
+        segments.append(seg)
         frame_log[i].update({
-            "placed": True,
-            "previous_placed_frame_index": previous,
-            "shared_label_count": len(shared),
-            "shared_labels": shared,
-            "relative_R": relative_R.tolist(),
-            "relative_T": relative_t.tolist(),
+            "placed": True, "segment_index": seg["index"],
+            "previous_placed_frame_index": None, "shared_label_count": None,
+            "relative_R": np.eye(2).tolist(), "relative_T": [0.0, 0.0],
         })
 
+    if not segments:
+        return [], [], [], frame_log, []
+
+    best = max(segments, key=lambda s: len(s["placed"]))  # first max on ties
+    for seg in segments:
+        if seg is best:
+            continue
+        for idx in seg["placed"]:
+            frame_log[idx].update({
+                "placed": False, "skip_reason": "not_in_largest_segment",
+            })
+
+    placed = best["placed"]
     gaps = []
     for left, right in zip(placed, placed[1:]):
         skipped = list(range(left + 1, right))
@@ -129,7 +155,7 @@ def _chain_poses(
                 "skipped_count": len(skipped),
                 "skipped_frame_indices": skipped,
             })
-    return placed, Rs, ts, frame_log, gaps
+    return placed, best["Rs"], best["ts"], frame_log, gaps
 
 
 def _optimize_globally(
@@ -623,11 +649,19 @@ def stitch_recording(
             "detection_points": _detection_canvas_points(label_log, stamp_affines),
         }, indent=2))
 
+    segment_indices = sorted({
+        rec["segment_index"] for rec in frame_log
+        if rec.get("segment_index") is not None
+    })
+    chosen_segment_index = frame_log[placed[0]]["segment_index"]
+
     if save_placements:
         out_path.with_name(out_path.stem + "_placements.json").write_text(json.dumps({
             "method": "sequential_rigid_then_joint_global_optimization",
             "minimum_detection_and_shared_label_count": 3,
             "crop_ratio": crop_ratio,
+            "segment_count": len(segment_indices),
+            "chosen_segment_index": chosen_segment_index,
             "initial_reference_frame_index": placed[0],
             "initial_reference_stamp_ns": timeline[placed[0]][0],
             "optimization_anchor_frame_index": anchor_idx,
@@ -638,6 +672,12 @@ def stitch_recording(
             "raw_placements": raw_placements,
             "optimized_placements": optimized_placements,
         }, indent=2))
+    if len(segment_indices) > 1:
+        print(
+            f"Note: {len(segment_indices)} disjoint segments found "
+            f"(too few shared labels to link); kept the largest "
+            f"({len(placed)} frames)."
+        )
     print(f"Sequential stitch: {len(placed)}/{len(timeline)} frames → {out_path}")
     print(
         f"Joint global optimization: {optimization_log['function_evaluations']} "
