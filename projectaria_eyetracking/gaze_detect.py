@@ -346,7 +346,7 @@ def main() -> None:
             if rgb_sample is not None:
                 rgb_timestamp_ns, bgr = rgb_sample
                 latest_rgb_timestamp_ns = rgb_timestamp_ns
-                print(f"RGB capture_timestamp_ns={rgb_timestamp_ns}")
+                # print(f"RGB capture_timestamp_ns={rgb_timestamp_ns}")
 
             if calibrating and rgb_sample is not None:
                 rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
@@ -393,10 +393,10 @@ def main() -> None:
                     if latest_rgb_timestamp_ns is not None
                     else "unavailable"
                 )
-                print(
-                    f"EyeTrack capture_timestamp_ns={eye_timestamp_ns}, "
-                    f"latest RGB capture_timestamp_ns={timestamp_text}"
-                )
+                # print(
+                #     f"EyeTrack capture_timestamp_ns={eye_timestamp_ns}, "
+                #     f"latest RGB capture_timestamp_ns={timestamp_text}"
+                # )
 
                 # cv2.imshow(eyetrack_window, eyetrack_image)
 
@@ -438,9 +438,9 @@ def main() -> None:
                     print(
                         f"Publishing pitch={publish_pitch:.4f}, "
                         f"yaw={publish_yaw:.4f}, "
-                        f"EyeTrack capture_timestamp_ns={publish_timestamp_ns}, "
-                        f"delay_frames={delay_frames}, "
-                        f"buffered_device_time={buffered_duration_ms:.2f} ms"
+                        # f"EyeTrack capture_timestamp_ns={publish_timestamp_ns}, "
+                        # f"delay_frames={delay_frames}, "
+                        # f"buffered_device_time={buffered_duration_ms:.2f} ms"
                         + (" [calibrating]" if calibrating else "")
                     )
 
