@@ -1,5 +1,4 @@
 import json
-import subprocess
 import threading
 import time
 from pathlib import Path
@@ -8,13 +7,19 @@ from typing import Callable, Optional
 import cv2
 import numpy as np
 
+from src.detection_infill import (
+    export_infilled_frames,
+    infill_missing_detections,
+    merge_infilled,
+    summary_brief,
+)
 from src.frame_stitcher import stitch_recording
+from utils.encode_video import encode_frame_video
 from src.gaze_score_stability import (
     export_selected_frames,
-    plot_stitched_variance,
+    generate_stability_plots,
     select_stable_windows,
 )
-from src.gaze_track_peak import find_stable_gaze_stamps, visualize_analyzed_peak
 
 
 def normalize_entries(entries: list[dict]) -> list[dict]:
@@ -48,6 +53,13 @@ def compute_average_entries(
     return weighted
 
 
+def save_published_result(recording_dir: Path, entries: list[dict]) -> Path:
+    """Replace the standalone normalized /gaze_label result file."""
+    path = Path(recording_dir) / "published.json"
+    path.write_text(json.dumps(entries, indent=2))
+    return path
+
+
 class GazeRecord:
     """Owns all recording / gaze-label state: frame buffers, the per-frame
     label log, the on-screen score display, and the final /gaze_label result.
@@ -62,29 +74,35 @@ class GazeRecord:
         participant: str,
         s_min: float,
         label_tail_duration: float,
-        gaze_peak_window: int,
-        gaze_peak_radius: float,
-        gaze_select_method: str = "msd",
+        boundary_radius: float,
         gaze_var_window: int = 3,
         gaze_var_threshold: Optional[float] = None,
-        gaze_var_top: Optional[int] = 5,
-        gaze_var_force_endpoint_points: int = 3,
+        gaze_var_top: Optional[int] = 1,
+        gaze_var_force_endpoint_points: int = 1,
+        hide_excluded: bool = False,
+        dist_threshold: float = 1080.0,
+        std_dist: float = 200.0,
+        detection_infill: bool = True,
+        infill_min_observations: int = 2,
     ) -> None:
         self._participant = participant
         self._s_min = s_min
         self._label_tail_duration = label_tail_duration
-        self._gaze_peak_window = gaze_peak_window
-        self._gaze_peak_radius = gaze_peak_radius
-        # Stable-frame selector: "msd" = original pixel-space dense-point method
-        # (find_stable_gaze_stamps, uses gaze_peak_window/radius); "variance" =
-        # label-score variance method (select_stable_windows; each selected
-        # window contributes only its centre frame, using its own window and
-        # force-endpoint knob but reusing gaze_peak_radius as the boundary radius).
-        self._gaze_select_method = gaze_select_method
+        self._boundary_radius = boundary_radius
+        # Each selected variance window contributes only its centre frame.
         self._gaze_var_window = gaze_var_window
         self._gaze_var_threshold = gaze_var_threshold
         self._gaze_var_top = gaze_var_top
         self._gaze_var_force_endpoint_points = gaze_var_force_endpoint_points
+        self._hide_excluded = hide_excluded
+        # Scoring parameters, mirrored from the live path so in-filled
+        # detections are scored exactly like logged ones.
+        self._dist_threshold = dist_threshold
+        self._std_dist = std_dist
+        # Offline repair of YOLO flicker: reproject a label observed in nearby
+        # frames into the frames that dropped it, using the stitching poses.
+        self._detection_infill = detection_infill
+        self._infill_min_observations = infill_min_observations
 
         # Latest camera_info stamp from the manipulation workstation (ns).
         self.latest_manip_stamp_ns: Optional[int] = None
@@ -229,6 +247,33 @@ class GazeRecord:
                 })
             self._gaze_label_display = entries
 
+    def _infill_detections(
+        self,
+        stitched_path: Path,
+        session_dir: Path,
+        label_log: list[dict],
+        frames: list[tuple[int, np.ndarray]],
+    ) -> Optional[dict]:
+        """Fill YOLO flicker gaps in label_log using the stitching poses.
+
+        Failures here must never cost us the /gaze_label publish, so anything
+        unexpected degrades to the raw log."""
+        try:
+            height, width = frames[0][1].shape[:2]
+            return infill_missing_detections(
+                label_log,
+                stitched_path.with_name(f"{stitched_path.stem}_placements.json"),
+                (width, height),
+                s_min=self._s_min,
+                dist_threshold=self._dist_threshold,
+                std_dist=self._std_dist,
+                min_label_observations=self._infill_min_observations,
+                report_path=session_dir / "detection_infill.json",
+            )
+        except Exception as exc:
+            print(f"Detection in-fill skipped: {exc}")
+            return None
+
     def _flush_and_encode(
         self,
         frames_dir: Path,
@@ -239,7 +284,13 @@ class GazeRecord:
         session_dir = frames_dir.parent
 
         selected_stamps_ns: list[int] = []
+        selected_windows: list[dict] = []
         fallback_reason: Optional[str] = None
+        infill_summary: Optional[dict] = None
+        # Everything downstream of in-fill analyses this merged timeline; the
+        # raw label_log is what gets saved, unchanged, as gaze_labels.json's
+        # "frames".
+        analysis_log: list[dict] = label_log or []
         if label_log:
             try:
                 stitched_path = stitch_recording(
@@ -248,89 +299,91 @@ class GazeRecord:
                     session_dir / "stitched.png",
                 )
                 if stitched_path is not None:
+                    # Repair YOLO flicker before anything reads the scores, so
+                    # the variance windows and the average both see a label that
+                    # stayed inside the gaze crop as present in every frame.
+                    if self._detection_infill:
+                        infill_summary = self._infill_detections(
+                            stitched_path, session_dir, label_log,
+                            clean_frames if clean_frames else frames,
+                        )
+                        if infill_summary:
+                            analysis_log = merge_infilled(
+                                label_log, infill_summary.get("infilled_frames")
+                            )
                     track_path = stitched_path.with_name(
                         f"{stitched_path.stem}_gaze_track.json"
                     )
                     if track_path.exists():
-                        if self._gaze_select_method == "variance":
-                            selected_windows, excluded = select_stable_windows(
-                                label_log,
-                                track_path,
-                                window=self._gaze_var_window,
-                                threshold=self._gaze_var_threshold,
-                                top=self._gaze_var_top,
-                                boundary_radius=self._gaze_peak_radius,
-                                force_endpoint_points=self._gaze_var_force_endpoint_points,
-                            )
-                            # A variance window only flags its centre timestamp
-                            # as a point of interest; the /gaze_label average and
-                            # the export both use those centre frames' scores
-                            # alone, not the windows' other member frames.
-                            selected_stamps_ns = sorted(
-                                {w["center_stamp_ns"] for w in selected_windows}
-                            )
-                            if selected_windows:
-                                plot_stitched_variance(
-                                    track_path.parent, selected_windows,
-                                    track_path.parent / "stitched_variance.png",
-                                    excluded=excluded,
+                        selected_windows, excluded = select_stable_windows(
+                            analysis_log,
+                            track_path,
+                            window=self._gaze_var_window,
+                            threshold=self._gaze_var_threshold,
+                            top=self._gaze_var_top,
+                            boundary_radius=self._boundary_radius,
+                            force_endpoint_points=self._gaze_var_force_endpoint_points,
+                        )
+                        # A variance window only flags its centre timestamp;
+                        # only those centre frames feed the label average.
+                        selected_stamps_ns = sorted(
+                            {w["center_stamp_ns"] for w in selected_windows}
+                        )
+                        if selected_windows:
+                            if any(w.get("threshold_fallback")
+                                   for w in selected_windows):
+                                print(
+                                    "No interior window is below the variance "
+                                    f"threshold ({self._gaze_var_threshold}); "
+                                    f"using the {len(selected_windows)} lowest-"
+                                    "variance interior window(s) for /gaze_label."
                                 )
-                            else:
-                                fallback_reason = "no interior low-variance window selected"
                         else:
-                            selected_stamps_ns = find_stable_gaze_stamps(
-                                track_path,
-                                self._gaze_peak_window,
-                                self._gaze_peak_radius,
-                                visualize=False,
+                            fallback_reason = (
+                                "no interior gaze window exists (every window "
+                                "centre falls in a start/end fixation region)"
                             )
-                            if selected_stamps_ns:
-                                visualize_analyzed_peak(
-                                    track_path, self._gaze_peak_radius
-                                )
-                            else:
-                                fallback_reason = "no non-boundary gaze point is below MSD threshold"
                     else:
-                        print(f"Gaze center analysis skipped: {track_path} not found.")
+                        print(f"Variance selection skipped: {track_path} not found.")
             except Exception as exc:
-                fallback_reason = f"peak processing failed: {exc}"
-                print(f"Frame stitching or gaze center analysis failed: {exc}")
+                fallback_reason = f"variance processing failed: {exc}"
+                print(f"Frame stitching or variance selection failed: {exc}")
 
         selected_stamp_set = set(selected_stamps_ns) if selected_stamps_ns else None
-        averaged = compute_average_entries(label_log or [], selected_stamp_set)
-        used_low_msd_frames = bool(selected_stamps_ns and averaged)
+        averaged = compute_average_entries(analysis_log, selected_stamp_set)
+        used_selected_frames = bool(selected_stamps_ns and averaged)
         stamped_frames = [
-            frame for frame in (label_log or []) if frame.get("stamp_ns") is not None
+            frame for frame in analysis_log if frame.get("stamp_ns") is not None
         ]
 
         if selected_stamps_ns and not averaged:
             fallback_reason = (
-                "low-MSD gaze frames have no corresponding YOLO detections"
+                "variance-selected frames have no corresponding YOLO detections"
             )
-            averaged = compute_average_entries(label_log or [], None)
+            averaged = compute_average_entries(analysis_log, None)
             print(
-                "Selected low-MSD gaze frames contain no YOLO detections; "
+                "Variance-selected frames contain no YOLO detections; "
                 "/gaze_label falls back to the whole-recording unweighted average."
             )
         elif not selected_stamps_ns:
             print(
-                "No low-MSD gaze frames selected"
+                "No variance frame selected"
                 + (f": {fallback_reason}" if fallback_reason else "")
                 + "; "
                 "/gaze_label falls back to the unweighted average."
             )
         elif label_log:
             print(
-                f"Selected {len(selected_stamps_ns)} low-MSD gaze timestamp(s) "
+                f"Selected {len(selected_stamps_ns)} variance timestamp(s) "
                 "for unweighted YOLO score averaging."
             )
 
-        if used_low_msd_frames:
+        if used_selected_frames:
             averaging_frames = [
                 frame for frame in stamped_frames
                 if frame["stamp_ns"] in selected_stamp_set
             ]
-            averaging_source = "LOW_MSD_FRAMES"
+            averaging_source = "VARIANCE_SELECTED_FRAMES"
         else:
             averaging_frames = stamped_frames
             averaging_source = "WHOLE_RECORDING_FALLBACK"
@@ -342,7 +395,7 @@ class GazeRecord:
             f"{averaging_source}; unweighted average over "
             f"{len(averaging_frames)} frame(s), "
             f"{detection_frame_count} with YOLO detections"
-            + (f"; reason: {fallback_reason}" if not used_low_msd_frames and fallback_reason else "")
+            + (f"; reason: {fallback_reason}" if not used_selected_frames and fallback_reason else "")
         )
 
         print()
@@ -355,30 +408,73 @@ class GazeRecord:
             timestamps.append(ts)
         print(f"Saved {len(timestamps)} frames to {frames_dir}")
 
+        # Redraw the in-filled frames first: the selected-frame export below
+        # picks its images from that folder, so a chosen frame is shown with the
+        # detections its scores actually came from.
+        self._export_infilled(session_dir, infill_summary)
+
+        # Generate all shared stability plots using the exact windows that fed
+        # /gaze_label (no second selection pass).
+        if label_log:
+            infilled_count = sum(
+                len(frame.get("detected", []))
+                for frame in (infill_summary or {}).get("infilled_frames", [])
+            )
+            source_note = (
+                f"logged + in-filled ({infilled_count} merged detection(s))"
+                if infilled_count else "logged only"
+            )
+            try:
+                generate_stability_plots(
+                    session_dir,
+                    analysis_log,
+                    selected_windows,
+                    window=self._gaze_var_window,
+                    threshold=self._gaze_var_threshold,
+                    boundary_radius=self._boundary_radius,
+                    force_endpoint_points=self._gaze_var_force_endpoint_points,
+                    hide_excluded=self._hide_excluded,
+                    source_note=source_note,
+                )
+            except Exception as exc:
+                print(f"Gaze score stability plots skipped: {exc}")
+
         # For the variance selector, dump the chosen frames' images + YOLO scores
         # into a dedicated subfolder of the session for offline inspection. These
         # are the same centre frames used for the average (one per selected
         # window), matching stitched_variance.png.
-        if self._gaze_select_method == "variance" and selected_stamps_ns and label_log:
+        if label_log:
             export_selected_frames(
-                session_dir, frames_dir, label_log, selected_stamps_ns
+                session_dir, frames_dir, analysis_log, selected_stamps_ns
             )
 
         if label_log:
             payload = {
-                "gaze_center_method": (
-                    "low_msd_frames" if used_low_msd_frames else "unweighted_average"
+                # The per-point fill/rejection lists stay in
+                # detection_infill.json; here we only keep the counts.
+                "detection_infill": (
+                    summary_brief(infill_summary) if infill_summary else None
                 ),
-                "gaze_selected_stamps_ns": selected_stamps_ns,
-                "gaze_peak_fallback_reason": fallback_reason,
-                "published": published,
+                # Exactly what the live run logged, never edited by in-fill...
                 "frames": label_log,
+                # ...and, separately, what in-fill added on top: same record
+                # shape, so analysis merges the two by stamp_ns while the origin
+                # of every score stays traceable.
+                "infilled_frames": (
+                    infill_summary.get("infilled_frames", []) if infill_summary else []
+                ),
             }
             labels_path = session_dir / "gaze_labels.json"
             labels_path.write_text(json.dumps(payload, indent=2))
-            print(f"Saved {len(label_log)} label records to {labels_path}")
+            print(
+                f"Saved {len(label_log)} label records "
+                f"(+{len(payload['infilled_frames'])} in-filled frame record(s)) "
+                f"to {labels_path}"
+            )
+            published_path = save_published_result(session_dir, published)
+            print(f"Saved /gaze_label result to {published_path}")
 
-        self._encode_video(frames_dir, timestamps)
+        encode_frame_video(session_dir, frames_dir, "gaze_overlay.mp4", "ffconcat.txt")
 
     def _publish_final_labels(self, entries: list[dict]) -> list[dict]:
         """Publish the averaged /gaze_label result, with a short repeat tail."""
@@ -403,35 +499,17 @@ class GazeRecord:
                 self._gaze_label_display = []
         return out_entries
 
-    def _encode_video(self, frames_dir: Path, timestamps: list[int]) -> None:
-        session_dir = frames_dir.parent
-        concat_path = session_dir / "ffconcat.txt"
+    def _export_infilled(self, session_dir: Path, summary: Optional[dict]) -> None:
+        """Write the reviewable in-fill frame folder and its video.
 
-        lines = ["ffconcat version 1.0"]
-        for i, ts in enumerate(timestamps):
-            dur = (timestamps[i + 1] - ts) / 1e9 if i + 1 < len(timestamps) else (timestamps[-1] - timestamps[-2]) / 1e9
-            lines.append(f"file 'frames/{ts}.png'")
-            lines.append(f"duration {dur:.9f}")
-        concat_path.write_text("\n".join(lines) + "\n")
-
-        out_path = session_dir / "gaze_overlay.mp4"
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            str(concat_path),
-            "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            str(out_path),
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode == 0:
-            print(f"Video encoded -> {out_path}")
-        else:
-            print(f"ffmpeg encoding failed:\n{result.stderr[-800:]}")
+        Runs only once frames/ is on disk, since the export copies/redraws those
+        images. Same outputs the offline tool produces, so a live recording can
+        be checked without re-running anything."""
+        if not summary or not summary.get("fills"):
+            return
+        try:
+            out_dir = export_infilled_frames(session_dir, summary)
+            if out_dir is not None:
+                encode_frame_video(session_dir, out_dir, "gaze_overlay_infilled.mp4")
+        except Exception as exc:
+            print(f"In-fill frame export skipped: {exc}")

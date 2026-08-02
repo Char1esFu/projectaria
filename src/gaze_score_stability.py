@@ -1,7 +1,8 @@
-"""Offline gaze-label score-stability analysis.
+"""Shared gaze-label score-stability selection and visualization.
 
-Reads the raw per-frame YOLO label scores logged in ``gaze_labels.json`` and
-looks for *stable* moments — short spans where the detection scores barely move.
+Used by the online recording pipeline and ``src.offline_gaze_label``. This
+module intentionally has no standalone CLI or alternate analysis modes: both
+callers share the same variance, endpoint, fallback, plotting, and export code.
 
 A sliding window of ``--window`` consecutive frames is swept over the recording.
 Inside each window every label's scores are collected and its variance computed;
@@ -15,41 +16,31 @@ Per-label occurrence rules inside a window:
 A window in which no label appears at least twice has no defined metric and is
 skipped.
 
-Selection of the reported windows:
-  * ``--threshold`` first keeps only windows whose metric is *below* it;
-  * ``--top`` then keeps the N smallest of those; when ``--top`` is omitted every
-    window under the threshold is kept.
+Selection keeps every interior window below the threshold. When none passes,
+the ``top`` lowest-variance interior windows are kept instead. Endpoint windows
+stay excluded either way.
 
-Outputs (unless ``--no-plot``), all written into the recording directory:
+Outputs written by the callers into the recording directory:
   * ``gaze_score_stability_variance.png`` — variance-vs-time point/line plot of
-    every window, the threshold line, and the selected windows highlighted;
+    every window, the threshold line, and the selected windows highlighted
+    (``--hide-excluded`` drops the endpoint windows instead of greying them out);
   * ``stitched_variance.png`` — the full gaze trajectory drawn on
     ``stitched_optimized.png`` with the selected windows' gaze points highlighted;
   * ``gaze_score_stability_frames.png`` — the selected windows' centre frames.
 """
 
-import argparse
 import json
 import shutil
-import sys
 from pathlib import Path
 
 import numpy as np
 
-# Allow `from src...` imports whether launched as a module or a script path.
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from src.gaze_rgb_config import (  # noqa: E402
+from src.detection_infill import frame_image_path
+from src.gaze_rgb_config import (
     DEFAULT_GAZE_BOUNDARY_RADIUS,
     DEFAULT_GAZE_MIN_BOUNDARY_POINTS,
 )
-from src.gaze_track_boundary import boundary_region  # noqa: E402
-
-
-def load_frames(recording_dir: Path) -> list[dict]:
-    """Return the timestamp-ordered frame log from gaze_labels.json."""
-    data = json.loads((recording_dir / "gaze_labels.json").read_text())
-    frames = data.get("frames", [])
-    return sorted(frames, key=lambda f: f["stamp_ns"])
+from src.gaze_track_boundary import boundary_region
 
 
 def window_variance(frames: list[dict]) -> float | None:
@@ -164,21 +155,34 @@ def select_windows(
     results: list[dict], threshold: float | None, top: int | None,
     excluded: set[int] | None = None, track_stamps: np.ndarray | None = None,
 ) -> list[dict]:
-    """Drop endpoint windows, keep those below ``threshold``, then the ``top`` smallest.
+    """Keep all sub-threshold interior windows, otherwise the ``top`` smallest.
 
     Endpoint (start/end fixation) windows in ``excluded`` are removed *first*, so
-    the threshold and ``top`` cut only ever see interior candidates. ``top`` of
-    ``None`` keeps every remaining window that passes the threshold.
+    the threshold and fallback ranking only ever see interior candidates.
+
+    When the threshold leaves nothing, the ``top`` steadiest interior windows
+    are returned regardless of the threshold,
+    tagged with ``threshold_fallback``. ``top=None`` keeps every interior window
+    in fallback. Endpoint windows are never resurrected this way: with no
+    interior window at all the result stays empty.
     """
-    eligible = []
-    for r in results:
-        if excluded and _is_boundary(r["center_stamp_ns"], excluded, track_stamps):
-            continue
-        if threshold is not None and r["variance"] >= threshold:
-            continue
-        eligible.append(r)
+    interior = [
+        r for r in results
+        if not (excluded and _is_boundary(r["center_stamp_ns"], excluded, track_stamps))
+    ]
+    eligible = [
+        r for r in interior
+        if threshold is None or r["variance"] < threshold
+    ]
+    if not eligible and interior:
+        fallback = sorted(interior, key=lambda r: r["variance"])
+        if top is not None:
+            fallback = fallback[:top]
+        for result in fallback:
+            result["threshold_fallback"] = True
+        return fallback
     eligible.sort(key=lambda r: r["variance"])
-    return eligible if top is None else eligible[:top]
+    return eligible
 
 
 def select_stable_windows(
@@ -189,16 +193,17 @@ def select_stable_windows(
     threshold: float | None = None,
     top: int | None = 5,
     boundary_radius: float = DEFAULT_GAZE_BOUNDARY_RADIUS,
-    min_boundary_points: int = DEFAULT_GAZE_MIN_BOUNDARY_POINTS,
     force_endpoint_points: int = 3,
 ) -> tuple[list[dict], set[int] | None]:
     """Shared core of the variance selector.
 
     Slides a variance window over the raw ``label_log`` scores, drops start/end
-    fixation windows using ``track_path``, then keeps the lowest-variance interior
-    windows (``threshold`` then ``top``). Returns ``(selected windows, excluded
-    endpoint stamps)`` — callers derive whichever stamps they need (window centres
-    for a one-per-window view, all member frames for score averaging).
+    fixation windows using ``track_path``, then keeps every sub-threshold interior
+    window; if the threshold rejects them all, the ``top`` steadiest interior
+    windows are kept anyway. Returns
+    ``(selected windows, excluded endpoint stamps)`` — callers derive whichever
+    stamps they need (window centres for a one-per-window view, all member frames
+    for score averaging).
     """
     frames = sorted(
         (f for f in label_log if f.get("stamp_ns") is not None),
@@ -208,42 +213,11 @@ def select_stable_windows(
     if not results:
         return [], None
     excluded, track_stamps = boundary_from_track(
-        track_path, boundary_radius, min_boundary_points, force_endpoint_points
+        track_path, boundary_radius, DEFAULT_GAZE_MIN_BOUNDARY_POINTS,
+        force_endpoint_points,
     )
     selected = select_windows(results, threshold, top, excluded, track_stamps)
     return selected, excluded
-
-
-def select_stable_stamps(
-    label_log: list[dict],
-    track_path: Path | None = None,
-    *,
-    window: int = 3,
-    threshold: float | None = None,
-    top: int | None = 5,
-    boundary_radius: float = DEFAULT_GAZE_BOUNDARY_RADIUS,
-    min_boundary_points: int = DEFAULT_GAZE_MIN_BOUNDARY_POINTS,
-    force_endpoint_points: int = 3,
-    visualize: bool = False,
-) -> list[int]:
-    """Runtime entry point returning the selected windows' centre ``stamp_ns``.
-
-    A variance window only flags its centre timestamp as a point of interest, so
-    the returned stamps are one per selected window (its centre) — the frames whose
-    scores drive the low-spread YOLO average. When ``visualize`` is set and a track
-    is given, also writes ``stitched_variance.png`` next to it.
-    """
-    selected, excluded = select_stable_windows(
-        label_log, track_path, window=window, threshold=threshold, top=top,
-        boundary_radius=boundary_radius, min_boundary_points=min_boundary_points,
-        force_endpoint_points=force_endpoint_points,
-    )
-    if visualize and track_path is not None:
-        plot_stitched_variance(
-            Path(track_path).parent, selected,
-            Path(track_path).parent / "stitched_variance.png", excluded=excluded,
-        )
-    return sorted({win["center_stamp_ns"] for win in selected})
 
 
 def export_selected_frames(
@@ -255,15 +229,18 @@ def export_selected_frames(
 ) -> Path | None:
     """Copy the selected frames' images and dump their YOLO scores to a subfolder.
 
-    Creates ``<session_dir>/<subdir>/`` holding one PNG per selected stamp (copied
-    from ``frames_dir``) plus ``scores.json`` — each stamp's gaze pixel and its
-    detected label/score list taken straight from the raw label log. Stamps with
-    no saved image (e.g. a dropped RGB frame) are still recorded, with a null
-    image. Returns the subfolder, or ``None`` when there is nothing to export.
+    Creates ``<session_dir>/<subdir>/`` holding one PNG per selected stamp plus
+    ``scores.json`` — each stamp's gaze pixel and the detected label/score list
+    from ``label_log``. The image is the in-fill redraw when one exists (so it
+    shows the detections those scores were computed from), otherwise the frame
+    from ``frames_dir``. Stamps with no saved image (e.g. a dropped RGB frame)
+    are still recorded, with a null image. Returns the subfolder, or ``None``
+    The directory is replaced on every run, including an empty selection, so
+    stale timestamps/images can never survive a new variance calculation.
     """
-    if not selected_stamps:
-        return None
     out_dir = session_dir / subdir
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     by_stamp = {f["stamp_ns"]: f for f in label_log if f.get("stamp_ns") is not None}
 
@@ -271,9 +248,9 @@ def export_selected_frames(
     copied = 0
     for stamp in selected_stamps:
         entry = by_stamp.get(stamp, {})
-        src = frames_dir / f"{stamp}.png"
+        src = frame_image_path(session_dir, stamp, frames_subdir=frames_dir.name)
         image_name = None
-        if src.exists():
+        if src is not None:
             image_name = src.name
             shutil.copy2(src, out_dir / src.name)
             copied += 1
@@ -286,6 +263,7 @@ def export_selected_frames(
 
     (out_dir / "scores.json").write_text(json.dumps({
         "method": "variance",
+        "selected_stamps_ns": selected_stamps,
         "count": len(records),
         "images_copied": copied,
         "frames": records,
@@ -298,24 +276,48 @@ def export_selected_frames(
 def plot_variance_timeline(
     results: list[dict], selected: list[dict], threshold: float | None,
     t0_ns: int, out_path: Path, boundary_flags: np.ndarray | None = None,
+    hide_excluded: bool = False, source_note: str | None = None,
 ) -> None:
     """Point/line plot of every window's variance over time.
 
     Selected windows are drawn in a distinct colour and endpoint (start/end
     fixation) windows are greyed out; the threshold (if any) is a horizontal
     reference line. A log y-axis keeps the wide variance range readable.
+
+    ``hide_excluded`` drops the endpoint windows from the plot entirely instead
+    of greying them out, leaving only the candidates selection actually ranked.
+    The connecting line then spans the removed spans, so the time axis stays
+    true but the polyline is no longer sample-contiguous.
+
+    ``source_note`` goes under the title to record which detections the plotted
+    variance was computed over — the figure should not be ambiguous about
+    whether in-filled detections were included.
     """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    if hide_excluded and boundary_flags is not None and boundary_flags.any():
+        keep = ~boundary_flags
+        results = [r for r, k in zip(results, keep) if k]
+        boundary_flags = np.zeros(len(results), dtype=bool)
+        if not results:
+            print("Variance timeline skipped: every window is an endpoint window.")
+            return
+
     times = np.array([(r["center_stamp_ns"] - t0_ns) / 1e9 for r in results])
     var = np.array([r["variance"] for r in results])
-    # Identify selected windows by object identity, not center stamp: duplicate
-    # frame timestamps (zedr async-stamp races) let different windows share a
-    # centre stamp, so stamp membership would over-highlight non-selected ones.
-    selected_ids = {id(r) for r in selected}
-    is_sel = np.array([id(r) in selected_ids for r in results])
+    # Window start + members identify a window across a regenerated analysis.
+    # Center stamp alone is insufficient because zedr async-stamp races can let
+    # different windows share the same centre timestamp.
+    def window_key(result: dict) -> tuple:
+        return (
+            result.get("window_start_index"),
+            tuple(result.get("member_stamps_ns", [])),
+        )
+
+    selected_keys = {window_key(result) for result in selected}
+    is_sel = np.array([window_key(result) in selected_keys for result in results])
     is_bnd = (boundary_flags if boundary_flags is not None
               else np.zeros(len(results), dtype=bool))
     is_plain = ~is_sel & ~is_bnd
@@ -343,6 +345,9 @@ def plot_variance_timeline(
     ax.set_xlabel("time (s)")
     ax.set_ylabel("window label-score variance (log)")
     ax.set_title("Gaze label-score stability over time")
+    if source_note:
+        ax.text(0.0, 1.005, f"detections: {source_note}", transform=ax.transAxes,
+                fontsize=8.5, color="#52514e")
     ax.grid(True, which="both", color="#e4e3e0", linewidth=0.7)
     ax.legend(loc="upper right", fontsize=9)
     fig.tight_layout()
@@ -432,7 +437,13 @@ def plot_stitched_variance(
 def plot_frames_grid(
     recording_dir: Path, windows: list[dict], out_path: Path
 ) -> None:
-    """Plot each selected window's centre frame in a grid and save to disk."""
+    """Plot each selected window's centre frame in a grid and save to disk.
+
+    Images come from ``infilled_frames/`` when in-fill has run, so a window's
+    picture shows the same detections its variance was computed from — a frame
+    whose flicker was repaired is the redrawn ``_filled`` version, marked in its
+    subplot title. Falls back to the raw ``frames/`` image otherwise.
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -441,7 +452,6 @@ def plot_frames_grid(
         print("Frames grid skipped: no windows selected.")
         return
 
-    frames_dir = recording_dir / "frames"
     n = len(windows)
     cols = min(n, 3) or 1
     rows = (n + cols - 1) // cols
@@ -450,14 +460,18 @@ def plot_frames_grid(
     for ax in axes.ravel():
         ax.axis("off")
 
+    filled_shown = 0
     for rank, (win, ax) in enumerate(zip(windows, axes.ravel()), start=1):
         stamp = win["center_stamp_ns"]
-        img_path = frames_dir / f"{stamp}.png"
+        img_path = frame_image_path(recording_dir, stamp)
         title = f"#{rank}  var={win['variance']:.3e}\n{stamp}"
-        if img_path.exists():
-            ax.imshow(plt.imread(str(img_path)))
+        if img_path is None:
+            ax.text(0.5, 0.5, f"missing\n{stamp}.png", ha="center", va="center")
         else:
-            ax.text(0.5, 0.5, f"missing\n{img_path.name}", ha="center", va="center")
+            ax.imshow(plt.imread(str(img_path)))
+            if img_path.name.endswith("_filled.png"):
+                title += "  (in-filled)"
+                filled_shown += 1
         ax.set_title(title, fontsize=9)
         ax.axis("off")
 
@@ -468,153 +482,73 @@ def plot_frames_grid(
     fig.tight_layout()
     fig.savefig(out_path, dpi=120)
     plt.close(fig)
-    print(f"Frames grid ({n} windows) -> {out_path}")
+    print(f"Frames grid ({n} windows, {filled_shown} showing in-filled detections) "
+          f"-> {out_path}")
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("recording_dir", type=Path,
-                        help="recording folder holding gaze_labels.json and frames/ "
-                             "(e.g. recordings/test02/26)")
-    parser.add_argument("-w", "--window", type=int, default=3,
-                        help="sliding window length in frames (default: 3)")
-    parser.add_argument("-n", "--top", type=int, default=None,
-                        help="keep the N lowest-variance windows below the "
-                             "threshold; omit to keep all that pass the threshold")
-    parser.add_argument("-t", "--threshold", type=float, default=None,
-                        help="only windows with variance below this value are "
-                             "eligible (default: no threshold)")
-    parser.add_argument("--boundary-radius", type=float,
-                        default=DEFAULT_GAZE_BOUNDARY_RADIUS,
-                        help="pixel radius on the stitched gaze track for the "
-                             "start/end fixation regions excluded before "
-                             f"selection (default: {DEFAULT_GAZE_BOUNDARY_RADIUS}; "
-                             "0 disables endpoint exclusion)")
-    parser.add_argument("--min-boundary-points", type=int,
-                        default=DEFAULT_GAZE_MIN_BOUNDARY_POINTS,
-                        help="minimum points for a start/end region to count as "
-                             f"a fixation (default: {DEFAULT_GAZE_MIN_BOUNDARY_POINTS})")
-    parser.add_argument("--force-endpoint-points", type=int, default=3,
-                        help="when an endpoint has no fixation cluster, force-"
-                             "exclude this many outermost points at that end "
-                             "(default: 3)")
-    parser.add_argument("--plot", action=argparse.BooleanOptionalAction, default=True,
-                        help="write the timeline, stitched, and frame plots "
-                             "(--no-plot to disable)")
-    parser.add_argument("--export", action=argparse.BooleanOptionalAction, default=True,
-                        help="copy the selected frames' images + YOLO scores into "
-                             "<recording>/variance_selected/ (--no-export to disable)")
-    return parser.parse_args()
+def generate_stability_plots(
+    recording_dir: Path,
+    label_log: list[dict],
+    selected: list[dict],
+    *,
+    window: int,
+    threshold: float | None,
+    boundary_radius: float = DEFAULT_GAZE_BOUNDARY_RADIUS,
+    force_endpoint_points: int = 3,
+    hide_excluded: bool = False,
+    source_note: str | None = None,
+) -> None:
+    """Write the same three plots as the offline stability CLI.
 
-
-def find_recordings(root: Path) -> list[Path]:
-    """Resolve ``root`` to the recording folders to process.
-
-    A folder holding ``gaze_labels.json`` is itself the single recording;
-    otherwise every immediate sub-folder that holds one is returned (sorted),
-    so an experiment path like ``recordings/test02`` batches all of its takes.
+    This is also used by the live recording flush path.  ``selected`` must be
+    the windows already used for the /gaze_label calculation, so visualization
+    can never silently select a different set of timestamps.
     """
-    if (root / "gaze_labels.json").exists():
-        return [root]
-    return sorted(
-        child for child in root.iterdir()
-        if child.is_dir() and (child / "gaze_labels.json").exists()
+    recording_dir = Path(recording_dir)
+    output_paths = (
+        recording_dir / "gaze_score_stability_variance.png",
+        recording_dir / "stitched_variance.png",
+        recording_dir / "gaze_score_stability_frames.png",
     )
+    # These are replaceable derived artifacts. Remove all previous versions
+    # first so a run with no valid/selected window cannot leave stale plots.
+    for output_path in output_paths:
+        if output_path.exists():
+            output_path.unlink()
 
-
-def process_recording(recording_dir: Path, args: argparse.Namespace) -> bool:
-    """Analyze and (optionally) plot one recording. Returns True on success."""
-    frames = load_frames(recording_dir)
-    results = analyze(frames, args.window)
+    frames = sorted(
+        (frame for frame in label_log if frame.get("stamp_ns") is not None),
+        key=lambda frame: frame["stamp_ns"],
+    )
+    results = analyze(frames, window)
     if not results:
-        print(f"Recording: {recording_dir}  -> skipped "
-              f"(no window had a label seen at least twice).")
-        return False
+        print("Stability plots skipped: no valid variance window.")
+        return
 
+    track_path = recording_dir / "stitched_gaze_track.json"
     excluded, track_stamps = boundary_from_track(
-        recording_dir / "stitched_gaze_track.json", args.boundary_radius,
-        args.min_boundary_points, args.force_endpoint_points,
+        track_path, boundary_radius, DEFAULT_GAZE_MIN_BOUNDARY_POINTS,
+        force_endpoint_points,
     )
     boundary_flags = np.zeros(len(results), dtype=bool)
     if excluded:
-        boundary_flags = np.array(
-            [_is_boundary(r["center_stamp_ns"], excluded, track_stamps) for r in results]
-        )
+        boundary_flags = np.array([
+            _is_boundary(result["center_stamp_ns"], excluded, track_stamps)
+            for result in results
+        ])
 
-    selected = select_windows(
-        results, args.threshold, args.top, excluded, track_stamps
+    plot_variance_timeline(
+        results, selected, threshold, frames[0]["stamp_ns"],
+        output_paths[0],
+        boundary_flags=boundary_flags,
+        hide_excluded=hide_excluded,
+        source_note=source_note,
     )
-    t0_ns = frames[0]["stamp_ns"]
-
-    if excluded is None and args.boundary_radius > 0:
-        endpoint_note = "endpoint exclusion: unavailable (no stitched gaze track)"
-    elif args.boundary_radius <= 0:
-        endpoint_note = "endpoint exclusion: disabled"
-    else:
-        endpoint_note = (f"endpoint-excluded windows: {int(boundary_flags.sum())} "
-                         f"(radius={args.boundary_radius:g}px)")
-
-    print(f"Recording: {recording_dir}")
-    print(f"Frames: {len(frames)}  window: {args.window}  valid windows: {len(results)}")
-    print(f"Threshold: {args.threshold if args.threshold is not None else 'none'}  "
-          f"top: {args.top if args.top is not None else 'all'}  "
-          f"selected: {len(selected)}")
-    print(endpoint_note)
-    for rank, win in enumerate(selected, start=1):
-        counts = ", ".join(f"{k}x{v}" for k, v in sorted(win["label_counts"].items()))
-        print(f"#{rank}  variance={win['variance']:.6e}  "
-              f"center_stamp_ns={win['center_stamp_ns']}")
-        print(f"     window_start_index={win['window_start_index']}  "
-              f"members={win['member_stamps_ns']}")
-        print(f"     label_counts: {counts}")
-
-    if args.plot:
-        plot_variance_timeline(
-            results, selected, args.threshold, t0_ns,
-            recording_dir / "gaze_score_stability_variance.png",
-            boundary_flags=boundary_flags,
-        )
-        plot_stitched_variance(
-            recording_dir, selected,
-            recording_dir / "stitched_variance.png",
-            excluded=excluded,
-        )
-        plot_frames_grid(
-            recording_dir, selected,
-            recording_dir / "gaze_score_stability_frames.png",
-        )
-
-    if args.export:
-        # One frame per selected window (its centre), matching the highlighted
-        # points in stitched_variance.png.
-        center_stamps = sorted({win["center_stamp_ns"] for win in selected})
-        export_selected_frames(
-            recording_dir, recording_dir / "frames", frames, center_stamps
-        )
-    return True
-
-
-def main() -> None:
-    args = parse_args()
-    if args.window < 2:
-        raise SystemExit("window must be >= 2 (variance needs at least 2 samples)")
-
-    recordings = find_recordings(args.recording_dir)
-    if not recordings:
-        raise SystemExit(
-            f"No gaze_labels.json found in {args.recording_dir} or its sub-folders."
-        )
-
-    ok = 0
-    for i, recording_dir in enumerate(recordings):
-        if len(recordings) > 1:
-            print(f"\n===== [{i + 1}/{len(recordings)}] {recording_dir.name} =====")
-        ok += process_recording(recording_dir, args)
-
-    if len(recordings) > 1:
-        print(f"\nDone: {ok}/{len(recordings)} recording(s) produced results.")
-
-
-if __name__ == "__main__":
-    main()
+    plot_stitched_variance(
+        recording_dir, selected, output_paths[1],
+        excluded=excluded,
+    )
+    plot_frames_grid(
+        recording_dir, selected,
+        output_paths[2],
+    )

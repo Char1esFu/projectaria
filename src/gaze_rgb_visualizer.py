@@ -5,8 +5,7 @@ from typing import Optional
 from utils.aria_rgb_stream import AriaRgbStream
 from src.gaze_overlay import GazeOverlay
 from src.gaze_rgb_config import (
-    DEFAULT_GAZE_PEAK_RADIUS,
-    DEFAULT_GAZE_PEAK_WINDOW,
+    DEFAULT_GAZE_BOUNDARY_RADIUS,
     MODEL_PATH,
 )
 
@@ -27,15 +26,16 @@ def run_gaze_rgb_visualizer(
     std_dist: float = 200.0,
     s_min: float = 0.3,
     participant: str = "",
-    gaze_peak_window: int = DEFAULT_GAZE_PEAK_WINDOW,
-    gaze_peak_radius: float = DEFAULT_GAZE_PEAK_RADIUS,
+    boundary_radius: float = DEFAULT_GAZE_BOUNDARY_RADIUS,
     rgb_buffer_delay_frames: int = 0,
     rgb_timestamp_source: str = "zedr",
-    gaze_select_method: str = "msd",
     gaze_var_window: int = 3,
     gaze_var_threshold: Optional[float] = None,
-    gaze_var_top: Optional[int] = 5,
-    gaze_var_force_endpoint_points: int = 3,
+    gaze_var_top: Optional[int] = 1,
+    gaze_var_force_endpoint_points: int = 1,
+    hide_excluded: bool = False,
+    detection_infill: bool = True,
+    infill_min_observations: int = 2,
 ) -> None:
     overlay = GazeOverlay(
         homography_path=homography_path,
@@ -51,14 +51,15 @@ def run_gaze_rgb_visualizer(
         std_dist=std_dist,
         s_min=s_min,
         participant=participant,
-        gaze_peak_window=gaze_peak_window,
-        gaze_peak_radius=gaze_peak_radius,
-        gaze_select_method=gaze_select_method,
+        boundary_radius=boundary_radius,
         gaze_var_window=gaze_var_window,
         gaze_var_threshold=gaze_var_threshold,
         gaze_var_top=gaze_var_top,
         gaze_var_force_endpoint_points=gaze_var_force_endpoint_points,
+        hide_excluded=hide_excluded,
         rgb_timestamp_source=rgb_timestamp_source,
+        detection_infill=detection_infill,
+        infill_min_observations=infill_min_observations,
     )
     stream = AriaRgbStream(
         # device_ip=device_ip,
@@ -94,12 +95,12 @@ def parse_args() -> argparse.Namespace:
              "If provided, the RGB image is warped before gaze overlay.",
     )
     parser.add_argument("--yolo",
-        default=False,
+        default=True,
         action="store_true",
         help="Enable YOLO detection. If not set, only gaze overlay is shown.",
     )
     parser.add_argument("--draw-gaze",
-        default=False,
+        default=True,
         action="store_true",
         help="Draw gaze marker (red circle and red dot) on RGB view.",
     )
@@ -154,20 +155,17 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Participant ID (e.g. AB12). Required for video recording to recordings/<participant>/NN/.",
     )
-    parser.add_argument("--gaze-peak-window",
-        type=int, 
-        default=DEFAULT_GAZE_PEAK_WINDOW,
-        help="Temporal window for stitched gaze peak detection. Fixed default: 3.",
-    )
-    parser.add_argument("--gaze-peak-radius",
-        type=float, 
-        default=DEFAULT_GAZE_PEAK_RADIUS,
-        help="Pixel radius for filtering start/end fixation regions. Default: 15.",
+    parser.add_argument(
+        "--boundary-radius",
+        type=float,
+        default=DEFAULT_GAZE_BOUNDARY_RADIUS,
+        help=("Pixel radius for filtering start/end fixation regions before "
+              f"variance selection (default: {DEFAULT_GAZE_BOUNDARY_RADIUS})."),
     )
     parser.add_argument(
         "--rgb-buffer-delay-frames",
         type=int,
-        default=0,
+        default=5,
         help=(
             "Display/process the RGB frame this many received RGB frames behind "
             "the newest frame (0 displays immediately)."
@@ -176,20 +174,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rgb-timestamp-source",
         choices=("zedr", "hardware"),
-        default="zedr",
+        default="hardware",
         help=(
             "Timestamp recorded RGB frames with the latest ZED right camera_info "
             "stamp or with each Aria RGB frame's hardware capture timestamp."
-        ),
-    )
-    parser.add_argument(
-        "--gaze-select-method",
-        choices=("msd", "variance"),
-        default="msd",
-        help=(
-            "Stable-frame selector for gaze-target averaging. 'msd' (default) is "
-            "the original pixel-space dense-point method on stitched_trajectory.png; "
-            "'variance' selects by label-score variance (src/gaze_score_stability.py)."
         ),
     )
     parser.add_argument(
@@ -197,37 +185,67 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=3,
         help=(
-            "variance method only: sliding window length in frames for the "
-            "label-score variance (default: 3). Separate from --gaze-peak-window, "
-            "which the 'msd' method uses."
+            "Sliding window length in frames for label-score variance "
+            "(default: 3)."
         ),
     )
     parser.add_argument(
         "--gaze-var-threshold",
         type=float,
-        default=None,
+        default=1.5e-3,
         help=(
-            "variance method only: keep windows with label-score variance below "
-            "this value before taking the top-N (default: no threshold)."
+            "Keep every window with label-score variance "
+            "below this value (default: 1.5e-3)."
         ),
     )
     parser.add_argument(
         "--gaze-var-force-endpoint-points",
         type=int,
-        default=3,
+        default=1,
         help=(
-            "variance method only: when an endpoint has no fixation cluster, "
+            "When an endpoint has no fixation cluster, "
             "force-exclude this many outermost gaze points at that end "
-            "(default: 3)."
+            "(default: 1)."
         ),
     )
     parser.add_argument(
         "--gaze-var-top",
         type=int,
-        default=5,
+        default=1,
         help=(
-            "variance method only: keep the N lowest-variance interior windows "
-            "(default: 5; <=0 keeps all that pass the threshold)."
+            "If no interior window passes the threshold, "
+            "keep the N lowest-variance interior windows "
+            "(default: 1; <=0 keeps all). All passing windows are always kept."
+        ),
+    )
+    parser.add_argument(
+        "--hide-excluded",
+        action="store_true",
+        help=(
+            "Hide endpoint-excluded windows from "
+            "gaze_score_stability_variance.png instead of drawing grey crosses. "
+            "Only the plot changes; selection and /gaze_label do not."
+        ),
+    )
+    parser.add_argument(
+        "--detection-infill",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "After recording stops, reproject a label seen in nearby frames into "
+            "the frames where YOLO flickered it out, using the stitching poses, "
+            "and score the filled points like real detections (default: on; "
+            "--no-detection-infill keeps the raw log)."
+        ),
+    )
+    parser.add_argument(
+        "--infill-min-observations",
+        type=int,
+        default=2,
+        help=(
+            "in-fill only: a label must be detected at least this many times in "
+            "the recording before it is filled into other frames, so a single "
+            "spurious detection is not spread around (default: 2)."
         ),
     )
     return parser.parse_args()
@@ -251,15 +269,16 @@ def main() -> None:
         std_dist=args.std_dist,
         s_min=args.s_min,
         participant=args.participant,
-        gaze_peak_window=args.gaze_peak_window,
-        gaze_peak_radius=args.gaze_peak_radius,
+        boundary_radius=args.boundary_radius,
         rgb_buffer_delay_frames=args.rgb_buffer_delay_frames,
         rgb_timestamp_source=args.rgb_timestamp_source,
-        gaze_select_method=args.gaze_select_method,
         gaze_var_window=args.gaze_var_window,
         gaze_var_threshold=args.gaze_var_threshold,
         gaze_var_top=args.gaze_var_top if args.gaze_var_top > 0 else None,
         gaze_var_force_endpoint_points=args.gaze_var_force_endpoint_points,
+        hide_excluded=args.hide_excluded,
+        detection_infill=args.detection_infill,
+        infill_min_observations=args.infill_min_observations,
     )
 
 
